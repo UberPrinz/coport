@@ -103,7 +103,8 @@ export abstract class ConnectableTerminalTabComponent<P extends ConnectableTermi
         return super.shouldTabBeDestroyedOnSessionClose()
     }
 
-    async getRecoveryToken (options?: GetRecoveryTokenOptions): Promise<RecoveryToken> {
+    // coport: An app-owned session can opt out of renderer tab recovery.
+    async getRecoveryToken (options?: GetRecoveryTokenOptions): Promise<RecoveryToken | null> {
         return {
             type: `app:${this.profile.type}-tab`,
             profile: this.profile,
@@ -125,7 +126,7 @@ export abstract class ConnectableTerminalTabComponent<P extends ConnectableTermi
         this.session?.releaseInitialDataBuffer()
     }
 
-    private clearServiceMessagesOnConnect (): void {
+    protected clearServiceMessagesOnConnect (): void { // coport: Allow a session to clear before replay.
         if (this.profile.clearServiceMessagesOnConnect && this.session?.open) {
             this.frontend?.clear()
         }

@@ -40,10 +40,10 @@ profileDefaults:
   ssh:
     disableDynamicTitle: true
 recoverTabs: true
-enableAnalytics: true
+enableAnalytics: false # coport: Disable analytics by default.
 enableWelcomeTab: true
 electronFlags: []
-enableAutomaticUpdates: true
+enableAutomaticUpdates: false # coport: Updates are managed outside the application.
 hideTray: false
 version: 1
 vault: null

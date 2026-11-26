@@ -259,6 +259,16 @@ export class ProfilesService {
         return roots
     }
 
+    private serialSelectorOrder (profile: PartialProfile<Profile>): Partial<SelectorOption<void>> {
+        if (profile.type === 'serial') {
+            const match = /^\/dev\/cu\.(wchusbserial|usbserial-)(.+)$/.exec(String(profile.options?.port ?? ''))
+            if (match) {
+                return { searchOrderGroup: match[2], searchOrderPriority: match[1] === 'wchusbserial' ? 0 : 1 }
+            }
+        }
+        return {}
+    }
+
     showProfileSelector (): Promise<PartialProfile<Profile> | null> {
         if (this.selector.active) {
             return Promise.resolve(null)
@@ -270,6 +280,7 @@ export class ProfilesService {
 
                 let options: SelectorOption<void>[] = recentProfiles.map((p, i) => ({
                     ...this.selectorOptionForProfile(p),
+                    ...this.serialSelectorOrder(p),
                     group: this.translate.instant('Recent'),
                     icon: 'fas fa-history',
                     color: p.color ?? undefined,
@@ -313,9 +324,22 @@ export class ProfilesService {
 
                 options = [...options, ...profiles.map((p): SelectorOption<void> => ({
                     ...this.selectorOptionForProfile(p),
-                    weight: p.isBuiltin ? 2 : 1,
+                    // coport: Preserve the driver preference of built-in serial ports.
+                    weight: p.isBuiltin ? (p.type === 'serial' ? p.weight ?? 2 : 2) : 1,
+                    ...this.serialSelectorOrder(p),
                     callback: () => resolve(p),
                 }))]
+
+                // coport: A manually entered Apple port can also appear in Recents.
+                const wchGroups = new Set(options.filter(option => option.searchOrderPriority === 0)
+                    .map(option => option.searchOrderGroup))
+                const appleDriverNote = '苹果驱动，高波特率可能失真'
+                for (const option of options) {
+                    if (option.searchOrderPriority === 1 && wchGroups.has(option.searchOrderGroup) &&
+                        !option.name.includes(appleDriverNote)) {
+                        option.description = [option.description, appleDriverNote].filter(Boolean).join(' · ')
+                    }
+                }
 
                 try {
                     const { SettingsTabComponent } = window['nodeRequire']('tabby-settings')

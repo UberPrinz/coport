@@ -28,6 +28,10 @@ export abstract class HostWindowService {
     abstract toggleMaximize (): void
     abstract close (): void
 
+    // coport: Electron uses this to cancel a pending application quit.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    cancelClose (): void { }
+
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     openDevTools (): void { }
 

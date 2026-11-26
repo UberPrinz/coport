@@ -36,6 +36,9 @@ const config = {
         ],
     },
     externals: {
+        // coport: Load serialport from the app package so bindings-cpp can find its native addon.
+        serialport: 'commonjs serialport',
+        './coport-queued-read.node': 'commonjs ./coport-queued-read.node',
         'any-promise': 'commonjs any-promise',
         electron: 'commonjs electron',
         'electron-config': 'commonjs electron-config',

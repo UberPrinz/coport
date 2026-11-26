@@ -6,6 +6,7 @@ import { NewTabParameters, PartialProfile, SelectorService, HostAppService, Plat
 import { SerialProfileSettingsComponent } from './components/serialProfileSettings.component'
 import { SerialTabComponent } from './components/serialTab.component'
 import { SerialService } from './services/serial.service'
+import { serialPortWeight } from './services/serialPorts'
 import { BAUD_RATES, SerialProfile } from './api'
 
 @Injectable({ providedIn: 'root' })
@@ -74,6 +75,7 @@ export class SerialProfilesService extends QuickConnectProfileProvider<SerialPro
                     this.translate.instant('Serial'),
                 icon: 'fas fa-microchip',
                 isBuiltin: true,
+                weight: serialPortWeight(p.name), // coport: Preserve WCH priority in the selector.
                 options: {
                     port: p.name,
                 },

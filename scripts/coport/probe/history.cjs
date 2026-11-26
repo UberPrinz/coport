@@ -99,4 +99,4 @@ async function replay(Terminal, snapshot) {
     return result
 }
 
-module.exports = { collect, replay }
+module.exports = { collect, replay, samples, numbered }

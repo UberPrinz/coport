@@ -557,6 +557,7 @@ export class AppService {
             this.hostWindow.close()
         } else {
             this.tabRecovery.enabled = true
+            this.hostWindow.cancelClose() // coport: Cancel a pending app quit.
         }
     }
 

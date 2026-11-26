@@ -92,6 +92,37 @@ class FlowControl {
 /** @hidden */
 export class XTermFrontend extends Frontend {
     enableResizing = true
+    // coport: Shared serial views apply layout changes in device-output order.
+    requestResize?: (cols: number, rows: number) => void
+
+    get terminalSize (): { cols: number, rows: number } {
+        return { cols: this.xterm.cols, rows: this.xterm.rows }
+    }
+
+    applyTerminalSize (cols: number, rows: number): void {
+        if (cols === this.xterm.cols && rows === this.xterm.rows) {
+            return
+        }
+        this.resizeTerminal(() => {
+            this.xtermCore._renderService?.clear()
+            this.xterm.resize(cols, rows)
+        })
+    }
+
+    private resizeTerminal (resize: () => void): void {
+        const savedViewportY = this.xterm.buffer.active.viewportY
+        const savedPinned = this.pinnedToBottom
+        resize()
+        this.xtermCore.viewport._refresh()
+        if (savedPinned) {
+            this.xtermCore._scrollToBottom()
+        } else {
+            this.xterm.scrollToLine(Math.min(savedViewportY, this.xterm.buffer.active.baseY))
+        }
+        // Repaint after restoring scroll position to avoid a blank frame during fit.
+        this.xtermCore._renderService?._renderRows(0, this.xterm.rows - 1)
+    }
+
     xterm: Terminal
     protected xtermCore: any
     protected enableWebGL = false
@@ -180,7 +211,22 @@ export class XTermFrontend extends Frontend {
             return result
         }
 
+        // coport: xterm flags keyboard and paste as user input. Mouse reporting
+        // also uses that flag, so suppress it at its own source for serial views.
+        const coreService = this.xtermCore.coreService
+        const triggerDataEvent = coreService.triggerDataEvent.bind(coreService)
+        coreService.triggerDataEvent = (data: string, userInput = false) => {
+            if (!this.suppressDeviceReports || userInput) {
+                triggerDataEvent(data, userInput)
+            }
+        }
+        const mouse = this.xtermCore.coreMouseService
+        const triggerMouseEvent = mouse.triggerMouseEvent.bind(mouse)
+        mouse.triggerMouseEvent = event => !this.suppressDeviceReports && triggerMouseEvent(event)
         this.xterm.onBinary(data => {
+            if (this.suppressDeviceReports) {
+                return
+            }
             this.input.next(Buffer.from(data, 'binary'))
         })
         this.xterm.onData(data => {
@@ -292,30 +338,27 @@ export class XTermFrontend extends Frontend {
         //   - wheel/keyboard event listeners (below)
         //   - explicit scrollToBottom() calls
 
+        let firstSerialFit = true
         const doResize = () => {
             try {
                 if (this.xterm.element && getComputedStyle(this.xterm.element).getPropertyValue('height') !== 'auto') {
-                    const savedPinned = this.pinnedToBottom
-                    const savedViewportY = this.xterm.buffer.active.viewportY
-
-                    this.fitAddon.fit()
-                    this.xtermCore.viewport._refresh()
-
-                    if (savedPinned) {
-                        this.xtermCore._scrollToBottom()
+                    if (this.suppressDeviceReports) {
+                        const size = this.fitAddon.proposeDimensions()
+                        if (size && Number.isFinite(size.cols) && Number.isFinite(size.rows)) {
+                            const firstFit = firstSerialFit
+                            firstSerialFit = false
+                            if (this.requestResize) {
+                                this.requestResize(size.cols, size.rows)
+                            } else if (firstFit && size.cols === this.xterm.cols && size.rows === this.xterm.rows) {
+                                // A fit at the default size does not emit xterm's resize event.
+                                this.resize.next({ columns: size.cols, rows: size.rows })
+                            } else {
+                                this.applyTerminalSize(size.cols, size.rows)
+                            }
+                        }
                     } else {
-                        // Restore the previous scroll position after fit
-                        const maxScroll = this.xterm.buffer.active.baseY
-                        const targetY = Math.min(savedViewportY, maxScroll)
-                        this.xterm.scrollToLine(targetY)
+                        this.resizeTerminal(() => this.fitAddon.fit())
                     }
-
-                    // fitAddon.fit() resizes the renderer's drawing buffer,
-                    // which blanks it synchronously, but xterm only repaints on
-                    // the next animation frame — leaving one blank frame that
-                    // reads as flicker during a window drag. Force the repaint
-                    // now (after scrolling settles) to close that gap.
-                    this.xtermCore._renderService?._renderRows(0, this.xterm.rows - 1)
                 }
             } catch (e) {
                 // tends to throw when element wasn't shown yet
@@ -607,7 +650,12 @@ export class XTermFrontend extends Frontend {
         // could change pinnedToBottom mid-write.
         const wasPinned = this.pinnedToBottom
         const savedViewportY = this.xterm.buffer.active.viewportY
-        await this.flowControl.write(data)
+        if (this.suppressDeviceReports) {
+            // coport: ACK shared serial output only after xterm has parsed it.
+            await new Promise<void>(resolve => this.xterm.write(data, resolve))
+        } else {
+            await this.flowControl.write(data)
+        }
         if (wasPinned) {
             this.xtermCore._scrollToBottom()
         } else {

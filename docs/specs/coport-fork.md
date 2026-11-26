@@ -157,7 +157,7 @@ flowchart TB
         PANEL --> AFB
     end
     SHIM -->|"Unix socket 字节流"| MCPH
-    SSES <-->|"ensure/attach/input/detach 与 output/ended 事件"| SIPC
+    SSES <-->|"ensure/attach/resize/input/detach 与 output/resized/ended 事件"| SIPC
     AFB -->|"coport-adb:fs:*"| AIPC
     ATAB -->|"coport-adb:devices"| AIPC
 ```
@@ -166,8 +166,11 @@ flowchart TB
 
 关键约束：
 1. **写入授权由主进程独占。** 渲染进程只提交 `source:'human'` 的字节，终端应答只由 headless 解析器产生，标记为 `terminal` 源。渲染端 xterm 产生的自动应答（DSR、DA、鼠标上报、焦点上报）一律丢弃，不进入 hub。这条规则同时去掉了 R6 中"终端上报被误判为人工输入"的候选成因。AI 无法自报角色。
-2. **解析器唯一，视图可随时丢弃。** headless 解析器是唯一的事实源，它和各视图消费同一个字节流。视图挂载时先取 serialize 快照，再接收增量输出；单个视图未消费的数据超过 64 KiB 就断开该视图，会话不受影响。重复打开同一设备时，聚焦已有标签，不建第二个视图。
-3. **生命周期由应用掌控。** 在 macOS 上 Tabby 关窗后不退出进程（`app/lib/app.ts`），会话不依赖任何窗口。`before-quit` 时结束所有代次、释放 fd、删除 socket。串口标签不参与 TabRecovery（移除 `tabby-serial` 的 recoveryProvider 注册）。
+2. **解析器唯一，视图可随时丢弃。** headless 解析器是唯一的事实源，它和各视图消费同一个字节流。视图挂载时先取 serialize 快照，再接收增量输出；单个视图未消费的数据超过 64 KiB 就断开该视图，会话不受影响。每个代次只注册一个视图。重复打开聚焦原标签，仍由该标签决定尺寸。原视图已拆离时，以最后挂接的视图为准。
+   - 人打开新代次时使用首次请求携带的视图尺寸。只有 AI 打开的新代次从 80×24 开始，视图拆离后保留最后一次上报的尺寸。
+   - 主进程完成正在解析的一批字节后应用挂接或 resize 的尺寸。挂接按新尺寸生成快照并带上输出序号。实时 resize 在同一 IPC 发送端按设备输出顺序发送 `resized`，渲染器写完此前输出后应用尺寸，再写后续输出。挂接期间的布局变化在快照回放后上报最新尺寸。
+   - 尺寸变化沿用 xterm 的缓冲区重排规则，已经提交的 MCP 逻辑行、序号及读取游标保持不变。回放快照时补齐其光标列，保留行尾待换行状态。
+3. **生命周期由应用掌控。** 在 macOS 上 Tabby 关窗后不退出进程（`app/lib/app.ts`），会话不依赖任何窗口。窗口同意关闭后在 `will-quit` 结束所有代次、释放 fd、删除 socket。串口标签不参与 TabRecovery（移除 `tabby-serial` 的 recoveryProvider 注册）。
 4. **仲裁按分支逐一移植。** 语义不做任何"顺手优化"，以 Swift XCTest 用例的转写和 sim 全量回归做双重对照。
 
 影响范围：`app`（主进程、构建配置、品牌）、`tabby-serial`、`tabby-ssh`、`tabby-core` 的默认配置、`scripts/vars.mjs`，新增 `tabby-adb`、`extras/coport-mcp`，以及从原仓库迁入的 `scripts/coport/sim`。
@@ -230,7 +233,7 @@ sequenceDiagram
     participant HD as 主进程/headlessTerminal
     participant HB as 主进程/serialHub
     U->>ST: 选择端口（WCH 优先）和参数；非标准波特率时确认
-    ST->>SI: invoke coport-serial:ensure{config, reveal:true, windowId}
+    ST->>SI: invoke coport-serial:ensure{config, reveal:true, windowId, cols, rows}
     SI->>SM: ensure(…)
     alt 已有会话但参数不一致
         SM-->>ST: error config_conflict{active}
@@ -240,8 +243,8 @@ sequenceDiagram
         Note over ST: 聚焦原标签或窗口，丢弃本次新建的标签
     else 已有会话但没有视图，或新会话
         SM-->>ST: {generation, reused}
-        ST->>SI: invoke coport-serial:attach{generation}
-        SI->>HD: serialize()
+        ST->>SI: invoke coport-serial:attach{generation, cols, rows}
+        SI->>HD: 等待当前输出后 resize 并 serialize
         HD-->>ST: {snapshot, seq}
         SI-->>ST: 之后推送 coport-serial:output{generation, seq, bytes}
     end
@@ -266,7 +269,7 @@ sequenceDiagram
     U->>APP: 点击 Dock（activate）
     APP->>APP: 新建窗口
     U->>R: 打开同一 profile → ensure(reused) → attach → 快照恢复
-    U->>APP: Cmd+Q（before-quit）
+    U->>APP: Cmd+Q（窗口同意关闭进入 will-quit）
     APP->>SM: shutdown()：拒绝待写数据、关闭全部 fd
     APP->>APP: 停止 mcpHost，unlink mcp.sock
 ```
@@ -308,14 +311,19 @@ sequenceDiagram
 
 | 消息 | 方向 | 请求 | 结果与规则 |
 |---|---|---|---|
-| `coport-serial:ensure` | 渲染→主（invoke）；mcpHost 在进程内直接调用 | `config{port:string, baudrate:number, databits:5\|6\|7\|8=8, stopbits:1\|1.5\|2=1, parity:'none'\|'odd'\|'even'\|'mark'\|'space'='none', rtscts=false, xon=false, xoff=false, xany=false}`；`reveal:boolean`；`windowId?:number`（reveal 时必填） | `{generation:string, reused:boolean, focus?:{windowId,tabId}}`。`port` 必须是字符设备；`baudrate` 为 1 到 4294967295 的整数（非标准值由渲染端提示，主进程不拒绝）。同一设备的打开请求按到达顺序逐个处理：首次打开失败时，所有等待者收到同一个错误；成功后，后到的请求与活动会话比较参数，一致则复用，不一致则返回 `config_conflict` 并附带 `active`（6 个参数）。`reveal:true` 但缺少 `windowId` 时返回 `invalid_argument`。截止时间为 15 秒，从请求进入主进程算起，到期返回 `timeout`；此后迟到的打开完成会被立即关闭 |
-| `coport-serial:attach` | 渲染→主（invoke） | `generation` | `{snapshot:string, seq:number}`。此后该 webContents 收到 `output` 事件中 `seq` 大于快照 seq 的部分。代次仍在打开时，等到打开完成再返回；代次已结束时返回 `channel_lost` |
+| `coport-serial:ensure` | 渲染→主（invoke）；mcpHost 在进程内直接调用 | `config{port:string, baudrate:number, databits:5\|6\|7\|8=8, stopbits:1\|1.5\|2=1, parity:'none'\|'odd'\|'even'\|'mark'\|'space'='none', rtscts=false, xon=false, xoff=false, xany=false}`；`reveal:boolean`；`windowId?:number, cols?:number, rows?:number`（reveal 时必填，尺寸范围与 attach 相同） | `{generation:string, reused:boolean, focus?:{windowId,tabId}}`。`port` 必须是字符设备；`baudrate` 为 1 到 4294967295 的整数（非标准值由渲染端提示，主进程不拒绝）。同一设备的打开请求按到达顺序逐个处理：首次打开失败时，所有等待者收到同一个错误；成功后，后到的请求与活动会话比较参数，一致则复用，不一致则返回 `config_conflict` 并附带 `active`（6 个参数）。`reveal:true` 但缺少调用方 `windowId` 或尺寸非法时返回 `invalid_argument`。截止时间为 15 秒，从请求进入主进程算起，到期返回 `timeout`；此后迟到的打开完成会被立即关闭 |
+| `coport-serial:attach`、`coport-serial:attach-display` | 渲染→主（invoke） | `{generation, cols, rows}` | `{snapshot:string, seq:number}`。主进程先应用尺寸，再返回快照。此后该 webContents 收到 `seq` 大于快照 seq 的 `output` 事件。代次已结束时返回 `channel_lost`。旧显示模式经 `attach-display` 额外取得原始字节帧 |
+| `coport-serial:resize` | 渲染→主（invoke） | `{generation, cols, rows}` | 更新已挂接视图所属代次的尺寸，未挂接或旧代次返回 `channel_lost`，尺寸非法返回 `invalid_argument`。与 attach 相同，列数为 2 至 1000 的整数，行数为 1 至 1000 的整数 |
+| `coport-serial:resized` | 主→渲染（事件） | — | `{generation, cols, rows}`。与设备 `output` 事件按发送顺序串行应用 |
 | `coport-serial:output` | 主→渲染（事件） | — | `{generation, seq, bytes}`。每个视图独立设有 64 KiB 有界缓冲，渲染端写入 xterm 后发送 `coport-serial:ack{generation, seq}`；超过上限即断开该视图 |
 | `coport-serial:ack` | 渲染→主 | `{generation, seq}` | 表示该视图已把 seq 及之前的输出写入 xterm，仅用于视图流控，与提示符证据无关。重复或乱序的 ack 取其中最大值，旧代次的 ack 忽略 |
 | `coport-serial:input` | 渲染→主（invoke） | `{generation, bytes}`，1 到 65536 字节 | `{queued:number}`。主进程固定把来源记为 `human`。出现 `busy` 或 `queue_full` 时在写入前拒绝；旧代次返回 `channel_lost` |
 | `coport-serial:detach` | 渲染→主 | `generation` | 只断开视图，不影响会话。没有视图、也没有 AI 绑定的会话照样保留（与原实现一致），直到用户显式 Disconnect、设备丢失或应用退出；用户再次打开同一 profile 时会挂回这个会话 |
 | `coport-serial:disconnect` | 渲染→主（invoke） | `generation` | 结束该代次，释放 fd，丢弃待写数据；已绑定该代次的 AI 后续调用返回 `channel_lost` |
 | `coport-serial:ended` | 主→渲染（事件） | — | `{generation, reason:'disconnected'\|'device_lost'\|'quit'}`。视图显示为已断开，并按 Tabby 的 `behaviorOnSessionEnd` 处理 |
+
+
+渲染实现保留既有 profile 的十六进制与换行格式。普通视图取权威终端快照，有旧格式设置的视图由现有渲染处理重放主进程保留的有界原始输出。首次打开可用同一输出重放触发该代次的条件登录脚本，重新挂回不重发登录输入。若首个用户 profile 是十六进制监视，或该 profile 挂到没有现有视图的会话，主进程继续解析原始设备输出并停发自动终端应答；下一任普通视图可恢复应答。会话的物理参数比较仍只含串口配置。原有串口标签的改速动作在主进程内修改现有 fd 和活动参数，保留代次、历史与待写数据。
 
 仲裁规则（输入所有者、半行、Ctrl-C、中断预留、提示符证据、遗留半行）按原 `SerialHub.swift` 的 `arbitrate`、`enqueueShared`、`reserveInterrupt` 和 `clientDisconnected` 逐分支移植，原实现即权威定义。
 
@@ -370,13 +378,18 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 
 | 上游文件 | 改动 |
 |---|---|
-| `app/lib/index.ts`、`app/lib/app.ts` | 启动 coport 服务；处理 `--coport-background`；`before-quit` 时执行 shutdown |
+| `app/lib/index.ts`、`app/lib/app.ts` | 启动 coport 服务；处理 `--coport-background`；窗口同意关闭后在 `will-quit` 执行 shutdown |
 | `app/lib/window.ts`、`app/lib/sentry.ts` | 禁用更新器；移除 Sentry 初始化 |
-| `tabby-settings/src/components/settingsTab.component.pug` | 移除检查更新按钮和自动更新开关 |
+| `tabby-settings/src/components/settingsTab.component.pug`、`settingsTab.component.ts`、`tabby-core/src/components/appRoot.component.pug`、`appRoot.component.ts` | 移除设置和工具栏的更新入口，以及相关定时查询和界面状态 |
+| `tabby-core/src/api/hostWindow.ts`、`services/app.service.ts`、`tabby-electron/src/services/hostWindow.service.ts` | renderer 拒绝窗口关闭时清除显式退出请求 |
+| `tabby-core/src/api/selector.ts`、`services/profiles.service.ts`、`components/selectorModal.component.ts` | 快速连接及过滤保留同适配器的 WCH 优先 |
 | `tabby-core/src/configDefaults.yaml` | `enableAutomaticUpdates: false`、`enableAnalytics: false` |
 | `tabby-serial/src/*` | 把 `SerialSession` 改为会话代理；端口列表 WCH 优先并加标注；增加波特率提示；移除 recoveryProvider |
+| `tabby-terminal/src/frontends/frontend.ts`、`xtermFrontend.ts` | 串口视图保留键盘及粘贴，丢弃设备上报，在 xterm 完成解析后 ACK，按主进程输出顺序应用尺寸 |
+| `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts` | 允许主进程托管的串口标签不生成恢复令牌，SSH 保持其原有恢复逻辑 |
+| `app/webpack.config.main.mjs` | 从 app 包加载现有串口原生绑定及同一 fd 的 FIONREAD 探针 |
 | `tabby-ssh/src/components/sftpPanel.component.ts`、`session/sftp.ts`、`index.ts` | 抽出并导出 `FileBackend`，放宽面板的输入类型 |
-| `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），M0 时确认主进程打包配置无需改动 |
+| `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），M1 的根构建在 macOS 编译 FIONREAD Node-API 模块 |
 | `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
 
@@ -405,6 +418,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | 打开统一截止并在过期后清理 | L2 | 提议用例：fake binding 打开时挂起 | 在 15±0.5 秒内返回 `timeout`；之后 fd 数为 0，会话表为空 |
 | MCP 六个工具兼容与后台拉起 | L2 | 迁移 `wire_test.py`、`ai_e2e.py`、`shim_autostart.py` | 工具清单和 schema 与原快照一致；应用未运行时可以拉起，且没有可见窗口 |
 | 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定返回 `channel_lost`；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
+| 串口视图尺寸与历史回放 | L2 | `coport_serial.py --geometry`（隔离 Coport.app 与私有 PTY） | 120 列实时输出、关窗后分别以 120 列和 80 列挂回、无窗口时沿用上次尺寸、挂接后实时 resize、AI 从 80×24 打开后以 120 列挂接。检查实际渲染 xterm 的字符位置和游标、PTY 收到的 headless 光标报告及代次复用 |
 | ADB exec 优先路由 | L2 | 迁移 `prepare_adb.py` 和 `scripts/fixtures/adb` | 有授权设备时 exec 返回 `channel=adb`；没有设备时走串口；离线或未授权时提示具体状态 |
 | ADB 文件面板后端 | L2 | 提议后端契约测试（使用假 adb 并记录 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |
 | SFTP 面板泛化后不回退 | L2 | 迁移 `coport_shells.py` 中的本机 OpenSSH 回环 | SFTP 下浏览、上传、下载、新建目录、删除全部成功 |

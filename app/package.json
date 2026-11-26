@@ -1,5 +1,6 @@
 {
   "name": "tabby",
+  "productName": "Coport",
   "description": "A terminal for a modern age",
   "private": true,
   "repository": "https://github.com/Eugeny/tabby",
@@ -17,6 +18,8 @@
   "dependencies": {
     "@electron/remote": "^2",
     "@npmcli/arborist": "^9",
+    "@xterm/addon-serialize": "0.12.0",
+    "@xterm/headless": "5.5.0",
     "any-promise": "^1",
     "atomically": "^2",
     "dunder-proto": "^1",

@@ -1,6 +1,7 @@
 ---
-appId: org.tabby
-productName: Tabby
+# coport: Keep the original Coport application identity.
+appId: local.coport.app
+productName: Coport
 compression: normal
 npmRebuild: false
 protocols:
@@ -40,6 +41,7 @@ extraResources:
 - builtin-plugins
 - extras
 asarUnpack:
+- 'dist/coport-queued-read.node' # coport: FIONREAD on the existing serial fd.
 - 'dist/*.map'
 - node_modules/keytar/build/Release/*.node
 - node_modules/**/*.node
@@ -61,7 +63,7 @@ nsis:
 mac:
   category: public.app-category.utilities
   icon: "./build/mac/icon.icns"
-  artifactName: tabby-${version}-macos-${env.ARCH}.${ext}
+  artifactName: coport-${version}-macos-${env.ARCH}.${ext}
   hardenedRuntime: true
   entitlements: "./build/mac/entitlements.plist"
   entitlementsInherit: "./build/mac/entitlements.plist"

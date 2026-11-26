@@ -19,6 +19,8 @@ export interface SearchState {
  */
 export abstract class Frontend {
     enableResizing = true
+    // coport: A shared serial view renders device reports without sending them.
+    suppressDeviceReports = false
     protected ready = new AsyncSubject<void>()
     protected title = new ReplaySubject<string>(1)
     protected alternateScreenActive = new BehaviorSubject<boolean>(false)
