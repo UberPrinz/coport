@@ -39,9 +39,9 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 
 估时：每个里程碑以"验收与审查通过"为准，不承诺工期。仲裁移植约 2k 行，加上 sim 迁移，M1 和 M2 成本最高。
 
-### 当前里程碑 M3
+### 当前里程碑 M4
 
-M2 已提交。M3 实现 ADB Shell、ADB 优先的 MCP exec 和共用文件面板。本阶段用假 adb、私有 PTY 与本机 OpenSSH 回环验证，真机操作留到 M4。
+M3 已提交。M4 收尾 ad-hoc 签名和上游差异检查，重跑最终隔离验收并准备 G3。
 
 ## 当前进展与问题
 
@@ -50,5 +50,5 @@ M2 已提交。M3 实现 ADB Shell、ADB 优先的 MCP exec 和共用文件面�
 | M0 | 已提交，独立复审无阻塞项。P1、P3、arm64 构建与隔离启动通过。P2 两组私有 PTY 双向收发和单一 fd 通过，采用既有 CH340 读取、本机写入与 drain 证据。由用户决定将真机对端收包推迟到 M4 G3（L4） | `54869e1` → `39ab33f2`。[M0 交付记录](../delivery/coport-fork-M0.md) · [验收证据](../delivery/coport-fork-M0-evidence.txt) | M4 G3 时由用户使用已上电并进入 shell 的 FTDI 板核对收包 |
 | M1 | 已提交。尺寸同步、R7 私有 PTY 生命周期、独立启动与第 4 轮复审通过 | `39ab33f2` → `b414202e`，裁决 `fb57641a`。[交付记录](../delivery/coport-fork-M1.md#实现期设计决定) · [验收证据](../delivery/coport-fork-M1-evidence.txt) | M2 接入 MCP host 后重跑完整 R1 启动和 R7 生命周期 |
 | M2 | 已提交。完成 MCP 六工具、Swift shim、串口 exec、仲裁移植和 R1/R7 回归。异 UID 的 L1 凭据测试和 L2 文件系统实测通过，末轮独立复审无发现 | `b414202e` → `69984e92`。[M2 交付记录](../delivery/coport-fork-M2.md) | M3 接入 ADB 路由与文件面板 |
-| M3 | 进入实现与隔离验收 | 起点为 M2 提交及其状态记录 | 实现 ADB 与 SFTP 后端并验证同窗共存 |
-| M4 | 等待 M3 | G3 L4、P2 真机写入和汇总 PR 待后续 | M3 提交后准备签名及人工验收 |
+| M3 | 已提交。ADB 优先与回退、ADB 文件协议、OpenSSH/SFTP 与四类终端同窗均通过，末轮复审无剩余 P0–P2 | `d02855d4` → `b39dc20a`。[M3 交付记录](../delivery/coport-fork-M3.md) | M4 验证签名包与准备 G3 |
+| M4 | 开始收尾 | G3 L4、P2 真机写入和汇总 PR 待后续 | 完成签名、白名单、累计审查和 G3 准备 |

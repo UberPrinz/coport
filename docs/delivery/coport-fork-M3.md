@@ -2,7 +2,7 @@
 
 - 功能分支 `feat/coport-fork`，目标 `main`。M3 工作区起点 `d02855d4`，产品基线为 M2 提交 `69984e92`。原 Swift / Tabby 插件参考 `2c1ea46`。
 - 范围为 R5 的 ADB Shell、MCP 对 ADB 的优先路由、ADB 文件面板、SSH/SFTP 回归及同窗共存。自动验收使用 macOS arm64、隔离 Electron 43.7.0、假 adb、私有 PTY 和本机回环 OpenSSH。真实设备由 G3 集中验收。
-- 待提交。M3 隔离构建为 `dist/coport-m3/mac-arm64/Coport.app`，证据位于 `dist/coport-m3/evidence/`。
+- M3 提交为 `b39dc20a`。M3 隔离构建为 `dist/coport-m3/mac-arm64/Coport.app`，证据位于 `dist/coport-m3/evidence/`。
 
 ## 实现期设计决定
 
