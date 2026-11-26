@@ -2,7 +2,7 @@
 
 - 功能分支 `feat/coport-fork`，目标 `main`，M2 起始提交 `b414202e`。原 Swift / Tabby 插件基线 `2c1ea46`。
 - 执行授权涵盖 M2–M4。M2 的范围包括 MCP host、Swift shim、串口 exec 和 prepare_shell、Swift 仲裁回归、R1 的 socket 与 R7 完整生命周期。
-- 受测版本是 `b414202e` 加本工作区 M2 改动。macOS arm64、Electron 43.7.0、Node 22.23.5。产品联调使用 `dist/coport-m2/mac-arm64/Coport.app`、临时数据目录和私有 PTY。所有串口验证仅用私有 PTY。异 UID 补测及重建使用 Node 26.4.0。独立审查 6 轮。前五轮的 1 项 P1 和 9 项 P2 均已修复，第六轮针对最终修复复审无发现。CI 修复 0 轮，尚无 M2 提交或 PR。
+- 受测版本是 `b414202e` 加本工作区 M2 改动。macOS arm64、Electron 43.7.0、Node 22.23.5。产品联调使用 `dist/coport-m2/mac-arm64/Coport.app`、临时数据目录和私有 PTY。所有串口验证仅用私有 PTY。异 UID 补测及重建使用 Node 26.4.0。独立审查 6 轮。前五轮的 1 项 P1 和 9 项 P2 均已修复，第六轮针对最终修复复审无发现。CI 修复 0 轮，M2 提交为 `69984e92`，作为 M3 产品代码基线。尚无 PR。
 
 ## 已确认裁决
 
