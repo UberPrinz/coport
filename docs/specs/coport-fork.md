@@ -377,7 +377,10 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | `tabby-serial/src/*` | 把 `SerialSession` 改为会话代理；端口列表 WCH 优先并加标注；增加波特率提示；移除 recoveryProvider |
 | `tabby-ssh/src/components/sftpPanel.component.ts`、`session/sftp.ts`、`index.ts` | 抽出并导出 `FileBackend`，放宽面板的输入类型 |
 | `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），M0 时确认主进程打包配置无需改动 |
+| `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
+
+实现已定稿设计所需的依赖锁文件、构建或打包注册项、模板、样式及 i18n 条目，可以在实现时同步列入本表，并登记到上游改动记录。可注释的改动标注 `coport:`，生成锁文件和 JSON 在上游改动记录中说明。涉及范围、验收标准、对外协议或关键设计的变化需要先裁决。
 
 同步流程：每季度在 `sync/<tag>` 分支上合入 upstream 的稳定 tag，按上表解决冲突；运行 `scripts/coport/check-upstream-diff.mjs`（设计提议，白名单之外有 diff 即报错）、P1 的 history 一致性用例和全量 sim；全部通过后提交 MR 合入 main。
 
@@ -401,7 +404,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | 无人工输入时不返回 busy | L2 | 提议 `coport_serial.py --open-noise`：打开瞬间灌入乱码和 `ESC[?1000h`，并注入鼠标与焦点上报 | AI 写入成功；有真实人工半行时仍返回 busy |
 | 打开统一截止并在过期后清理 | L2 | 提议用例：fake binding 打开时挂起 | 在 15±0.5 秒内返回 `timeout`；之后 fd 数为 0，会话表为空 |
 | MCP 六个工具兼容与后台拉起 | L2 | 迁移 `wire_test.py`、`ai_e2e.py`、`shim_autostart.py` | 工具清单和 schema 与原快照一致；应用未运行时可以拉起，且没有可见窗口 |
-| 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定返回 `channel_lost`；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签 |
+| 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定返回 `channel_lost`；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
 | ADB exec 优先路由 | L2 | 迁移 `prepare_adb.py` 和 `scripts/fixtures/adb` | 有授权设备时 exec 返回 `channel=adb`；没有设备时走串口；离线或未授权时提示具体状态 |
 | ADB 文件面板后端 | L2 | 提议后端契约测试（使用假 adb 并记录 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |
 | SFTP 面板泛化后不回退 | L2 | 迁移 `coport_shells.py` 中的本机 OpenSSH 回环 | SFTP 下浏览、上传、下载、新建目录、删除全部成功 |
