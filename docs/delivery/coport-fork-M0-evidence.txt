@@ -1,0 +1,47 @@
+P1 · isolated Electron rerun
+{"probe":"P1","electron":"43.7.0","samples":[{"line":1,"osc":"fresh","end":"fresh","empty":true},{"line":2,"osc":"fresh","end":null,"empty":false},{"line":2,"osc":"new","end":null,"empty":false},{"line":3,"osc":"new","end":null,"empty":false},{"line":3,"osc":"new","end":null,"empty":false},{"line":3,"osc":"c1-new","end":null,"empty":false},{"line":3,"osc":"redraw","end":null,"empty":false},{"line":4,"osc":"occupied","end":"occupied","empty":false},{"line":5,"osc":"split","end":null,"empty":false},{"line":5,"osc":"split","end":null,"empty":false},{"line":5,"osc":"split","end":"split","empty":true},{"line":7,"osc":"split","end":null,"empty":false}],"lines":20008,"restoredRows":152,"bytes":1180000,"headlessMs":48,"rendererMs":35}
+
+P2 · isolated PTY rerun
+{"receivedHex":"ff006f70656e2d6e6f6973651b5b3f31303030681b5b366e","receivedText":"..open-noise.[?1000h.[6n"}
+{"receivedHex":"ff0061667465722d6f70656e1b5b3f31303030681b5b366e","receivedText":"..after-open.[?1000h.[6n"}
+PTY preload=False master received: {"receivedHex": "61690d", "receivedText": "ai."}
+PTY preload=False: {"bytesRead":48,"openingNoiseReceived":true,"replies":["\u001b[1;11R","\u001b[1;21R"],"txDrained":3}
+closed fd=0
+{"receivedHex":"ff0061667465722d6f70656e1b5b3f31303030681b5b366e","receivedText":"..after-open.[?1000h.[6n"}
+PTY preload=True master received: {"receivedHex": "61690d", "receivedText": "ai."}
+PTY preload=True: {"bytesRead":24,"openingNoiseReceived":false,"replies":["\u001b[1;11R"],"txDrained":3}
+closed fd=0
+
+P2 · CH340 historical run (peer receipt unobserved)
+open
+{"bytesRead":575,"textLines":3,"replacementCharacters":0,"txDrained":1,"peerReceipt":"unobserved"}
+closed fd=0
+
+P2 · FTDI historical run (exit 1, G3 pending)
+open
+closed fd=0
+AssertionError [ERR_ASSERTION]: FTDI did not return a shell prompt
+
+P3 · isolated Swift / Electron wire rerun
+{"tools": ["exec", "get_view_state", "open_serial", "prepare_shell", "read_terminal", "write_serial"], "fieldParity": true, "protectedMs": 1.59}
+
+Local arm64 build and packaging · historical logs
+webpack 5.110.3 compiled with 1 warning in 1654 ms
+Done in 58.82s.
+• packaging       platform=darwin arch=arm64 electron=43.7.0 appOutDir=dist/mac-arm64
+• skipped macOS code signing  reason=identity explicitly is set to null
+• building        target=macOS zip arch=arm64 file=dist/tabby-1.0.239-nightly.0-macos-arm64.zip
+• building        target=DMG arch=arm64 file=dist/tabby-1.0.239-nightly.0-macos-arm64.dmg
+
+Isolated startup rerun
+{"event": "app:ready", "electron": "43.7.0"}
+
+SSH TERM rerun
+# tests 14
+# pass 14
+# fail 0
+
+unit rerun
+# tests 11
+# pass 11
+# fail 0

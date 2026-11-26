@@ -23,7 +23,7 @@
 - 成功判据：spec 验收矩阵中全部 L0–L2 行通过；M4 的 G3 真机人工验收项通过；汇总 PR 不是 Draft，且所需 CI 通过。
 - 价值反馈：用户日常使用 Coport.app 替代原 App 后的反馈，在 PR 就绪后由用户试用提供。在此之前不算价值已验证。
 - 主要风险与前置验证：P1 headless 解析器一致性（失败时回退方案 A，验收不变）；P2 主进程 serialport 与 busy 成因；P3 MCP SDK 经 socket 的兼容性。三项都在 M0 先行验证。
-- 取舍与待决定事项：无。范围和关键设计都已由 G1/G2 确认。
+- 取舍与待决定事项：范围和关键设计已由 G1/G2 确认。由用户决定按现有证据准出 P2，把真机对端收包核对推迟到 M4 G3（L4），由用户在已上电并进入 shell 的 FTDI 板上执行。FTDI 仍由原 Coport 占用，本阶段保留现有设备连接。
 
 ## 里程碑计划
 
@@ -35,7 +35,7 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 | M1 · MVP | 人能用 Coport.app 中的 serial profile 共享打开串口：品牌与构建骨架、关闭统计和更新、主进程 sessionManager/serialHub/headless/IPC、`tabby-serial` 改为会话代理、WCH 优先与波特率提示、15 秒统一截止、R6 busy 修复、关窗保留与 Dock 挂回、退出释放、重启不重连、迁移 sim 框架与验收夹具 | R1（构建与独立启动）、R2、R6、R7；验收矩阵中对应的构建、启动、唯一串口类型、单一 fd、WCH、无输入 busy、统一截止、生命周期各行 | Codex | M0 准出 | 上述验收行通过，独立审查通过，提交 commit |
 | M2 · MVP | AI 经 `coport-mcp` 接入同一会话：mcpHost、Swift shim 打包与拉起、exec/prepare_shell 移植、仲裁单测转写、sim 全量回归 | R3、R4；验收矩阵中的防拼接仲裁、exec 全路径、MCP 工具兼容与后台拉起、socket 安全与连接上限 | Codex | M1 提交 | 同上 |
 | M3 · MVP | ADB：新增 `tabby-adb` 包，SFTP 面板改用 FileBackend，实现 ADB 后端，exec 优先走 ADB，SFTP 不回退 | R5；验收矩阵中的 ADB exec 路由、ADB 文件面板后端、SFTP 面板泛化不回退、同窗多类会话 | Codex | M2 提交 | 同上 |
-| M4 · MVP | 收尾：签名、`check-upstream-diff` 脚本、`upstream-changes.md` 与同步流程、G3 真机验收、汇总 PR 与 CI | R1（签名）、R8；上游改动白名单；人工验收项三行 | Codex；G3 由用户操作 | M3 提交 | 跨模型审查通过，G3 通过，汇总 PR 非 Draft 且 CI 通过 |
+| M4 · MVP | 收尾：签名、`check-upstream-diff` 脚本、`upstream-changes.md` 与同步流程、G3 真机验收（含 P2 的 FTDI 对端收包）、汇总 PR 与 CI | R1（签名）、R8；上游改动白名单；人工验收项（含 P2 的 L4） | Codex；G3 由用户操作 | M3 提交 | 跨模型审查通过，G3 通过，汇总 PR 非 Draft 且 CI 通过 |
 
 估时：每个里程碑以"验收与审查通过"为准，不承诺工期。仲裁移植约 2k 行，加上 sim 迁移，M1 和 M2 成本最高。
 
@@ -47,12 +47,12 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 
 | 仓库／现有工作区 | 当前任务与责任 | 里程碑起始提交／功能分支／最终目标分支 | 对端／环境依赖 |
 |---|---|---|---|
-| `~/project/coport-tabby` | P1–P3 探针与证据；把结论写回 spec | `54869e1` / `feat/coport-fork` / `main` | Node 与 yarn 构建环境；原仓库只读；P2 的 CH340 部分需要设备空闲，原 Coport 占用的 FTDI 口不要碰 |
+| `~/project/coport-tabby` | P1–P3 探针与证据；把结论写回 spec | `54869e1` / `feat/coport-fork` / `main` | Node 与 Yarn 构建环境；原仓库只读；使用既有 CH340 证据与隔离 PTY 回归 |
 
 ## 当前进展与问题
 
 | 里程碑 | 当前状态与实际结果 | 起止 commit／证据／交付记录／汇总 MR | 下一动作与负责方 |
 |---|---|---|---|
-| M0 | 待派发 | — | 编排方派 Codex 执行 |
+| M0 | P1、P3、本机构建与隔离启动通过。P2 两组隔离 PTY 双向收发和单一 fd 通过，CH340 在 921600 8N1 读取正常，本机写入、drain 成功。由用户决定将真机对端收包推迟到 M4 G3（L4），使用已上电并进入 shell 的 FTDI 板。打开时的 busy 未复现，M1 覆盖自动应答分类与陈旧输出 | `54869e1` → `0efd1d52`（定稿文档）；[M0 交付记录](../delivery/coport-fork-M0.md) | 完成 M0 独立审查并提交，随后进入 M1 |
 
-MVP 进展：方案和计划已定，工程交付尚未开始。
+MVP 进展：M0 预研验证完成，待独立审查与提交。M1–M4 尚未开始。
