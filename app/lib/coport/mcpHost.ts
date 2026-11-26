@@ -3,6 +3,7 @@ import { chmodSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs'
 import { createConnection, createServer, Server as Listener, Socket } from 'node:net'
 import { dirname } from 'node:path'
 import { McpConnection, tools } from './mcpTools'
+import type { AdbService } from './adbService'
 import type { SessionManager } from './sessionManager'
 
 // The SDK's Zod 4 declarations require TS 5. The Tabby build uses TS 4.
@@ -256,6 +257,7 @@ export class McpHost {
         private sessions: SessionManager,
         private path: string,
         private peerUid: (fd: number) => number = fd => require('./coport-queued-read.node').peerUid(fd),
+        private adb?: AdbService,
     ) {}
 
     async start (): Promise<void> {
@@ -300,7 +302,7 @@ export class McpHost {
 
     private accept (socket: Socket): void {
         this.sockets.add(socket)
-        const connection = new McpConnection(this.sessions)
+        const connection = new McpConnection(this.sessions, this.adb)
         const server = new Server({ name: 'Coport', version: '1.0.0' }, { capabilities: { tools: {} } })
         server.setRequestHandler(ListToolsRequestSchema, () => ({ tools }))
         server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {

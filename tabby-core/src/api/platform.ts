@@ -42,7 +42,12 @@ export abstract class FileTransfer {
     }
 
     isComplete (): boolean {
-        return !this.cancelled && (this.completed || this.completedBytes >= this.getSize())
+        return !this.cancelled && !this.pendingCommit && (this.completed || this.completedBytes >= this.getSize())
+    }
+
+    // coport: Staged transfers remain cancellable until the destination commits them.
+    setPendingCommit (pending: boolean): void {
+        this.pendingCommit = pending
     }
 
     isCancelled (): boolean {
@@ -80,17 +85,24 @@ export abstract class FileTransfer {
     private lastChunkStartTime = Date.now()
     private lastChunkSpeed = 0
     private cancelled = false
+    private pendingCommit = false
     private completed = false
     private status = ''
 }
 
 export abstract class FileDownload extends FileTransfer {
     abstract write (buffer: Uint8Array): Promise<void>
+
+    async completeDownload (): Promise<void> {
+        this.setPendingCommit(false)
+        this.setCompleted(true)
+        this.close()
+    }
 }
 
 export abstract class DirectoryDownload extends FileTransfer {
     abstract createDirectory (relativePath: string): Promise<void>
-    abstract createFile (relativePath: string, mode: number, size: number): Promise<FileDownload>
+    abstract createFile (relativePath: string, mode: number, size: number, atomic?: boolean): Promise<FileDownload>
 }
 
 export abstract class FileUpload extends FileTransfer {
@@ -155,7 +167,7 @@ export abstract class PlatformService {
     abstract loadConfig (): Promise<string>
     abstract saveConfig (content: string): Promise<void>
 
-    abstract startDownload (name: string, mode: number, size: number): Promise<FileDownload|null>
+    abstract startDownload (name: string, mode: number, size: number, filePath?: string, atomic?: boolean): Promise<FileDownload|null>
     abstract startDownloadDirectory (name: string, estimatedSize?: number): Promise<DirectoryDownload|null>
     abstract startUpload (options?: FileUploadOptions): Promise<FileUpload[]>
     abstract startUploadDirectory (paths?: string[]): Promise<DirectoryUpload>

@@ -302,7 +302,7 @@ export class ElectronPlatformService extends PlatformService {
         return root
     }
 
-    async startDownload (name: string, mode: number, size: number, filePath?: string): Promise<FileDownload|null> {
+    async startDownload (name: string, mode: number, size: number, filePath?: string, atomic = false): Promise<FileDownload|null> {
         if (!filePath) {
             const result = await this.electron.dialog.showSaveDialog(
                 this.hostWindow.getWindow(),
@@ -315,7 +315,7 @@ export class ElectronPlatformService extends PlatformService {
             }
             filePath = result.filePath
         }
-        const transfer = new ElectronFileDownload(filePath, mode, size, this.electron)
+        const transfer = new ElectronFileDownload(filePath, mode, size, this.electron, atomic)
         await wrapPromise(this.zone, transfer.open())
         this.fileTransferStarted.next(transfer)
         return transfer
@@ -423,22 +423,39 @@ class ElectronFileUpload extends FileUpload {
 }
 
 class ElectronFileDownload extends FileDownload {
-    private file: fs.FileHandle
+    private file?: fs.FileHandle
     private powerSaveBlocker = 0
+    private temporary?: { id: string, path: string }
+    private closing?: Promise<void>
+    private closed = false
 
     constructor (
         private filePath: string,
         private mode: number,
         private size: number,
         private electron: ElectronService,
+        private atomic = false,
     ) {
         super()
         this.powerSaveBlocker = electron.powerSaveBlocker.start('prevent-app-suspension')
         this.setTotalSize(size)
+        this.setPendingCommit(atomic)
     }
 
     async open (): Promise<void> {
-        this.file = await fs.open(this.filePath, 'w', this.mode)
+        try {
+            if (this.atomic) {
+                const reply = await this.electron.ipcRenderer.invoke('coport-adb:fs:reserve-local', { target: this.filePath })
+                if (!reply.ok) {
+                    throw new Error(reply.error.message)
+                }
+                this.temporary = reply.result
+            }
+            this.file = await fs.open(this.temporary?.path ?? this.filePath, this.atomic ? 'r+' : 'w', this.mode)
+        } catch (error) {
+            this.close()
+            throw error
+        }
     }
 
     getName (): string {
@@ -452,7 +469,7 @@ class ElectronFileDownload extends FileDownload {
     async write (buffer: Uint8Array): Promise<void> {
         let pos = 0
         while (pos < buffer.length) {
-            const result = await this.file.write(buffer, pos, buffer.length - pos, null)
+            const result = await this.file!.write(buffer, pos, buffer.length - pos, null)
             this.increaseProgress(result.bytesWritten)
             pos += result.bytesWritten
         }
@@ -461,9 +478,38 @@ class ElectronFileDownload extends FileDownload {
         }
     }
 
+    private closeHandle (): Promise<void> {
+        return this.closing ??= this.file?.close() ?? Promise.resolve()
+    }
+
+    async completeDownload (): Promise<void> {
+        if (this.temporary) {
+            await this.closeHandle()
+            if (this.isCancelled()) {
+                throw new Error('Download cancelled')
+            }
+            await fs.chmod(this.temporary.path, this.mode & 0o777 & ~process.umask())
+            if (this.isCancelled()) {
+                throw new Error('Download cancelled')
+            }
+            await fs.rename(this.temporary.path, this.filePath)
+        }
+        await super.completeDownload()
+    }
+
     close (): void {
+        if (this.closed) {
+            return
+        }
+        this.closed = true
         this.electron.powerSaveBlocker.stop(this.powerSaveBlocker)
-        this.file.close()
+        void this.closeHandle().finally(async () => {
+            if (this.temporary) {
+                const { id } = this.temporary
+                this.temporary = undefined
+                await this.electron.ipcRenderer.invoke('coport-adb:fs:release-local', { id })
+            }
+        }).catch(console.error)
     }
 }
 
@@ -499,11 +545,11 @@ class ElectronDirectoryDownload extends DirectoryDownload {
         await fs.mkdir(fullPath, { recursive: true })
     }
 
-    async createFile (relativePath: string, mode: number, size: number): Promise<FileDownload> {
+    async createFile (relativePath: string, mode: number, size: number, atomic = false): Promise<FileDownload> {
         const fullPath = resolveInsideBase(this.basePath, relativePath)
         await fs.mkdir(path.dirname(fullPath), { recursive: true })
 
-        const fileDownload = new ElectronFileDownload(fullPath, mode, size, this.electron)
+        const fileDownload = new ElectronFileDownload(fullPath, mode, size, this.electron, atomic)
         await wrapPromise(this.zone, fileDownload.open())
         return fileDownload
     }

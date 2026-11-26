@@ -9,7 +9,7 @@
         [(ngModel)]='editingPath'
     )
     .breadcrumb(*ngIf='editingPath === null', (dblclick)='editPath()')
-        a.breadcrumb-item.text-decoration-none((click)='navigate("/")') SFTP
+        a.breadcrumb-item.text-decoration-none((click)='navigate("/")') {{rootLabel}}
         a.breadcrumb-item.text-decoration-none(
             *ngFor='let segment of pathSegments',
             (click)='navigate(segment.path)'
@@ -52,9 +52,9 @@
         button.btn.btn-secondary((click)='clearFilter()')
             i.fas.fa-times
 
-.body(dropZone, (transfer)='uploadOneFolder($event)')
+.body(dropZone, [dropTarget]='getDropTarget', (transferAt)='uploadOneFolder($event.upload, $event.target)')
     a.alert.alert-info.d-flex.align-items-center(
-        *ngIf='shouldShowCWDTip && !cwdDetectionAvailable',
+        *ngIf='shouldShowCWDTip && cwdDetectionAvailable === false',
         (click)='platform.openExternal("https://tabby.sh/go/cwd-detection")'
     )
         .me-auto

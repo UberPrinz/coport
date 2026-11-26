@@ -1,0 +1,15 @@
+terminal-toolbar([tab]='this')
+    strong.me-auto {{serial}}
+    button.btn.btn-sm.btn-link((click)='showFiles = !showFiles')
+        i.far.fa-folder-open
+        span(translate) Files
+
+sftp-panel.coport-adb-files.bg-dark(
+    *ngIf='showFiles',
+    [session]='files',
+    [cwdDetectionAvailable]='null',
+    rootLabel='Files',
+    [(path)]='remotePath',
+    (closed)='showFiles = false',
+    (click)='$event.stopPropagation()'
+)

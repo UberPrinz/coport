@@ -28,6 +28,7 @@ export const builtinPlugins = [
     'tabby-serial',
     'tabby-telnet',
     'tabby-local',
+    'tabby-adb', // coport: Build after its Local and SSH dependencies.
     'tabby-electron',
     'tabby-plugin-manager',
     'tabby-linkifier',

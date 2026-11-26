@@ -293,8 +293,13 @@ sequenceDiagram
     AI-->>FB: entries 或 adb_error{stderr}
     U->>PN: 下载 a.log
     PN->>FB: download(path, FileDownload)
-    FB->>AI: invoke coport-adb:fs:pull{serial,path,transferId}
-    AI-->>FB: coport-adb:fs:{transferId}:chunk…，最后发 done 或 error
+    FB->>AI: invoke coport-adb:fs:pull{serial,path}
+    AI-->>FB: transferId
+    loop 每次读取至多 256 KiB
+        FB->>AI: invoke coport-adb:fs:read{id}
+        AI-->>FB: bytes（零字节为结束）或 adb_error
+    end
+    FB->>AI: invoke coport-adb:fs:close{id}
 ```
 
 ## 交互协议
@@ -329,7 +334,7 @@ sequenceDiagram
 
 ### 功能：MCP 工具与 coport-mcp
 
-AI 客户端通过 stdio 调用工具。工具定义以原仓库 `Sources/CoportMCP/MCPTools.swift` 和 `OpenSerialTool.swift`（`2c1ea46`）为基线逐一转写，唯一差异是 `get_view_state` 固定返回 `{"log": null}`。`exec` 在有已授权 ADB 设备时走 ADB，否则走已准备好的串口 shell。判定条件：`adbService` 找到 adb 可执行文件，`adb devices` 在 5 秒内返回，并且所选设备状态为 `device`（有多台设备时取最近使用的那台）。adb 缺失、server 启动失败或超时时，退回串口路径，并在结果中注明原因 `adb_unavailable`。连接级语义：`open_serial` 只绑定当前连接；连接 EOF 会触发遗留半行保护；最多 16 个连接，且最多 16 台活动或正在打开的共享串口设备。达到设备上限时仍可复用现有会话。连接时校验 uid。socket 权限为 0600，父目录只有属主可访问。协商 2025-03-26 的旧客户端仍可发送 JSON-RPC 批处理。
+AI 客户端通过 stdio 调用工具。工具定义以原仓库 `Sources/CoportMCP/MCPTools.swift` 和 `OpenSerialTool.swift`（`2c1ea46`）为基线逐一转写，唯一差异是 `get_view_state` 固定返回 `{"log": null}`。`exec` 在有已授权 ADB 设备时走 ADB，否则走已准备好的串口 shell。判定条件：`adbService` 找到 adb 可执行文件，`adb devices` 在 5 秒内返回，并且所选设备状态为 `device`（有多台设备时取最近使用的那台）。发现、PTY、文件操作和 MCP 使用应用启动时固定的 ADB server 参数。adb 缺失、server 启动失败或超时时，退回串口路径，并在结果的 `adb_fallback.reason`（或错误的 `error.details.adb_fallback.reason`）中注明 `adb_unavailable`。保留串口原有错误原因，离线或未授权时在 `adb_fallback.message` 中保留各设备状态。空设备列表沿用串口输出。连接级语义：`open_serial` 只绑定当前连接；连接 EOF 会触发遗留半行保护；最多 16 个连接，且最多 16 台活动或正在打开的共享串口设备。达到设备上限时仍可复用现有会话。连接时校验 uid。socket 权限为 0600，父目录只有属主可访问。协商 2025-03-26 的旧客户端仍可发送 JSON-RPC 批处理。
 
 `coport-mcp`：源码沿用原仓库 `Sources/coport-mcp/main.swift`，并把 `Sources/CoportMCP/UnixSocket.swift` 单独抽出，一起放到 `extras/coport-mcp/` 下编译（不连带整个 CoportMCP 模块），只修改拉起命令，改为 `open -g -j -b local.coport.app --args --coport-background`。`--tabby` 参数仍可传入，等同于默认行为。socket 路径、5 秒重试窗口和 stderr 报错行为不变。带 `--coport-background` 启动时，主进程不创建窗口。
 
@@ -352,10 +357,10 @@ export interface FileBackend {
 
 ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 - readdir：`adb -s <serial> ls <path>`，解析逻辑与"不可读目录"的判定沿用 `ADBClient.parseDirectoryListing`
-- stat、readlink：`adb shell` 执行 `stat -c` 和 `readlink`；无法判定时按普通条目处理
-- download：`adb exec-out cat` 流式读取，失败时回退为 `adb pull` 到临时文件
-- upload：先 `adb push` 到远端临时文件名，再用 `mv` 改为目标名
-- mkdir、rmdir、unlink：`adb shell` 执行，路径做 shell 转义
+- stat、readlink：`adb shell` 执行 `stat -L -c` 和 `readlink`；无法判定时按普通条目处理
+- download：`adb exec-out cat` 流式写入私有临时文件，读取完成后移除校验通过的远端完成标记。标记缺失或读取失败时改用 `adb pull` 覆盖临时文件。成功后通过带背压的 IPC 分块交付，避免部分失败的 cat 输出污染最终文件
+- upload：通过 IPC 分块写入私有临时文件，再 `adb push` 到唯一的远端临时文件名，用 `mv` 改为目标名。完成、取消、窗口退出时清除临时文件
+- mkdir、rmdir、unlink：`adb shell` 执行，路径做 shell 转义。目录和删除操作以及上传后的移动通过远端成功标记验证，兼容缺少 shell v2 的设备
 
 错误统一为 `adb_error`，并附带 stderr。
 
@@ -388,7 +393,10 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | `tabby-terminal/src/frontends/frontend.ts`、`xtermFrontend.ts` | 串口视图保留键盘及粘贴，丢弃设备上报，在 xterm 完成解析后 ACK，按主进程输出顺序应用尺寸 |
 | `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts` | 允许主进程托管的串口标签不生成恢复令牌，SSH 保持其原有恢复逻辑 |
 | `app/webpack.config.main.mjs` | 从 app 包加载现有串口原生绑定、同一 fd 的 FIONREAD 和 socket 对端 uid 探针，以及锁定的 MCP SDK |
-| `tabby-ssh/src/components/sftpPanel.component.ts`、`session/sftp.ts`、`index.ts` | 抽出并导出 `FileBackend`，放宽面板的输入类型 |
+| `tabby-ssh/src/components/sftpPanel.component.ts`、`sftpPanel.component.pug`、`sftpDeleteModal.component.ts`、`session/sftp.ts`、`index.ts`、`sftpContextMenu.ts` | 抽出并导出 `FileBackend`，面板和删除交互可用于 SSH 和 ADB |
+| `tabby-core/src/api/profileProvider.ts`、`tabby-core/src/api/platform.ts` | 选择取消不打开标签。ADB 分阶段上传等待远端提交后才完成 |
+| `tabby-core/src/directives/dropZone.directive.ts` | 拖放文件扫描前记录目标路径 |
+| `tabby-electron/src/sftpContextMenu.ts`、`tabby-electron/src/services/platform.service.ts` | 本地编辑继续使用 SSH 后端能力。ADB 下载原子替换本地文件，保留既有 SFTP 下载路径 |
 | `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），根构建在 macOS 编译 Node-API 模块和 Swift shim |
 | `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
@@ -419,8 +427,8 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | MCP 六个工具兼容与后台拉起 | L2 | `wire_test.py`、`serial_exec.sh`、`shim_autostart.py`，组合覆盖原 `ai_e2e.py` 的串口用例 | 工具清单和 schema 与原快照一致。旧版 JSON-RPC 批处理按请求顺序返回一组响应。应用未运行时可以拉起，且没有可见窗口 |
 | 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定的写入、`exec`、`prepare_shell` 返回 `channel_lost`，历史仍可读；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
 | 串口视图尺寸与历史回放 | L2 | `coport_serial.py --geometry`（隔离 Coport.app 与私有 PTY） | 120 列实时输出、关窗后分别以 120 列和 80 列挂回、无窗口时沿用上次尺寸、挂接后实时 resize、AI 从 80×24 打开后以 120 列挂接。检查实际渲染 xterm 的字符位置和游标、PTY 收到的 headless 光标报告及代次复用 |
-| ADB exec 优先路由 | L2 | 迁移 `prepare_adb.py` 和 `scripts/fixtures/adb` | 有授权设备时 exec 返回 `channel=adb`；没有设备时走串口；离线或未授权时提示具体状态 |
-| ADB 文件面板后端 | L2 | 提议后端契约测试（使用假 adb 并记录 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |
+| ADB exec 优先路由 | L2 | `python3 -B scripts/coport/sim/prepare_adb.py "$bundle"` 与假 adb | 有授权设备时 exec 返回 `channel=adb`；没有设备时走串口；离线或未授权时提示具体状态 |
+| ADB 文件面板后端 | L2 | `python3 -B scripts/coport/sim/coport_shells.py "$bundle"`（实际 renderer、假 adb，核对 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |
 | SFTP 面板泛化后不回退 | L2 | 迁移 `coport_shells.py` 中的本机 OpenSSH 回环 | SFTP 下浏览、上传、下载、新建目录、删除全部成功 |
 | 同窗口内多类会话共存 | L2 | `coport_shells.py` | 本地终端、SSH 回环、共享串口、ADB PTY 在同一窗口内正常工作；切换标签后 AI 的绑定不变 |
 | 上游改动白名单 | L0 | 提议 `scripts/coport/check-upstream-diff.mjs` | 白名单之外 diff 为空；`upstream-changes.md` 覆盖所有修改 |

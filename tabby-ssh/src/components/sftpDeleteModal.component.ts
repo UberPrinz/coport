@@ -1,28 +1,35 @@
 import { Component } from '@angular/core'
 import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap'
-import { BaseComponent } from 'tabby-core'
-import { SFTPFile, SFTPSession } from '../session/sftp'
+import { BaseComponent, NotificationsService } from 'tabby-core'
+import { SFTPFile } from '../session/sftp'
+import { FileBackend } from '../api/fileBackend'
 
 /** @hidden */
 @Component({
     templateUrl: './sftpDeleteModal.component.pug',
 })
 export class SFTPDeleteModalComponent extends BaseComponent {
-    sftp: SFTPSession
+    sftp: FileBackend
     item: SFTPFile
     progressMessage = ''
     cancelled = false
 
     constructor (
         private modalInstance: NgbActiveModal,
+        private notifications: NotificationsService,
     ) {
         super()
     }
 
     async ngOnInit (): Promise<void> {
         this.destroyed$.subscribe(() => this.cancel())
-        await this.run(this.item)
-        this.modalInstance.close()
+        try {
+            await this.run(this.item)
+            this.modalInstance.close()
+        } catch (error) {
+            this.notifications.error(error.message)
+            this.modalInstance.dismiss(error)
+        }
     }
 
     cancel (): void {
@@ -40,9 +47,11 @@ export class SFTPDeleteModalComponent extends BaseComponent {
                     break
                 }
             }
-            await this.sftp.rmdir(file.fullPath)
+            if (!this.cancelled) {
+                await this.sftp.rmdir(file.fullPath)
+            }
         } else {
-            this.sftp.unlink(file.fullPath)
+            await this.sftp.unlink(file.fullPath)
         }
     }
 }

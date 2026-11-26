@@ -32,6 +32,8 @@ import { loadConfig } from './config'
 import { SessionManager } from './coport/sessionManager'
 import { installSerialIpc } from './coport/serialIpc'
 import { McpHost } from './coport/mcpHost'
+import { AdbService } from './coport/adbService'
+import { installAdbIpc } from './coport/adbIpc'
 
 const argv = parseArgs(process.argv, process.cwd())
 
@@ -49,21 +51,23 @@ process.mainModule = module
 
 const application = new Application(configStore)
 const serial = new SessionManager()
+const adb = new AdbService(isolatedDir ? process.env.COPORT_TEST_ADB : undefined, configStore?.terminal?.environment)
 const mcp = process.platform === 'darwin'
     ? new McpHost(serial, isolatedDir && process.env.COPORT_TEST_SOCKET
-        ? process.env.COPORT_TEST_SOCKET : join(app.getPath('userData'), 'mcp.sock'))
+        ? process.env.COPORT_TEST_SOCKET : join(app.getPath('userData'), 'mcp.sock'), undefined, adb)
     : undefined
 const background = process.argv.includes('--coport-background')
 
 let quitting = false
 let servicesStopped = false
+let stopAdbTransfers: (() => Promise<void>) | undefined = undefined
 // coport: Leave serial intact if the renderer cancels the quit request.
 app.on('will-quit', event => {
     if (!servicesStopped) {
         event.preventDefault()
         if (!quitting) {
             quitting = true
-            void Promise.allSettled([mcp?.stop(), serial.shutdown()]).then(() => {
+            void Promise.allSettled([mcp?.stop(), serial.shutdown(), stopAdbTransfers?.()]).then(() => {
                 servicesStopped = true
                 app.quit()
             })
@@ -149,6 +153,7 @@ app.on('ready', async () => {
     try {
         application.init()
         installSerialIpc(serial)
+        stopAdbTransfers = installAdbIpc(adb)
         await mcp?.start()
         console.log('coport: ready')
         if (background) {

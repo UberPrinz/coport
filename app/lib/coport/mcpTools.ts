@@ -2,6 +2,7 @@ import { SessionManager, SerialSession, SerialConfig } from './sessionManager'
 import { SerialFailure } from './serialHub'
 import { ExecFailure } from './serialExec'
 import { isAbsolute } from 'node:path'
+import type { AdbService } from './adbService'
 
 interface Tool {
     name: string
@@ -89,12 +90,14 @@ export class McpConnection {
     private source = Symbol('mcp')
     private binding?: SerialSession
     private closed = false
+    private abort = new AbortController()
 
-    constructor (private sessions: SessionManager) {}
+    constructor (private sessions: SessionManager, private adb?: AdbService) {}
 
     close (): void {
         if (!this.closed) {
             this.closed = true
+            this.abort.abort()
             this.sessions.clientDisconnected(this.source)
         }
     }
@@ -107,6 +110,7 @@ export class McpConnection {
         if (!argsMatch(tools[index], args, name !== 'write_serial')) {
             return errorResult('invalid_argument', argumentErrors[index])
         }
+        let adbFallback: { reason: string, message?: string } | undefined = undefined
         try {
             switch (name) {
                 case 'open_serial': {
@@ -163,21 +167,32 @@ export class McpConnection {
                     if (command.includes('\0')) {
                         return errorResult('invalid_argument', argumentErrors[index])
                     }
-                    if (!this.binding) {
-                        return errorResult('no_device', 'No device connected', true)
+                    const route = await this.adb?.selectForExec(this.abort.signal)
+                    if (this.closed) {
+                        return errorResult('channel_lost', channelLost, true)
                     }
-                    return await this.binding.exec.run(command, timeout_ms, max_output_bytes, () => this.closed)
+                    if (route?.selection) {
+                        return await this.adb!.exec(route.selection, command, timeout_ms, max_output_bytes, this.abort.signal)
+                    }
+                    if (route?.reason) {
+                        adbFallback = { reason: route.reason, message: route.message }
+                    }
+                    if (!this.binding) {
+                        return errorResult('no_device', 'No device connected', true, adbFallback && { adb_fallback: adbFallback })
+                    }
+                    const result = await this.binding.exec.run(command, timeout_ms, max_output_bytes, () => this.closed)
+                    return adbFallback ? { ...result, adb_fallback: adbFallback } : result
                 }
                 default:
                     return errorResult('invalid_argument', 'Unknown tool')
             }
         } catch (error) {
             if (error instanceof ExecFailure) {
-                const details = error.code === 'channel_lost' && name === 'exec'
+                const details = error.details ?? (error.code === 'channel_lost' && name === 'exec'
                     ? { channel: 'serial', partial_output: '' }
-                    : error.details
+                    : undefined)
                 return errorResult(error.code, error.message, !['timeout', 'command_too_long'].includes(error.code),
-                    error.details ?? details)
+                    adbFallback ? { ...details, adb_fallback: adbFallback } : details)
             }
             if (error instanceof SerialFailure) {
                 switch (error.code) {
