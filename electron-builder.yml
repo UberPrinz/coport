@@ -61,6 +61,10 @@ nsis:
   allowToChangeInstallationDirectory: true
   shortcutName: Tabby Terminal
 mac:
+  extraFiles:
+  # coport: The legacy stdio shim stays next to the application executable.
+  - from: dist/coport-mcp
+    to: MacOS/coport-mcp
   category: public.app-category.utilities
   icon: "./build/mac/icon.icns"
   artifactName: coport-${version}-macos-${env.ARCH}.${ext}

@@ -4,14 +4,14 @@
 
 | 上游文件 | Coport 改动 |
 |---|---|
-| `app/lib/index.ts` | 注册主进程串口 IPC 与安全退出流程，处理后台启动和隔离数据目录，避免隔离启动改写宿主协议注册 |
+| `app/lib/index.ts` | 注册主进程串口 IPC、MCP host 与安全退出流程，处理后台启动和隔离数据目录，避免隔离启动改写宿主协议注册 |
 | `app/lib/app.ts`、`app/lib/window.ts` | 菜单、托盘和窗口使用打包后的名称。移除主进程自动更新器 |
 | `app/lib/sentry.ts` | 保留构建和 preload 入口，移除 Sentry 初始化 |
-| `app/package.json` | 为 Electron 声明产品名，加入 headless 与 serialize 依赖 |
-| `app/yarn.lock` | Yarn 生成的 headless 和 serialize 锁项。M2 的 SDK 与其传递依赖获准在接入时更新 |
-| `app/webpack.config.main.mjs` | 从 app 包解析现有 serialport 原生绑定，外部加载 FIONREAD Node-API 模块 |
-| `build/mac/icon.icns`、`electron-builder.yml` | 更换为 Coport 图标、产品名、bundle ID 与 macOS 产物名称。将 FIONREAD 模块从 asar 解包 |
-| `package.json` | 在 macOS 构建时编译 FIONREAD Node-API 模块 |
+| `app/package.json` | 为 Electron 声明产品名，加入 headless、serialize 与锁定的 MCP SDK 1.29.0 |
+| `app/yarn.lock` | Yarn 生成的 headless、serialize、MCP SDK 及其传递依赖锁项 |
+| `app/webpack.config.main.mjs` | 从 app 包解析 serialport 和 MCP SDK，外部加载 FIONREAD 与 getpeereid Node-API 模块 |
+| `build/mac/icon.icns`、`electron-builder.yml` | 更换为 Coport 图标、产品名、bundle ID 与 macOS 产物名称。将 Node-API 模块从 asar 解包，将 Swift shim 放在 Contents/MacOS |
+| `package.json` | 在 macOS 构建时编译 Coport 的原生组件 |
 | `tabby-core/src/api/hostWindow.ts`、`services/app.service.ts`、`tabby-electron/src/services/hostWindow.service.ts` | 窗口拒绝关闭时通知主进程取消退出请求，保留活动串口 |
 | `tabby-core/src/api/selector.ts`、`services/profiles.service.ts`、`components/selectorModal.component.ts` | 在快速连接及过滤结果中保留同一适配器的驱动顺序 |
 | `tabby-core/src/configDefaults.yaml` | 关闭默认统计与自动更新 |

@@ -10,7 +10,7 @@ mkdirSync(join(repo, output), { recursive: true })
 execFileSync(process.execPath, ['scripts/coport/build-native.mjs'], options)
 execFileSync(process.execPath, [
     'node_modules/typescript/bin/tsc', '--target', 'es2022', '--module', 'commonjs', '--skipLibCheck',
-    '--esModuleInterop', '--outDir', output, 'app/lib/coport/sessionManager.ts',
+    '--esModuleInterop', '--outDir', output, 'app/lib/coport/sessionManager.ts', 'app/lib/coport/mcpHost.ts',
 ], options)
 for (const file of ['app/lib/coport/history.js', 'app/dist/coport-queued-read.node']) {
     copyFileSync(join(repo, file), join(repo, output, file.split('/').at(-1)))

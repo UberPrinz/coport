@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, realpathSync, statSync } from 'node:fs'
+import { access, realpath, stat } from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
 import { EventEmitter } from 'node:events'
 import { HeadlessTerminal } from './headlessTerminal'
 import { openDevice, SerialDevice } from './serialDevice'
-import { SerialFailure, SerialHub } from './serialHub'
+import { SERIAL_BUDGET, SerialFailure, SerialHub } from './serialHub'
+import { SerialExec } from './serialExec'
 
 export interface SerialConfig {
     port: string
@@ -39,14 +40,25 @@ export function serialConfig (input: Partial<SerialConfig> | undefined): SerialC
     return { port, baudrate: baudrate!, databits, stopbits, parity, rtscts, xon, xoff, xany }
 }
 
-export function darwinCalloutPath (resolved: string, exists = existsSync): string {
+export async function darwinCalloutPath (
+    resolved: string, exists: (path: string) => boolean | Promise<boolean> = path => access(path).then(() => true, () => false),
+): Promise<string> {
     if (resolved.startsWith('/dev/tty.')) {
         const callout = '/dev/cu.' + resolved.slice('/dev/tty.'.length)
-        if (exists(callout)) {
+        if (await exists(callout)) {
             return callout
         }
     }
     return resolved
+}
+
+async function identifyDevice (port: string): Promise<{ path: string, identity: bigint }> {
+    const path = await darwinCalloutPath(await realpath(port))
+    const info = await stat(path, { bigint: true })
+    if (!info.isCharacterDevice()) {
+        throw new Error('Not a character device')
+    }
+    return { path, identity: info.rdev }
 }
 
 function timeoutError (): SerialFailure {
@@ -61,12 +73,16 @@ export class SerialSession extends EventEmitter {
     readonly generation = randomUUID()
     readonly hub: SerialHub
     readonly terminal: HeadlessTerminal
+    readonly exec: SerialExec
     private buffer = Buffer.allocUnsafe(16384)
     private parsing?: Promise<void>
     private ending?: Promise<void>
     private settingsUpdate?: Promise<void>
     private profileBaudOverride?: { id: string, original: number }
     private seq = 0
+    private replies: Buffer[] = []
+    private replyBytes = 0
+    private replyTimer?: ReturnType<typeof setTimeout>
     // Preserve device chunks for profiles that apply legacy display transforms.
     // The headless parser stays authoritative for history and prompt evidence.
     private displayFrames: Buffer[] = []
@@ -74,26 +90,19 @@ export class SerialSession extends EventEmitter {
     private displayHead = 0
 
     constructor (
-        public readonly config: SerialConfig, private device: SerialDevice, private onLoss: () => void,
+        public readonly config: SerialConfig, public readonly path: string,
+        private device: SerialDevice, private onLoss: () => void,
         private terminalReplies: boolean, size?: TerminalSize,
     ) {
         super()
         this.hub = new SerialHub(device, () => this.watch())
-        this.terminal = new HeadlessTerminal(data => {
-            if (!this.terminalReplies) {
-                return
-            }
-            try {
-                this.hub.enqueue(data, 'terminal')
-            } catch (error) {
-                if (error.code !== 'queue_full' && error.code !== 'channel_lost') {
-                    this.onLoss()
-                }
-            }
-        }, size)
+        this.terminal = new HeadlessTerminal(data => this.queueReply(data), size)
+        this.exec = new SerialExec(this.hub, () => this.afterOutput(() => this.terminal.history.prompt()))
+        this.hub.onEnqueued = data => this.exec.enqueued(data)
         device.onReady(() => this.read(), () => {
             try {
                 this.hub.drainWrites()
+                this.flushReplies()
             } catch {
                 this.onLoss()
             }
@@ -102,6 +111,64 @@ export class SerialSession extends EventEmitter {
 
     setTerminalReplies (enabled: boolean): void {
         this.terminalReplies = enabled
+        if (!enabled) {
+            this.clearReplies()
+        }
+    }
+
+    private tryReply (data: Buffer): boolean {
+        try {
+            this.hub.enqueue(data, 'terminal')
+            return true
+        } catch (error) {
+            if (error.code === 'queue_full') {
+                return false
+            }
+            if (error.code !== 'channel_lost') {
+                this.onLoss()
+            }
+            return true
+        }
+    }
+
+    private queueReply (data: Buffer): void {
+        if (!this.terminalReplies || !this.hub.connected) {
+            return
+        }
+        if (!this.replies.length && this.tryReply(data)) {
+            return
+        }
+        // The old renderer retried queue_full because the serial hub had
+        // accepted zero bytes. Keep the same bound and retry window here.
+        if (data.length > SERIAL_BUDGET - this.replyBytes) {
+            this.onLoss()
+            return
+        }
+        this.replyTimer ??= setTimeout(() => this.onLoss(), 3500)
+        this.replyBytes += data.length
+        this.replies.push(data)
+    }
+
+    private flushReplies (): void {
+        let accepted = 0
+        for (const data of this.replies) {
+            if (!this.tryReply(data) || !this.hub.connected) {
+                break
+            }
+            this.replyBytes -= data.length
+            accepted++
+        }
+        this.replies.splice(0, accepted)
+        if (!this.replies.length) {
+            this.clearReplies()
+        }
+    }
+
+    private clearReplies (): void {
+        clearTimeout(this.replyTimer)
+        this.replyTimer = undefined
+        this.replies.length = 0
+        this.replyBytes = 0
     }
 
     start (): void {
@@ -144,6 +211,7 @@ export class SerialSession extends EventEmitter {
                 this.parsing = undefined
                 this.watch()
             })
+            this.exec.receive(bytes)
             this.watch()
         } catch {
             this.onLoss()
@@ -218,6 +286,8 @@ export class SerialSession extends EventEmitter {
 
     close (reason: EndReason): Promise<void> {
         if (!this.ending) {
+            this.clearReplies()
+            this.exec.close()
             this.hub.close()
             this.displayFrames.length = 0
             this.ending = this.waitForSettings().then(() => this.device.close()).finally(async () => {
@@ -235,8 +305,11 @@ export class SessionManager {
     private opening = new Map<bigint, Promise<SerialSession>>()
     private closing = new Map<bigint, Promise<void>>()
     private stopping = false
+    private resolutionOrder = Promise.resolve()
 
-    constructor (private open = openDevice, private openTimeout = 15000) {}
+    constructor (
+        private open = openDevice, private openTimeout = 15000, private identify = identifyDevice,
+    ) {}
 
     async ensure (
         input: Partial<SerialConfig>, terminalReplies = true, profileId?: string, size?: TerminalSize,
@@ -246,30 +319,33 @@ export class SessionManager {
             throw channelLost()
         }
         const config = serialConfig(input)
-        let path: string | undefined = undefined
-        let identity: bigint | undefined = undefined
-        try {
-            path = darwinCalloutPath(realpathSync(config.port))
-            const stat = statSync(path, { bigint: true })
-            if (!stat.isCharacterDevice()) {
-                throw new Error('Not a character device')
-            }
-            identity = stat.rdev
-        } catch (error) {
-            throw new SerialFailure('invalid_argument', `Cannot use serial device ${config.port}: ${error.message}`)
+        // Resolve paths in parallel, but admit them to the device queue in request order.
+        const previous = this.resolutionOrder
+        let release: (() => void) | undefined = undefined
+        const turn = new Promise<void>(resolve => { release = resolve })
+        this.resolutionOrder = previous.then(() => turn)
+        const request = async () => {
+            const resolution = this.identify(config.port).catch(error => {
+                this.checkDeadline(deadline)
+                throw new SerialFailure('invalid_argument', `Cannot use serial device ${config.port}: ${error.message}`)
+            })
+            const [{ path, identity }] = await Promise.all([resolution, previous])
+            this.checkDeadline(deadline)
+            const session = this.ensureDevice(identity, path, config, deadline, terminalReplies, profileId, size)
+            release?.()
+            return session
         }
         let timer: ReturnType<typeof setTimeout> | undefined = undefined
-        const remaining = deadline - performance.now()
-        if (remaining <= 0) {
-            throw timeoutError()
-        }
         try {
             return await Promise.race([
-                new Promise<never>((_, reject) => { timer = setTimeout(() => reject(timeoutError()), Math.ceil(remaining)) }),
-                this.ensureDevice(identity, path, config, deadline, terminalReplies, profileId, size),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(timeoutError()), Math.max(0, Math.ceil(deadline - performance.now())))
+                }),
+                request(),
             ])
         } finally {
             clearTimeout(timer)
+            release?.()
         }
     }
 
@@ -294,6 +370,9 @@ export class SessionManager {
                 throw channelLost()
             }
             return { session, reused: true }
+        }
+        if (new Set([...this.sessions.keys(), ...this.opening.keys()]).size >= 16) {
+            throw new SerialFailure('queue_full', 'Shared serial queue is full')
         }
         const opening = this.openSession(identity, path, config, deadline, terminalReplies, size)
         this.opening.set(identity, opening)
@@ -321,15 +400,20 @@ export class SessionManager {
             device = await this.open(path, identity, config)
         } catch (error) {
             this.checkDeadline(deadline)
-            if (error.code === 'EBUSY' || /resource busy|cannot lock/i.test(error.message)) {
+            // The native binding includes strerror in the message but omits errno.
+            if (['EBUSY', 'EACCES', 'EWOULDBLOCK'].includes(error.code) ||
+                /^Error .+ Cannot lock port$|^Error: (Resource busy|Permission denied|Resource temporarily unavailable), cannot open /.test(error.message)) {
                 throw new SerialFailure('port_busy', error.message)
+            }
+            if (error.code === 'ENOENT' || error.message?.startsWith('Error: No such file or directory, cannot open ')) {
+                throw new SerialFailure('invalid_argument', error.message)
             }
             throw error
         }
         let session: SerialSession | undefined = undefined
         try {
             this.checkDeadline(deadline)
-            session = new SerialSession(config, device, () => {
+            session = new SerialSession(config, path, device, () => {
                 void this.end(identity, 'device_lost').catch(console.error)
             }, terminalReplies, size)
             this.checkDeadline(deadline)
@@ -373,6 +457,16 @@ export class SessionManager {
             await closing
         } finally {
             this.closing.delete(identity)
+        }
+    }
+
+    clientDisconnected (source: symbol): void {
+        for (const [identity, session] of this.sessions) {
+            try {
+                session.hub.clientDisconnected(source)
+            } catch {
+                void this.end(identity, 'device_lost').catch(console.error)
+            }
         }
     }
 

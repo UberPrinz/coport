@@ -1,6 +1,11 @@
 import { BrowserWindow, ipcMain, IpcMainEvent, IpcMainInvokeEvent, WebContents } from 'electron'
 import { SERIAL_BUDGET, SerialFailure } from './serialHub'
-import { SessionManager, SerialSession, TerminalSize } from './sessionManager'
+import { SessionManager, SerialSession, TerminalSize, SerialConfig } from './sessionManager'
+
+function activeParameters (config: SerialConfig): object {
+    const { port, baudrate, databits, stopbits, parity, rtscts, xon, xoff, xany } = config
+    return { port, baudrate, databits, stopbits, parity, flowControl: { rtscts, xon, xoff, xany } }
+}
 
 function terminalSize ({ cols, rows }: TerminalSize): TerminalSize {
     if (!Number.isInteger(cols) || cols < 2 || cols > 1000 ||
@@ -34,7 +39,7 @@ export function installSerialIpc (manager: SessionManager): void {
                     return { ok: false, error: {
                         code: error.code, message: error.message,
                         retryable: ['port_busy', 'busy', 'queue_full', 'timeout'].includes(error.code),
-                        ...(error.active ? { active: error.active } : {}),
+                        ...(error.active ? { active: activeParameters(error.active as SerialConfig) } : {}),
                     } }
                 }
                 console.error('coport: serial IPC failed', error)

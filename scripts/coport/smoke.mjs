@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
 import { setTimeout as delay } from 'node:timers/promises'
 
 async function waitFor (callback, timeout = 12000) {
@@ -64,7 +65,28 @@ const bundle = resolve(process.argv[2] ?? 'dist/mac-arm64/Coport.app')
 const executable = join(bundle, 'Contents/MacOS/Coport')
 const plist = join(bundle, 'Contents/Info.plist')
 assert.equal(execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print CFBundleIdentifier', plist], { encoding: 'utf8' }).trim(), 'local.coport.app')
-const run = await realpath(await mkdtemp(join(tmpdir(), 'coport-m1-smoke-')))
+const run = await realpath(await mkdtemp(join(tmpdir(), 'coport-smoke-')))
+const endpoint = join(run, 'mcp.sock')
+const requireApp = createRequire(new URL('../../app/package.json', import.meta.url))
+const { Client } = requireApp('@modelcontextprotocol/sdk/client/index.js')
+const { StdioClientTransport } = requireApp('@modelcontextprotocol/sdk/client/stdio.js')
+let mcp
+
+async function connectMcp () {
+    const client = new Client({ name: 'coport-lifecycle', version: '1' })
+    await client.connect(new StdioClientTransport({
+        command: join(bundle, 'Contents/MacOS/coport-mcp'),
+        env: { COPORT_TEST_SOCKET: endpoint },
+    }))
+    return client
+}
+
+async function tool (name, args) {
+    const result = await mcp.callTool({ name, arguments: args })
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent)
+    assert.equal(result.isError, 'error' in result.structuredContent)
+    return result.structuredContent
+}
 const geometry = process.argv[3] === '--geometry'
 const lifecycle = geometry || process.argv[3] === '--lifecycle'
 const hexMonitor = process.argv.includes('--hex-monitor')
@@ -125,6 +147,9 @@ async function start () {
     assert.equal(info.name, 'Coport')
     assert.equal(info.data, run)
     assert.match(log, /coport: ready/)
+    const socket = await lstat(endpoint)
+    assert.equal(socket.isSocket(), true)
+    assert.equal(socket.mode & 0o777, 0o600)
     assert.equal(info.pid, app.pid)
     const processes = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,comm='], { encoding: 'utf8' })
         .trim().split('\n').map(line => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)).filter(Boolean)
@@ -143,7 +168,7 @@ async function start () {
         }
     }
     console.log(JSON.stringify({ case: 'startup', bundleId: 'local.coport.app', renderer: 'ready',
-        originalSwiftDescendants: 0, ...info }))
+        originalSwiftDescendants: 0, socketMode: '0600', ...info }))
     return { port, target }
 }
 
@@ -229,6 +254,7 @@ async function openProfile (target, name = profileName, baudrate = 115200, gateA
 async function quit (target) {
     await evaluate(target, 'setTimeout(() => require("@electron/remote").app.quit(), 100); true')
     assert.deepEqual(await Promise.race([exit, delay(5000, ['timeout'])]), [0, null])
+    await assert.rejects(lstat(endpoint), { code: 'ENOENT' })
 }
 
 async function exerciseCancelledQuit (target) {
@@ -327,17 +353,16 @@ async function exerciseGeometry (port, target) {
 
     assert.equal(await evaluate(target, `require('electron').ipcRenderer.invoke('coport-serial:disconnect',
         { generation: ${JSON.stringify(opened.result.generation)} }).then(x => x.ok)`), true)
-    const ai = await evaluate(target, `require('electron').ipcRenderer.invoke('coport-serial:ensure', {
-        config: { port: ${JSON.stringify(device)}, baudrate: 115200 }, reveal: false
-    })`)
-    assert.equal(ai.ok, true)
-    assert.notEqual(ai.result.generation, opened.result.generation)
+    mcp = await connectMcp()
+    const ai = await tool('open_serial', { path: device })
+    assert.equal(ai.reused, false)
+    assert.notEqual(ai.session_id.toLowerCase(), opened.result.generation.toLowerCase())
     console.log(JSON.stringify({ case: 'geometry-write-ai', reply: '\x1b[24;80R\x1b[2;2R' }))
     // Wait for the PTY's DSR round trip before revealing the AI-opened session.
     target = await reopen(target, 120, 28)
     await waitFor(() => readFile(join(run, 'geometry-write-ai'), 'utf8').then(() => true))
     const attached = await openProfile(target)
-    assert.deepEqual(attached, { ok: true, result: { generation: ai.result.generation, reused: true } })
+    assert.deepEqual(attached, { ok: true, result: { generation: ai.session_id.toLowerCase(), reused: true } })
     await assertGeometry(target, {
         ...wide, y: 1, lines: ['A'.repeat(80), 'B' + 'A'.repeat(19)],
     })
@@ -363,6 +388,19 @@ try {
         assert.equal(initial.ok, true)
         assert.equal(countFds(app.pid), 1)
         console.log(JSON.stringify({ case: 'profile-open', pid: app.pid, ...initial.result }))
+        mcp = await connectMcp()
+        const joined = await tool('open_serial', { path: device })
+        assert.deepEqual(joined, { session_id: initial.result.generation.toUpperCase(), path: device, reused: true })
+        const conflict = await evaluate(target, `require('electron').ipcRenderer.invoke('coport-serial:ensure', {
+            config: { port: ${JSON.stringify(device)}, baudrate: 9600 }, reveal: false
+        })`)
+        assert.equal(conflict.ok, false)
+        assert.equal(conflict.error.code, 'config_conflict')
+        assert.deepEqual(conflict.error.active, {
+            port: device, baudrate: 115200, databits: 8, stopbits: 1, parity: 'none',
+            flowControl: { rtscts: false, xon: false, xoff: false, xany: false },
+        })
+        console.log(JSON.stringify({ case: 'ipc-config-conflict', active: conflict.error.active }))
 
         await waitFor(() => evaluate(target, `coportCapture.frames.some(frame =>
             frame.bytes.includes('COPORT-SNAPSHOT') && coportCapture.acks[frame.generation] >= frame.seq)`))
@@ -399,6 +437,18 @@ try {
         await waitFor(async () => !await renderer(port))
         assert.equal(countFds(app.pid), 1)
 
+        if (!hexMonitor) {
+            assert.deepEqual(await tool('write_serial', { data: 'MCP-DETACHED\r' }), { bytes_queued: 13 })
+            console.log(JSON.stringify({ case: 'mcp-detached-write' }))
+            const reading = await tool('read_terminal', { after_line: -1, wait_ms: 1000 })
+            const detachedLine = line => line.text === 'MCP-DETACHED-OUTPUT'
+            if (!reading.lines.some(detachedLine)) {
+                const observed = await tool('read_terminal', { after_line: reading.last_line, wait_ms: 2000 })
+                assert.ok(observed.lines.some(detachedLine))
+            }
+            console.log(JSON.stringify({ case: 'mcp-detached-read', session_id: joined.session_id }))
+        }
+
         execFileSync(resolve('dist/coport-m1/reopen'), [String(app.pid)], { stdio: 'inherit', timeout: 4000 })
         const reopened = await readyWindow(port)
         assert.notEqual(reopened.id, target.id)
@@ -420,6 +470,29 @@ try {
         await evaluate(reopened, `[...document.querySelectorAll('serial-tab button')]
             .find(button => button.textContent.trim() === 'Disconnect').click()`)
         await waitFor(() => countFds(app.pid) === 0)
+        assert.deepEqual(await tool('write_serial', { data: 'stale\r' }), {
+            error: { code: 'channel_lost', message: 'Tabby terminal is unavailable', retryable: true },
+        })
+        assert.equal((await tool('prepare_shell')).error.code, 'channel_lost')
+        assert.equal((await tool('exec', { command: 'true' })).error.code, 'channel_lost')
+        assert.ok((await tool('read_terminal')).lines.some(line => line.text.includes('COPORT-SNAPSHOT')))
+        console.log(JSON.stringify({ case: 'mcp-disconnected', channelLost: true, historyReadable: true }))
+        const [humanRace, aiRace] = await Promise.all([
+            evaluate(reopened, `require('electron').ipcRenderer.invoke('coport-serial:ensure', {
+                config: { port: ${JSON.stringify(device)}, baudrate: 115200 }, reveal: true,
+                windowId: require('@electron/remote').getCurrentWindow().id, cols: 80, rows: 24,
+            })`),
+            tool('open_serial', { path: device }),
+        ])
+        assert.equal(humanRace.ok, true)
+        assert.equal(humanRace.result.generation, aiRace.session_id.toLowerCase())
+        assert.notEqual(humanRace.result.reused, aiRace.reused)
+        assert.equal(countFds(app.pid), 1)
+        assert.equal(await evaluate(reopened, `require('electron').ipcRenderer.invoke('coport-serial:disconnect', {
+            generation: ${JSON.stringify(humanRace.result.generation)}
+        }).then(result => result.ok)`), true)
+        assert.equal(countFds(app.pid), 0)
+        console.log(JSON.stringify({ case: 'mcp-ipc-concurrent-open', openedFds: 1, aiReused: aiRace.reused }))
         await evaluate(reopened, `(() => {
             const dialog = require('@electron/remote').dialog
             const original = dialog.showMessageBox
@@ -462,6 +535,7 @@ try {
             replayedHistory: true, hexMonitor, generation: reused.result.generation, disconnectFds: 0, quitFds: 0, restartFds: 0 }))
     }
 } finally {
+    await mcp?.close()
     if (app && app.exitCode === null && app.signalCode === null) {
         app.kill('SIGKILL')
         await exit

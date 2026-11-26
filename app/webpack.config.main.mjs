@@ -35,7 +35,10 @@ const config = {
             },
         ],
     },
-    externals: {
+    externals: [({ request }, callback) => {
+        // coport: Keep the MCP SDK and its Zod runtime in the app package.
+        callback(null, request?.startsWith('@modelcontextprotocol/sdk/') ? `commonjs ${request}` : undefined)
+    }, {
         // coport: Load serialport from the app package so bindings-cpp can find its native addon.
         serialport: 'commonjs serialport',
         './coport-queued-read.node': 'commonjs ./coport-queued-read.node',
@@ -56,7 +59,7 @@ const config = {
         'windows-swca': 'commonjs windows-swca',
         'windows-native-registry': 'commonjs windows-native-registry',
         'yargs/yargs': 'commonjs yargs/yargs',
-    },
+    }],
     plugins: [
         new wp.optimize.ModuleConcatenationPlugin(),
         new wp.DefinePlugin({

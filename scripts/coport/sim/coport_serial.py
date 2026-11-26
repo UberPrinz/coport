@@ -121,6 +121,12 @@ def main():
                             event["deviceReceivedBytes"] = len(response)
                             event["deviceReceivedHex"] = response.hex()
                             line = json.dumps(event)
+                        if event["case"] == "mcp-detached-write":
+                            response = wire(master, 0.15)
+                            assert response == b"MCP-DETACHED\r", response
+                            os.write(master, b"MCP-DETACHED-OUTPUT\r\n")
+                            event["deviceReceivedHex"] = response.hex()
+                            line = json.dumps(event)
                         if event["case"] == "profile-reopened":
                             response = wire(master, 0.15)
                             assert not response, f"Reopen repeated login bytes {response.hex()}"

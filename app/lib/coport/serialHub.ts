@@ -34,6 +34,7 @@ export class SerialHub {
     private evidence?: { token: symbol, stale: number }
     private closed = false
     humanWriteSeq = 0
+    onEnqueued?: (data: Buffer) => void
 
     constructor (private device: SerialDevice, private writable: () => void) {
         this.evidence = { token: Symbol(), stale: device.queuedReadBytes() }
@@ -57,6 +58,7 @@ export class SerialHub {
                 this.humanWriteSeq++
             }
             this.writes.push({ data, offset: 0, done })
+            this.onEnqueued?.(data)
             this.writable()
             return data.length
         } catch (error) {

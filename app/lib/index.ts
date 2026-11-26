@@ -3,7 +3,7 @@ import { logMainError } from './errors'
 
 import { app, ipcMain, Menu, dialog } from 'electron'
 import { mkdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 
 // set userData Path on portable version
 import './portable'
@@ -31,6 +31,7 @@ import { loadConfig } from './config'
 // coport: Serial state belongs to the main process and survives renderer teardown.
 import { SessionManager } from './coport/sessionManager'
 import { installSerialIpc } from './coport/serialIpc'
+import { McpHost } from './coport/mcpHost'
 
 const argv = parseArgs(process.argv, process.cwd())
 
@@ -48,18 +49,22 @@ process.mainModule = module
 
 const application = new Application(configStore)
 const serial = new SessionManager()
+const mcp = process.platform === 'darwin'
+    ? new McpHost(serial, isolatedDir && process.env.COPORT_TEST_SOCKET
+        ? process.env.COPORT_TEST_SOCKET : join(app.getPath('userData'), 'mcp.sock'))
+    : undefined
 const background = process.argv.includes('--coport-background')
 
 let quitting = false
-let serialStopped = false
+let servicesStopped = false
 // coport: Leave serial intact if the renderer cancels the quit request.
 app.on('will-quit', event => {
-    if (!serialStopped) {
+    if (!servicesStopped) {
         event.preventDefault()
         if (!quitting) {
             quitting = true
-            void serial.shutdown().finally(() => {
-                serialStopped = true
+            void Promise.allSettled([mcp?.stop(), serial.shutdown()]).then(() => {
+                servicesStopped = true
                 app.quit()
             })
         }
@@ -144,6 +149,7 @@ app.on('ready', async () => {
     try {
         application.init()
         installSerialIpc(serial)
+        await mcp?.start()
         console.log('coport: ready')
         if (background) {
             return
@@ -154,8 +160,11 @@ app.on('ready', async () => {
         window.passCliArguments(process.argv, process.cwd(), false)
         window.focus()
     } catch (err) {
-        logMainError('Failed to open window', err)
-        dialog.showErrorBox('Coport failed to start', String(err?.stack ?? err))
+        await mcp?.stop()
+        logMainError('Failed to start Coport', err)
+        if (!background) {
+            dialog.showErrorBox('Coport failed to start', String(err?.stack ?? err))
+        }
         app.exit(1)
     }
 })

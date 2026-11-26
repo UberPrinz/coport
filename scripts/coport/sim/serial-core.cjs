@@ -171,9 +171,9 @@ app.whenReady().then(async () => {
             if (scenario === 'extended') {
                 const dialIn = '/dev/tty.cop-pty-fixture'
                 const callout = '/dev/cu.cop-pty-fixture'
-                assert.equal(darwinCalloutPath(dialIn, path => path === callout), callout)
-                assert.equal(darwinCalloutPath(dialIn, () => false), dialIn)
-                assert.equal(darwinCalloutPath(callout), callout)
+                assert.equal(await darwinCalloutPath(dialIn, path => path === callout), callout)
+                assert.equal(await darwinCalloutPath(dialIn, () => false), dialIn)
+                assert.equal(await darwinCalloutPath(callout), callout)
                 for (const mode of ['human-first', 'ai-first', 'concurrent']) {
                     const before = opens
                     await basic(manager, mode)

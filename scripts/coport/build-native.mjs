@@ -21,4 +21,12 @@ if (process.platform === 'darwin') {
         '-bundle', '-undefined', 'dynamic_lookup', '-arch', process.env.ARCH ?? process.arch,
         '-I', headers, '-o', output, resolve(root, 'app/lib/coport/queuedRead.c'),
     ], { stdio: 'inherit' })
+    const shim = resolve(root, 'dist/coport-mcp')
+    mkdirSync(dirname(shim), { recursive: true })
+    const arch = process.env.ARCH ?? process.arch
+    execFileSync('swiftc', [
+        '-O', '-target', `${arch === 'x64' ? 'x86_64' : arch}-apple-macosx12.0`,
+        '-o', shim, 'extras/coport-mcp/main.swift', 'extras/coport-mcp/UnixSocket.swift',
+    ], { cwd: root, stdio: 'inherit' })
+    execFileSync('codesign', ['--force', '--sign', '-', shim], { stdio: 'inherit' })
 }

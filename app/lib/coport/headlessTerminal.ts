@@ -1,6 +1,7 @@
 import { Terminal } from '@xterm/headless'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import type { SerialHub } from './serialHub'
+import { installTerminalReplies } from './terminalReplies'
 
 const { History } = require('./history.js')
 
@@ -13,6 +14,7 @@ export class HeadlessTerminal {
         this.terminal = new Terminal({ ...size, scrollback: 10000, allowProposedApi: true })
         this.history = new History(this.terminal, 10000)
         this.terminal.loadAddon(this.serializer)
+        installTerminalReplies(this.terminal, onReply)
         this.terminal.onData(data => onReply(Buffer.from(data)))
         this.terminal.onBinary(data => onReply(Buffer.from(data, 'latin1')))
     }

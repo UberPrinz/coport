@@ -39,15 +39,16 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 
 估时：每个里程碑以"验收与审查通过"为准，不承诺工期。仲裁移植约 2k 行，加上 sim 迁移，M1 和 M2 成本最高。
 
-### 当前里程碑 M1
+### 当前里程碑 M2
 
-M0 已准出。经授权，设置页模板加入 R8 白名单，移除更新入口时标注并登记。M1 验收隔离启动日志 `coport: ready` 及进程树中无原 Swift App，M2 接入完整 MCP host 后重跑独立启动并核对 `mcp.sock`。R7 在 M1 使用私有 PTY 验证串口生命周期，M2 接入 MCP host 后重跑整行并补齐 MCP 读写、旧绑定错误与 socket 清理。各阶段记录依赖后续交付的判据及重跑里程碑，最终保留验收矩阵中的所有判据。具体裁决和实测见 [M1 交付记录](../delivery/coport-fork-M1.md)。
+M1 已提交为 `b414202e`。M2 接入 MCP host、Swift shim、串口 exec 和 prepare_shell，逐分支移植原仲裁并运行契约及隔离联调。R1 复测启动后创建 `mcp.sock`，R7 复测关窗后 MCP 读写、Disconnect 后旧绑定错误、退出后删除 socket，沿用 M1 的全部生命周期判据。ADB 路由和文件面板留给 M3。详见 [M2 交付记录](../delivery/coport-fork-M2.md)。
 
 ## 当前进展与问题
 
 | 里程碑 | 当前状态与实际结果 | 起止 commit／证据／交付记录／汇总 MR | 下一动作与负责方 |
 |---|---|---|---|
 | M0 | 已提交，独立复审无阻塞项。P1、P3、arm64 构建与隔离启动通过。P2 两组私有 PTY 双向收发和单一 fd 通过，采用既有 CH340 读取、本机写入与 drain 证据。由用户决定将真机对端收包推迟到 M4 G3（L4） | `54869e1` → `39ab33f2`。[M0 交付记录](../delivery/coport-fork-M0.md) · [验收证据](../delivery/coport-fork-M0-evidence.txt) | M4 G3 时由用户使用已上电并进入 shell 的 FTDI 板核对收包 |
-| M1 | 尺寸同步、R7 私有 PTY 生命周期、独立启动与第 4 轮复审通过 | 起始 `39ab33f2`，已提交裁决 `fb57641a`。[交付记录](../delivery/coport-fork-M1.md#实现期设计决定) · [验收证据](../delivery/coport-fork-M1-evidence.txt) | M2 接入 MCP host 后重跑完整 R1 启动和 R7 生命周期 |
+| M1 | 已提交。尺寸同步、R7 私有 PTY 生命周期、独立启动与第 4 轮复审通过 | `39ab33f2` → `b414202e`，裁决 `fb57641a`。[交付记录](../delivery/coport-fork-M1.md#实现期设计决定) · [验收证据](../delivery/coport-fork-M1-evidence.txt) | M2 接入 MCP host 后重跑完整 R1 启动和 R7 生命周期 |
+| M2 | 实现留在工作区。按已授权的调整，异 UID 验收使用 L1 对端凭据测试及 L2 文件系统实测。R1 和 R7 已取得隔离包证据。独立审查发现的契约缺口已修复，最终复审无发现，待提交 | 起始 `b414202e`。[M2 交付记录](../delivery/coport-fork-M2.md) | 完成修复后的复验、独立复审和 M2 提交，再推进 M3 |
 
-M0 前置验证已完成。M1 的阶段验收与独立复审完成，M2–M4 依次交付。G3 L4 与汇总 PR 待后续里程碑。
+M3 和 M4 依次等待前序提交。G3 L4 与汇总 PR 待后续里程碑。

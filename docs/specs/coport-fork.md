@@ -111,7 +111,7 @@ flowchart TB
     subgraph MAIN["Coport 主进程 app/lib"]
         direction TB
         subgraph MA["接入层"]
-            MCPH["coport/mcpHost.ts<br/>McpServer + socket Transport，每连接绑定，≤16 连接，校验 uid"]
+            MCPH["coport/mcpHost.ts<br/>SDK Server + socket Transport，每连接绑定，≤16 连接，校验 uid"]
             SIPC["coport/serialIpc.ts<br/>coport-serial:* 处理与视图注册"]
             AIPC["coport/adbIpc.ts<br/>coport-adb:*"]
         end
@@ -311,7 +311,7 @@ sequenceDiagram
 
 | 消息 | 方向 | 请求 | 结果与规则 |
 |---|---|---|---|
-| `coport-serial:ensure` | 渲染→主（invoke）；mcpHost 在进程内直接调用 | `config{port:string, baudrate:number, databits:5\|6\|7\|8=8, stopbits:1\|1.5\|2=1, parity:'none'\|'odd'\|'even'\|'mark'\|'space'='none', rtscts=false, xon=false, xoff=false, xany=false}`；`reveal:boolean`；`windowId?:number, cols?:number, rows?:number`（reveal 时必填，尺寸范围与 attach 相同） | `{generation:string, reused:boolean, focus?:{windowId,tabId}}`。`port` 必须是字符设备；`baudrate` 为 1 到 4294967295 的整数（非标准值由渲染端提示，主进程不拒绝）。同一设备的打开请求按到达顺序逐个处理：首次打开失败时，所有等待者收到同一个错误；成功后，后到的请求与活动会话比较参数，一致则复用，不一致则返回 `config_conflict` 并附带 `active`（6 个参数）。`reveal:true` 但缺少调用方 `windowId` 或尺寸非法时返回 `invalid_argument`。截止时间为 15 秒，从请求进入主进程算起，到期返回 `timeout`；此后迟到的打开完成会被立即关闭 |
+| `coport-serial:ensure` | 渲染→主（invoke）；mcpHost 在进程内直接调用 | `config{port:string, baudrate:number, databits:5\|6\|7\|8=8, stopbits:1\|1.5\|2=1, parity:'none'\|'odd'\|'even'\|'mark'\|'space'='none', rtscts=false, xon=false, xoff=false, xany=false}`；`reveal:boolean`；`windowId?:number, cols?:number, rows?:number`（reveal 时必填，尺寸范围与 attach 相同） | `{generation:string, reused:boolean, focus?:{windowId,tabId}}`。`port` 必须是字符设备；`baudrate` 为 1 到 4294967295 的整数（非标准值由渲染端提示，主进程不拒绝）。同一设备的打开请求按到达顺序逐个处理：首次打开失败时，所有等待者收到同一个错误；成功后，后到的请求与活动会话比较参数，一致则复用，不一致则返回 `config_conflict` 并附带 `active`（`port`、`baudrate`、`databits`、`stopbits`、`parity`、`flowControl`，最后一项保留四个流控开关）。`reveal:true` 但缺少调用方 `windowId` 或尺寸非法时返回 `invalid_argument`。截止时间为 15 秒，从请求进入主进程算起，到期返回 `timeout`；此后迟到的打开完成会被立即关闭 |
 | `coport-serial:attach`、`coport-serial:attach-display` | 渲染→主（invoke） | `{generation, cols, rows}` | `{snapshot:string, seq:number}`。主进程先应用尺寸，再返回快照。此后该 webContents 收到 `seq` 大于快照 seq 的 `output` 事件。代次已结束时返回 `channel_lost`。旧显示模式经 `attach-display` 额外取得原始字节帧 |
 | `coport-serial:resize` | 渲染→主（invoke） | `{generation, cols, rows}` | 更新已挂接视图所属代次的尺寸，未挂接或旧代次返回 `channel_lost`，尺寸非法返回 `invalid_argument`。与 attach 相同，列数为 2 至 1000 的整数，行数为 1 至 1000 的整数 |
 | `coport-serial:resized` | 主→渲染（事件） | — | `{generation, cols, rows}`。与设备 `output` 事件按发送顺序串行应用 |
@@ -319,7 +319,7 @@ sequenceDiagram
 | `coport-serial:ack` | 渲染→主 | `{generation, seq}` | 表示该视图已把 seq 及之前的输出写入 xterm，仅用于视图流控，与提示符证据无关。重复或乱序的 ack 取其中最大值，旧代次的 ack 忽略 |
 | `coport-serial:input` | 渲染→主（invoke） | `{generation, bytes}`，1 到 65536 字节 | `{queued:number}`。主进程固定把来源记为 `human`。出现 `busy` 或 `queue_full` 时在写入前拒绝；旧代次返回 `channel_lost` |
 | `coport-serial:detach` | 渲染→主 | `generation` | 只断开视图，不影响会话。没有视图、也没有 AI 绑定的会话照样保留（与原实现一致），直到用户显式 Disconnect、设备丢失或应用退出；用户再次打开同一 profile 时会挂回这个会话 |
-| `coport-serial:disconnect` | 渲染→主（invoke） | `generation` | 结束该代次，释放 fd，丢弃待写数据；已绑定该代次的 AI 后续调用返回 `channel_lost` |
+| `coport-serial:disconnect` | 渲染→主（invoke） | `generation` | 结束该代次，释放 fd，丢弃待写数据；已绑定该代次的 AI 写入和执行返回 `channel_lost`，`read_terminal` 仍可读取保留的历史 |
 | `coport-serial:ended` | 主→渲染（事件） | — | `{generation, reason:'disconnected'\|'device_lost'\|'quit'}`。视图显示为已断开，并按 Tabby 的 `behaviorOnSessionEnd` 处理 |
 
 
@@ -329,7 +329,7 @@ sequenceDiagram
 
 ### 功能：MCP 工具与 coport-mcp
 
-AI 客户端通过 stdio 调用工具。工具定义以原仓库 `Sources/CoportMCP/MCPTools.swift` 和 `OpenSerialTool.swift`（`2c1ea46`）为基线逐一转写，唯一差异是 `get_view_state` 固定返回 `{"log": null}`。`exec` 在有已授权 ADB 设备时走 ADB，否则走已准备好的串口 shell。判定条件：`adbService` 找到 adb 可执行文件，`adb devices` 在 5 秒内返回，并且所选设备状态为 `device`（有多台设备时取最近使用的那台）。adb 缺失、server 启动失败或超时时，退回串口路径，并在结果中注明原因 `adb_unavailable`。连接级语义：`open_serial` 只绑定当前连接；连接 EOF 会触发遗留半行保护；最多 16 个连接；连接时校验 uid；socket 权限为 0600，父目录只有属主可访问。
+AI 客户端通过 stdio 调用工具。工具定义以原仓库 `Sources/CoportMCP/MCPTools.swift` 和 `OpenSerialTool.swift`（`2c1ea46`）为基线逐一转写，唯一差异是 `get_view_state` 固定返回 `{"log": null}`。`exec` 在有已授权 ADB 设备时走 ADB，否则走已准备好的串口 shell。判定条件：`adbService` 找到 adb 可执行文件，`adb devices` 在 5 秒内返回，并且所选设备状态为 `device`（有多台设备时取最近使用的那台）。adb 缺失、server 启动失败或超时时，退回串口路径，并在结果中注明原因 `adb_unavailable`。连接级语义：`open_serial` 只绑定当前连接；连接 EOF 会触发遗留半行保护；最多 16 个连接，且最多 16 台活动或正在打开的共享串口设备。达到设备上限时仍可复用现有会话。连接时校验 uid。socket 权限为 0600，父目录只有属主可访问。协商 2025-03-26 的旧客户端仍可发送 JSON-RPC 批处理。
 
 `coport-mcp`：源码沿用原仓库 `Sources/coport-mcp/main.swift`，并把 `Sources/CoportMCP/UnixSocket.swift` 单独抽出，一起放到 `extras/coport-mcp/` 下编译（不连带整个 CoportMCP 模块），只修改拉起命令，改为 `open -g -j -b local.coport.app --args --coport-background`。`--tabby` 参数仍可传入，等同于默认行为。socket 路径、5 秒重试窗口和 stderr 报错行为不变。带 `--coport-background` 启动时，主进程不创建窗口。
 
@@ -387,9 +387,9 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | `tabby-serial/src/*` | 把 `SerialSession` 改为会话代理；端口列表 WCH 优先并加标注；增加波特率提示；移除 recoveryProvider |
 | `tabby-terminal/src/frontends/frontend.ts`、`xtermFrontend.ts` | 串口视图保留键盘及粘贴，丢弃设备上报，在 xterm 完成解析后 ACK，按主进程输出顺序应用尺寸 |
 | `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts` | 允许主进程托管的串口标签不生成恢复令牌，SSH 保持其原有恢复逻辑 |
-| `app/webpack.config.main.mjs` | 从 app 包加载现有串口原生绑定及同一 fd 的 FIONREAD 探针 |
+| `app/webpack.config.main.mjs` | 从 app 包加载现有串口原生绑定、同一 fd 的 FIONREAD 和 socket 对端 uid 探针，以及锁定的 MCP SDK |
 | `tabby-ssh/src/components/sftpPanel.component.ts`、`session/sftp.ts`、`index.ts` | 抽出并导出 `FileBackend`，放宽面板的输入类型 |
-| `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），M1 的根构建在 macOS 编译 FIONREAD Node-API 模块 |
+| `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），根构建在 macOS 编译 Node-API 模块和 Swift shim |
 | `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
 
@@ -409,15 +409,15 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | 构建签名、品牌、关闭统计与更新 | L1 | `node scripts/build-macos.mjs`（fork 现有）加 `codesign --verify --deep --strict` | 退出码 0；`CFBundleIdentifier` 为 `local.coport.app`；默认配置中的两个开关为 false；没有 Sentry 初始化 |
 | 未安装原 App 时独立启动 | L2 | 提议 `scripts/coport/smoke.mjs`（隔离 `--user-data-dir`） | M1：日志中出现 `coport: ready`，进程树中没有原 Swift App。M2：接入完整 MCP host 后重跑，沿用上述断言并检查隔离目录中的 `mcp.sock` 已创建，另按后台拉起用例验证冷启动 |
 | 只有一种串口类型，旧配置兼容 | L1 | 提议 `tabby-serial` 单元测试 | profile 提供者中只有 `serial`；旧 YAML profile 可以打开 |
-| 同一设备单一 fd：人先、AI 先、并发三种顺序，以及经别名节点打开 | L2 | `scripts/coport/sim/coport_serial.py --extended`（迁自 `tabby_shared_serial.py`；别名用指向同一 PTY 的符号链接） | 三种顺序都只打开一次设备、只有一个 fd；从别名路径打开时复用同一 generation；参数冲突时人和 AI 都收到 `config_conflict` 并附 active，原会话不受影响 |
-| MCP socket 安全与连接上限 | L2 | 迁移 `wire_test.py`，并增加第 17 个连接和非属主 uid 的用例（提议） | socket 权限为 0600；第 17 个连接被拒绝；uid 不符的连接被关闭 |
+| 同一设备单一 fd：人先、AI 先、并发三种顺序，以及经别名节点打开 | L2 | `scripts/coport/sim/coport_serial.py --extended`（迁自 `tabby_shared_serial.py`；别名用指向同一 PTY 的符号链接） | 三种顺序都只打开一次设备、只有一个 fd；从别名路径打开时复用同一 generation；参数冲突时原会话不受影响。AI 侧的 `config_conflict` 错误与 Swift 快照逐字段一致（`code`、`message`、`retryable`），`message` 包含活动参数。人侧的 `coport-serial:ensure` IPC 返回 `config_conflict` 和含六个活动参数的结构化 `active` |
+| MCP socket 安全与连接上限 | L1/L2 | L2：`wire_test.py` 记录 socket 与父目录的 stat。L1：运行 `build-fixtures.mjs` 后执行 `node --test scripts/coport/sim/mcp-peer-uid.test.cjs`，注入异 UID。有 root 环境时可额外手动运行 `wire_test.py --foreign-uid` | socket 和父目录均由当前 UID 所有，权限分别为 0600 和 0700，其他普通用户无法穿过目录连接。第 17 个连接被拒绝。第 17 台共享串口设备返回可重试的 `queue_full`，复用已有设备仍成功。UID 不符的连接被关闭且不进入 MCP 处理 |
 | WCH 节点优先与非标准波特率提示 | L1 | 提议 `tabby-serial` 组件测试（注入双节点端口清单） | WCH 节点在前，苹果节点带标注；输入 961200 时出现提示，确认后可以连接 |
-| 防拼接仲裁一致 | L1/L2 | 提议 `app/lib/coport/__tests__/serialHub.test.ts`（转写自 Swift XCTest）加 `coport_serial.py --extended` 和 `coport_history.py` | 冲突写入返回 busy 且 PTY master 收到 0 字节；迟到回显、Ctrl-O、ACK 积压、中断后旧完成、自动接管、新代次等原有断言全部通过 |
+| 防拼接仲裁一致 | L1/L2 | `node --test scripts/coport/sim/serial-arbitration.test.cjs`（转写自 Swift XCTest）加 `coport_serial.py --extended` 和 `coport_history.py` | 冲突写入返回 busy 且 PTY master 收到 0 字节；迟到回显、Ctrl-O、ACK 积压、中断后旧完成、自动接管、新代次等原有断言全部通过 |
 | exec 与 prepare_shell 全路径 | L1/L2 | `scripts/coport/sim/serial_exec.sh`（迁移）加单元测试 | `__cp` 标记、超时时预留 Ctrl-C、`ctrl_c_not_sent`、恢复观测等用例退出码均为 0 |
 | 无人工输入时不返回 busy | L2 | 提议 `coport_serial.py --open-noise`：打开瞬间灌入乱码和 `ESC[?1000h`，并注入鼠标与焦点上报 | AI 写入成功；有真实人工半行时仍返回 busy |
 | 打开统一截止并在过期后清理 | L2 | 提议用例：fake binding 打开时挂起 | 在 15±0.5 秒内返回 `timeout`；之后 fd 数为 0，会话表为空 |
-| MCP 六个工具兼容与后台拉起 | L2 | 迁移 `wire_test.py`、`ai_e2e.py`、`shim_autostart.py` | 工具清单和 schema 与原快照一致；应用未运行时可以拉起，且没有可见窗口 |
-| 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定返回 `channel_lost`；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
+| MCP 六个工具兼容与后台拉起 | L2 | `wire_test.py`、`serial_exec.sh`、`shim_autostart.py`，组合覆盖原 `ai_e2e.py` 的串口用例 | 工具清单和 schema 与原快照一致。旧版 JSON-RPC 批处理按请求顺序返回一组响应。应用未运行时可以拉起，且没有可见窗口 |
+| 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定的写入、`exec`、`prepare_shell` 返回 `channel_lost`，历史仍可读；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
 | 串口视图尺寸与历史回放 | L2 | `coport_serial.py --geometry`（隔离 Coport.app 与私有 PTY） | 120 列实时输出、关窗后分别以 120 列和 80 列挂回、无窗口时沿用上次尺寸、挂接后实时 resize、AI 从 80×24 打开后以 120 列挂接。检查实际渲染 xterm 的字符位置和游标、PTY 收到的 headless 光标报告及代次复用 |
 | ADB exec 优先路由 | L2 | 迁移 `prepare_adb.py` 和 `scripts/fixtures/adb` | 有授权设备时 exec 返回 `channel=adb`；没有设备时走串口；离线或未授权时提示具体状态 |
 | ADB 文件面板后端 | L2 | 提议后端契约测试（使用假 adb 并记录 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |

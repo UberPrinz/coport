@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@electron/remote": "^2",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@npmcli/arborist": "^9",
     "@xterm/addon-serialize": "0.12.0",
     "@xterm/headless": "5.5.0",
