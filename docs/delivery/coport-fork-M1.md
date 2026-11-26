@@ -1,7 +1,7 @@
 # Coport fork M1 交付记录
 
 - 功能分支 `feat/coport-fork`，目标 `main`，M1 起始提交 `39ab33f2`。原实现读取基线 `2c1ea46`。
-- 状态为两项启动前裁决已落实到规格与计划。当前没有 M1 产品代码，审查和 CI 修复均为 0 轮，无 PR。
+- 两项启动前裁决由 `5285dfca` 落实到规格与计划。M1 在实现前发现依赖锁文件的白名单冲突，当前没有 M1 产品代码，审查和 CI 修复均为 0 轮，无 PR。
 - M0 已准出。[M0 交付记录](coport-fork-M0.md) · [验收证据](coport-fork-M0-evidence.txt)
 
 ## 已确认裁决
@@ -13,4 +13,12 @@
 
 使用 Electron 43.7.0、现有 Darwin 串口绑定与本次新开的私有 PTY 验证 `FIONREAD`。一次性 Node-API 探针在现有绑定持有的 fd 上读到 9 个缓冲字节，消费后读到 0，fd 与 PTY 的 `st_rdev` 一致。此结果验证了在同一个 fd 上保留 Swift 的陈旧输出水位判断的可行性。产品移植仍待实现。完整输出位于忽略目录 `dist/coport-m1/evidence/fionread-private-pty.log`。
 
-下一步是从本分支实现及验证 M1。FTDI、CH340 和原 Coport 会话均保持原状态。
+## 阻塞：主进程依赖锁文件
+
+规格要求从 app 包解析 `@xterm/headless`、`@xterm/addon-serialize` 和 `@modelcontextprotocol/sdk`。前两项用于 M1 的 headless 解析，SDK 用于 M2。R8 白名单列出了 `app/package.json`，未列出 `app/yarn.lock`。
+
+在 `5285dfca` 上，`git ls-files --error-unmatch app/yarn.lock` 退出 0，确认锁文件已受版本控制。静态检查确认三个依赖在该锁文件内均无条目。仓库安装脚本在 `app/` 独立运行 Yarn，渲染包的锁文件不能为主进程解析这些依赖。M0 探针使用的是忽略目录中的单独依赖安装。
+
+待裁决：允许 `app/yarn.lock` 随 `app/package.json` 更新，只包含为规格所列新增依赖生成的锁定记录。生成的锁项在上游改动清单登记，手写修改继续标注 `coport:`。确认后同步规格，从同一分支恢复 M1 实现和隔离验收。
+
+本次只检查文档与依赖文件。FTDI、CH340 和原 Coport 会话均保持原状态。
