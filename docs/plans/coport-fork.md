@@ -32,8 +32,8 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 | 里程碑与归属 | 可验收结果与范围 | 需求／验收引用 | 主要负责方 | 前置条件 | 结束条件 |
 |---|---|---|---|---|---|
 | M0 · 前置工作 | P1、P2、P3 的预研结论与证据：通过、未通过并启用回退、或证据不足。同时确认 fork 能在本机构建并启动 | spec 中"前置预研与准出标准"的 P1–P3；验收矩阵的三条预研行 | Codex（coport-tabby） | 功能分支已建立 | 各项结论写回 spec 的"验证状态与结论"，探针代码和证据提交到 commit。P1 未通过时在 spec 中改用方案 A 并记录原因 |
-| M1 · MVP | 人能用 Coport.app 中的 serial profile 共享打开串口：品牌与构建骨架、关闭统计和更新、主进程 sessionManager/serialHub/headless/IPC、`tabby-serial` 改为会话代理、WCH 优先与波特率提示、15 秒统一截止、R6 busy 修复、关窗保留与 Dock 挂回、退出释放、重启不重连、迁移 sim 框架与验收夹具 | R1（构建与独立启动）、R2、R6、R7；验收矩阵中对应的构建、启动、唯一串口类型、单一 fd、WCH、无输入 busy、统一截止、生命周期各行 | Codex | M0 准出 | 上述验收行通过，独立审查通过，提交 commit |
-| M2 · MVP | AI 经 `coport-mcp` 接入同一会话：mcpHost、Swift shim 打包与拉起、exec/prepare_shell 移植、仲裁单测转写、sim 全量回归 | R3、R4；验收矩阵中的防拼接仲裁、exec 全路径、MCP 工具兼容与后台拉起、socket 安全与连接上限 | Codex | M1 提交 | 同上 |
+| M1 · MVP | 人能用 Coport.app 中的 serial profile 共享打开串口：品牌与构建骨架、关闭统计和更新、主进程 sessionManager/serialHub/headless/IPC、`tabby-serial` 改为会话代理、WCH 优先与波特率提示、15 秒统一截止、R6 busy 修复、关窗保留与 Dock 挂回、退出释放、重启不重连、迁移 sim 框架与验收夹具 | R1（构建与隔离独立启动，socket 在 M2 验收）、R2、R6、R7；验收矩阵中对应的构建、启动、唯一串口类型、单一 fd、WCH、无输入 busy、统一截止、生命周期各行 | Codex | M0 准出 | 上述验收行通过，独立审查通过，提交 commit |
+| M2 · MVP | AI 经 `coport-mcp` 接入同一会话：mcpHost、Swift shim 打包与拉起、exec/prepare_shell 移植、仲裁单测转写、sim 全量回归 | R1（重跑独立启动并核对 `mcp.sock`）、R3、R4；验收矩阵中的防拼接仲裁、exec 全路径、MCP 工具兼容与后台拉起、socket 安全与连接上限 | Codex | M1 提交 | 同上 |
 | M3 · MVP | ADB：新增 `tabby-adb` 包，SFTP 面板改用 FileBackend，实现 ADB 后端，exec 优先走 ADB，SFTP 不回退 | R5；验收矩阵中的 ADB exec 路由、ADB 文件面板后端、SFTP 面板泛化不回退、同窗多类会话 | Codex | M2 提交 | 同上 |
 | M4 · MVP | 收尾：签名、`check-upstream-diff` 脚本、`upstream-changes.md` 与同步流程、G3 真机验收（含 P2 的 FTDI 对端收包）、汇总 PR 与 CI | R1（签名）、R8；上游改动白名单；人工验收项（含 P2 的 L4） | Codex；G3 由用户操作 | M3 提交 | 跨模型审查通过，G3 通过，汇总 PR 非 Draft 且 CI 通过 |
 
@@ -41,13 +41,13 @@ MVP 由 M1 至 M4 共同构成。M0 是前置预研，只产出准出结论，�
 
 ### 当前里程碑 M1
 
-M0 已准出。M1 启动前核对发现更新入口与上游改动白名单冲突，以及独立启动的 socket 验收跨越 M1、M2。具体条款、实测和建议见 [M1 交付记录](../delivery/coport-fork-M1.md)。
+M0 已准出。经授权，设置页模板加入 R8 白名单，移除更新入口时标注并登记。M1 验收隔离启动日志 `coport: ready` 及进程树中无原 Swift App，M2 接入完整 MCP host 后重跑独立启动并核对 `mcp.sock`。具体裁决和实测见 [M1 交付记录](../delivery/coport-fork-M1.md)。
 
 ## 当前进展与问题
 
 | 里程碑 | 当前状态与实际结果 | 起止 commit／证据／交付记录／汇总 MR | 下一动作与负责方 |
 |---|---|---|---|
 | M0 | 已提交，独立复审无阻塞项。P1、P3、arm64 构建与隔离启动通过。P2 两组私有 PTY 双向收发和单一 fd 通过，采用既有 CH340 读取、本机写入与 drain 证据。由用户决定将真机对端收包推迟到 M4 G3（L4） | `54869e1` → `39ab33f2`。[M0 交付记录](../delivery/coport-fork-M0.md) · [验收证据](../delivery/coport-fork-M0-evidence.txt) | M4 G3 时由用户使用已上电并进入 shell 的 FTDI 板核对收包 |
-| M1 | 等待方案裁决。R1 要求去掉更新入口，R8 白名单缺少设置页模板。独立启动验收检查 `mcp.sock`，计划在 M2 交付 MCP host | 起始 `39ab33f2`。[M1 交付记录](../delivery/coport-fork-M1.md) | 确认设置页模板加入白名单，并明确 socket 验收交付时点；Codex 随后实现和验证 M1 |
+| M1 | 两项启动前裁决已落实到规格与计划，进入实现 | 起始 `39ab33f2`。[M1 交付记录](../delivery/coport-fork-M1.md) | Codex 实现并验证 M1，M2 重跑独立启动并核对 socket |
 
-MVP 进展为 M0 前置验证完成，M1 等待上述裁决，M2–M4 尚未实施。G3 L4 与汇总 PR 待后续里程碑。
+MVP 进展为 M0 前置验证完成，M1 实施中，M2–M4 尚未实施。G3 L4 与汇总 PR 待后续里程碑。

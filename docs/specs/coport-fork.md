@@ -372,6 +372,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 |---|---|
 | `app/lib/index.ts`、`app/lib/app.ts` | 启动 coport 服务；处理 `--coport-background`；`before-quit` 时执行 shutdown |
 | `app/lib/window.ts`、`app/lib/sentry.ts` | 禁用更新器；移除 Sentry 初始化 |
+| `tabby-settings/src/components/settingsTab.component.pug` | 移除检查更新按钮和自动更新开关 |
 | `tabby-core/src/configDefaults.yaml` | `enableAutomaticUpdates: false`、`enableAnalytics: false` |
 | `tabby-serial/src/*` | 把 `SerialSession` 改为会话代理；端口列表 WCH 优先并加标注；增加波特率提示；移除 recoveryProvider |
 | `tabby-ssh/src/components/sftpPanel.component.ts`、`session/sftp.ts`、`index.ts` | 抽出并导出 `FileBackend`，放宽面板的输入类型 |
@@ -390,7 +391,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | 主进程 serialport 与 busy 成因（P2） | L2 | `scripts/coport/probe/serial_pty.py` 调用 `serial-main.cjs` | 两组隔离 PTY 双向收发，打开时 fd 为 1，关闭后为 0。CH340 读取、写入和 drain 的既有证据见 M0 记录。未复现 busy，按已记录的两项候选成因实施兜底 |
 | MCP SDK 经 socket 兼容（P3） | L2 | 原仓库 `scripts/sim/mcp_client.py`，通过 Swift shim 调用 | 六个工具的结构逐字段无差异；断开后 200 ms 内触发 busy 保护 |
 | 构建签名、品牌、关闭统计与更新 | L1 | `node scripts/build-macos.mjs`（fork 现有）加 `codesign --verify --deep --strict` | 退出码 0；`CFBundleIdentifier` 为 `local.coport.app`；默认配置中的两个开关为 false；没有 Sentry 初始化 |
-| 未安装原 App 时独立启动 | L2 | 提议 `scripts/coport/smoke.mjs`（隔离 `--user-data-dir`） | 日志中出现 `coport: ready`，`mcp.sock` 已创建，进程树中没有原 Swift App |
+| 未安装原 App 时独立启动 | L2 | 提议 `scripts/coport/smoke.mjs`（隔离 `--user-data-dir`） | M1：日志中出现 `coport: ready`，进程树中没有原 Swift App。M2：接入完整 MCP host 后重跑，沿用上述断言并检查隔离目录中的 `mcp.sock` 已创建，另按后台拉起用例验证冷启动 |
 | 只有一种串口类型，旧配置兼容 | L1 | 提议 `tabby-serial` 单元测试 | profile 提供者中只有 `serial`；旧 YAML profile 可以打开 |
 | 同一设备单一 fd：人先、AI 先、并发三种顺序，以及经别名节点打开 | L2 | `scripts/coport/sim/coport_serial.py --extended`（迁自 `tabby_shared_serial.py`；别名用指向同一 PTY 的符号链接） | 三种顺序都只打开一次设备、只有一个 fd；从别名路径打开时复用同一 generation；参数冲突时人和 AI 都收到 `config_conflict` 并附 active，原会话不受影响 |
 | MCP socket 安全与连接上限 | L2 | 迁移 `wire_test.py`，并增加第 17 个连接和非属主 uid 的用例（提议） | socket 权限为 0600；第 17 个连接被拒绝；uid 不符的连接被关闭 |
