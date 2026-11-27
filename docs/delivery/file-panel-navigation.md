@@ -12,10 +12,10 @@
   - Codex 第 5 轮审查修复提交：`d023376d`（`d023376d9e620579e0e98d5588c59bd5107da263`）
   - Codex 第 6 轮审查修复提交：`97142f65`（`97142f6542c7ad1df2e6b21969a97134c7ef8db4`）
   - Codex 第 7 轮审查修复提交 `e5ffcb54eebe5059fd3ccc8d862c96d48cf6495e`
-- **当前状态**：`等待 G3 真机人工验收`。全部 L0（47+11）/L2（`coport_shells` + `prepare_adb`）与定向增量复核完成（0 P0 / 0 P1），已将验证通过的 `e5ffcb54` 构建安装至 `/Applications/Coport.app`。
+- **当前状态**：`G3 真机验收通过`，准备推送分支、创建 PR 并跟进 CI 至 G4 就绪。
 - **累计审查轮次**：8（含第 7 轮修复后的定向增量复核；按 `dev-flow` 收敛刹车放行 3 项极细 SSH/上游 `russh` 边界记录于下文）。
-- **累计 CI 修复轮次**：0（未推送 / 无远端 CI 触发）
-- **下一动作**：请用户按 G3 真机验收清单在 `/Applications/Coport.app` 上体验验收并回复通过或问题；通过后推送分支并创建 PR 进入 G4。
+- **累计 CI 修复轮次**：0
+- **下一动作**：推送 `feat/file-panel-navigation`、创建 PR 并等待 CI 全通过后通知用户进入 G4。
 
 ## 实现摘要与偏差记录
 
@@ -182,10 +182,13 @@ SFTP 沿用先移除目标再重命名的提交顺序。如果移除成功而重
 2. **非标准 SFTP 服务端在 `0111` 仅搜索父目录下对真实符号链接持续返回通用 `Failure`**：`russh` 原生 `SftpChannel` 未暴露 `LSTAT` 与 `REALPATH`，极端非标准服务端场景下无法无父目录列举地再区分。
 3. **SSH 上传 `rename` 毫秒级提交瞬间点击传输菜单取消**：传输菜单（上游 `transfersMenu.component.ts`）立即从列表移除该行，实际已进入提交态的远端替换仍会完成。
 
-## L4 真机人工验收清单（G3 就绪 · 已安装至 `/Applications/Coport.app`）
+## L4 真机人工验收结论（G3 通过 · 2026-11-27）
 
-1. 独立复审通过后，构建并安装至 `/Applications/Coport.app`，连接真实无 `/sdcard` ADB 设备（及可选 SSH 主机）。
-2. 打开 Files 面板确认首次直接打开 `/`、无 `/sdcard` 报错且不卡 `Loading`。
-3. 切换至可读目录并重启 Coport，确认目录恢复；切换另一设备验证共享与缺失目录自动回退提示条。
-4. 点击星标收藏，在快捷芯片条与收藏/最近下拉中完成一键跳转与移除（确认收藏在最近之上、移除后保留最近记录）。
-5. 不点 Filter 直接敲字模糊过滤，用 `↑/↓/Enter/Backspace/Esc` 连续逐层钻取，确认高亮清晰、布局无遮挡、手感流畅且 `Esc` 不误关面板。
+- **被测构建**：`Coport 1.0.239-nightly.0`（macOS arm64，ad-hoc 签名校验通过，功能提交 `e5ffcb54`，已正式覆盖安装至 `/Applications/Coport.app`）
+- **验收结果**：**通过**（用户 2026-11-27 在真实无 `/sdcard` ADB 设备及 SSH 环境下验证并明确回复通过；主进程状态文件 `~/Library/Application Support/Coport/coport-file-panel-state.json` 实测写入最近目录与收藏记录正常）
+- **执行清单**：
+  1. 连接真实无 `/sdcard` ADB 设备（及可选 SSH 主机）打开 `Coport.app`。
+  2. 打开 Files 面板确认首次直接打开 `/`、无 `/sdcard` 报错且不卡 `Loading`。
+  3. 切换至可读目录并重启 Coport，确认目录恢复；切换设备验证共享与缺失目录自动回退提示条。
+  4. 点击星标收藏，在快捷芯片条与收藏/最近下拉中完成一键跳转与移除（确认收藏在最近之上、移除后保留最近记录）。
+  5. 不点 Filter 直接敲字模糊过滤，用 `↑/↓/Enter/Backspace/Esc` 连续逐层钻取，确认高亮清晰、布局无遮挡、手感流畅且 `Esc` 不误关面板。
