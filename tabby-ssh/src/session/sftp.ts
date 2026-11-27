@@ -5,6 +5,13 @@ import { Injector } from '@angular/core'
 import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
 import type { FileBackend } from '../api/fileBackend'
+import { runStagedSFTPUpload } from './sftpUpload'
+import {
+    inspectPosixEntryViaParentReaddir,
+    isSFTPChannelClosedError,
+    isSFTPDirectoryUnavailableError,
+    resolvePosixPathWithReadlink,
+} from '../utils/filePanelFallback'
 
 export interface SFTPFile {
     name: string
@@ -12,6 +19,7 @@ export interface SFTPFile {
     isDirectory: boolean
     isSymlink: boolean
     mode: number
+    hasMode?: boolean
     size: number
     modified: Date
 }
@@ -44,24 +52,58 @@ export class SFTPFileHandle {
 }
 
 export class SFTPSession implements FileBackend {
+    readonly atomicDownloads = true
+    readonly preserveExistingMode = true
     get closed$ (): Observable<void> { return this.closed }
+    get rawSftp (): russh.SFTP { return this.sftp }
     private closed = new Subject<void>()
     private logger: Logger
 
-    constructor (private sftp: russh.SFTP, injector: Injector) {
+    constructor (
+        private sftp: russh.SFTP,
+        injector: Injector,
+        private onInvalidate?: () => void,
+    ) {
         this.logger = injector.get(LogService).create('sftp')
         sftp.closed$.subscribe(() => {
+            this.onInvalidate?.()
             this.closed.next()
             this.closed.complete()
         })
     }
 
+    isDirectoryUnavailable (error: unknown): boolean {
+        return isSFTPDirectoryUnavailableError(error)
+    }
+
+    resolvePath (rawPath: string): Promise<string> {
+        return resolvePosixPathWithReadlink(
+            rawPath,
+            target => this.sftp.readlink(target),
+            target => inspectPosixEntryViaParentReaddir(
+                target,
+                dir => this.readdir(dir),
+                p => this.stat(p),
+            ),
+        )
+    }
+
     async readdir (p: string): Promise<SFTPFile[]> {
         this.logger.debug('readdir', p)
-        const entries = await this.sftp.readDirectory(p)
-        return entries.map(entry => this._makeFile(
-            posixPath.join(p, entry.name), entry,
-        ))
+        try {
+            const entries = await this.sftp.readDirectory(p)
+            return entries.map(entry => {
+                const fullPath = !p || p === '/'
+                    ? `/${entry.name}`
+                    : p.endsWith('/') ? `${p}${entry.name}` : `${p}/${entry.name}`
+                return this._makeFile(fullPath, entry)
+            })
+        } catch (error) {
+            if (isSFTPChannelClosedError(error)) {
+                this.onInvalidate?.()
+            }
+            throw error
+        }
     }
 
     readlink (p: string): Promise<string> {
@@ -78,6 +120,7 @@ export class SFTPSession implements FileBackend {
             isDirectory: stats.type === russh.SFTPFileType.Directory,
             isSymlink: stats.type === russh.SFTPFileType.Symlink,
             mode: stats.permissions ?? 0,
+            hasMode: stats.permissions != null,
             size: stats.size,
             modified: new Date((stats.mtime ?? 0) * 1000),
         }
@@ -113,55 +156,50 @@ export class SFTPSession implements FileBackend {
 
     async upload (path: string, transfer: FileUpload): Promise<void> {
         this.logger.info('Uploading into', path)
-        const tempPath = path + '.tabby-upload'
-        try {
-            const handle = await this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE)
-            while (true) {
-                const chunk = await transfer.read()
-                if (!chunk.length) {
-                    break
-                }
-                await handle.write(chunk)
-            }
-            await handle.close()
-            await this.unlink(path).catch(() => null)
-            await this.rename(tempPath, path)
-            transfer.close()
-        } catch (e) {
-            transfer.setStatus(e instanceof Error ? e.message : String(e))
-            transfer.cancel()
-            this.unlink(tempPath).catch(() => null)
-            throw e
-        }
+        await runStagedSFTPUpload(path, transfer, {
+            openTemp: tempPath => this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE),
+            unlink: targetPath => this.unlink(targetPath),
+            rename: (oldPath, newPath) => this.rename(oldPath, newPath),
+        })
     }
 
     async download (path: string, transfer: FileDownload): Promise<void> {
         this.logger.info('Downloading', path)
+        let handle: SFTPFileHandle | null = null
         try {
-            const handle = await this.open(path, russh.OPEN_READ)
-            while (true) {
+            if (transfer.isCancelled()) {
+                throw new Error('Download cancelled')
+            }
+            handle = await this.open(path, russh.OPEN_READ)
+            while (!transfer.isCancelled()) {
                 const chunk = await handle.read()
-                if (!chunk.length) {
+                if (transfer.isCancelled()) {
                     break
+                }
+                if (!chunk.length) {
+                    await transfer.completeDownload()
+                    return
                 }
                 await transfer.write(chunk)
             }
-            transfer.close()
-            handle.close()
+            throw new Error('Download cancelled')
         } catch (e) {
             transfer.setStatus(e instanceof Error ? e.message : String(e))
             transfer.cancel()
             throw e
+        } finally {
+            await handle?.close().catch(() => null)
         }
     }
 
     private _makeFile (p: string, entry: russh.SFTPDirectoryEntry): SFTPFile {
         return {
             fullPath: p,
-            name: posixPath.basename(p),
+            name: entry.name,
             isDirectory: entry.metadata.type === russh.SFTPFileType.Directory,
             isSymlink: entry.metadata.type === russh.SFTPFileType.Symlink,
             mode: entry.metadata.permissions ?? 0,
+            hasMode: entry.metadata.permissions != null,
             size: entry.metadata.size,
             modified: new Date((entry.metadata.mtime ?? 0) * 1000),
         }

@@ -9,7 +9,10 @@ sftp-panel.coport-adb-files.bg-dark(
     [session]='files',
     [cwdDetectionAvailable]='null',
     rootLabel='Files',
-    [(path)]='remotePath',
+    [stateScope]='fileStateScope',
+    [defaultPath]='defaultFilePath',
+    [path]='null',
+    (pathChange)='remotePath = $event',
     (closed)='showFiles = false',
     (click)='$event.stopPropagation()'
 )

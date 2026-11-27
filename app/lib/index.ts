@@ -34,6 +34,7 @@ import { installSerialIpc } from './coport/serialIpc'
 import { McpHost } from './coport/mcpHost'
 import { AdbService } from './coport/adbService'
 import { installAdbIpc } from './coport/adbIpc'
+import { installFilePanelStateIpc } from './coport/filePanelStateIpc'
 
 const argv = parseArgs(process.argv, process.cwd())
 
@@ -154,6 +155,7 @@ app.on('ready', async () => {
         application.init()
         installSerialIpc(serial)
         stopAdbTransfers = installAdbIpc(adb)
+        installFilePanelStateIpc()
         await mcp?.start()
         console.log('coport: ready')
         if (background) {

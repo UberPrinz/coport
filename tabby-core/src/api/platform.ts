@@ -50,11 +50,47 @@ export abstract class FileTransfer {
         this.pendingCommit = pending
     }
 
+    protected isPendingCommit (): boolean {
+        return this.pendingCommit
+    }
+
+    protected isCompleted (): boolean {
+        return this.completed
+    }
+
     isCancelled (): boolean {
         return this.cancelled
     }
 
+    // coport: Once an irreversible commit (such as atomic rename) starts,
+    // cancel() cannot roll it back; pending cancel intent is replayed only if commit fails.
+    setCommitting (committing: boolean): void {
+        this.committing = committing
+        if (committing) {
+            this.cancelRequestedDuringCommit = false
+        }
+    }
+
+    consumeCancelRequestedDuringCommit (): boolean {
+        const requested = this.cancelRequestedDuringCommit
+        this.cancelRequestedDuringCommit = false
+        return requested
+    }
+
+    markCommitted (): void {
+        this.committed = true
+        this.committing = false
+        this.cancelRequestedDuringCommit = false
+    }
+
     cancel (): void {
+        if (this.committed) {
+            return
+        }
+        if (this.committing) {
+            this.cancelRequestedDuringCommit = true
+            return
+        }
         this.cancelled = true
         this.close()
     }
@@ -86,6 +122,9 @@ export abstract class FileTransfer {
     private lastChunkSpeed = 0
     private cancelled = false
     private pendingCommit = false
+    private committing = false
+    private committed = false
+    private cancelRequestedDuringCommit = false
     private completed = false
     private status = ''
 }
@@ -94,6 +133,7 @@ export abstract class FileDownload extends FileTransfer {
     abstract write (buffer: Uint8Array): Promise<void>
 
     async completeDownload (): Promise<void> {
+        this.markCommitted()
         this.setPendingCommit(false)
         this.setCompleted(true)
         this.close()
@@ -102,13 +142,25 @@ export abstract class FileDownload extends FileTransfer {
 
 export abstract class DirectoryDownload extends FileTransfer {
     abstract createDirectory (relativePath: string): Promise<void>
-    abstract createFile (relativePath: string, mode: number, size: number, atomic?: boolean): Promise<FileDownload>
+    abstract createFile (relativePath: string, mode: number | undefined, size: number, atomic?: boolean, preserveExistingMode?: boolean): Promise<FileDownload>
 }
 
 export abstract class FileUpload extends FileTransfer {
     abstract getMode (): number
 
     abstract read (): Promise<Uint8Array>
+
+    // coport: Queued 0-byte uploads must not appear complete before upload finishes and commits.
+    isComplete (): boolean {
+        if (this.isCancelled() || this.isPendingCommit()) {
+            return false
+        }
+        if (this.isCompleted()) {
+            return true
+        }
+        const size = this.getSize()
+        return size > 0 && this.getCompletedBytes() >= size
+    }
 
     async readAll (): Promise<Uint8Array> {
         const result = new Uint8Array(this.getSize())
@@ -121,6 +173,8 @@ export abstract class FileUpload extends FileTransfer {
             result.set(buf, pos)
             pos += buf.length
         }
+        this.setCompleted(true)
+        this.close()
         return result
     }
 }
@@ -167,37 +221,57 @@ export abstract class PlatformService {
     abstract loadConfig (): Promise<string>
     abstract saveConfig (content: string): Promise<void>
 
-    abstract startDownload (name: string, mode: number, size: number, filePath?: string, atomic?: boolean): Promise<FileDownload|null>
-    abstract startDownloadDirectory (name: string, estimatedSize?: number): Promise<DirectoryDownload|null>
+    abstract startDownload (name: string, mode: number | undefined, size: number, filePath?: string, atomic?: boolean, canOpen?: () => boolean, preserveExistingMode?: boolean): Promise<FileDownload|null>
+    abstract startDownloadDirectory (name: string, estimatedSize?: number, canOpen?: () => boolean): Promise<DirectoryDownload|null>
     abstract startUpload (options?: FileUploadOptions): Promise<FileUpload[]>
     abstract startUploadDirectory (paths?: string[]): Promise<DirectoryUpload>
 
-    async startUploadFromDragEvent (event: DragEvent, multiple = false): Promise<DirectoryUpload> {
+    async startUploadFromDragEvent (event: DragEvent, multiple = false, canAccept?: () => boolean): Promise<DirectoryUpload> {
         const result = new DirectoryUpload()
 
         if (!event.dataTransfer) {
             return Promise.resolve(result)
         }
 
+        const created: FileUpload[] = []
+        let aborted = false
+        const cancelCreated = () => {
+            aborted = true
+            for (const transfer of created) {
+                if (!transfer.isCancelled()) {
+                    transfer.cancel()
+                }
+            }
+        }
+
         const traverseFileTree = (item: any, root: DirectoryUpload = result): Promise<void> => {
-            return new Promise((resolve) => {
+            return new Promise((resolve, reject) => {
                 if (item.isFile) {
                     item.file((file: File) => {
                         const transfer = new HTMLFileUpload(file)
-                        this.fileTransferStarted.next(transfer)
+                        if (aborted) {
+                            transfer.cancel()
+                            resolve()
+                            return
+                        }
+                        created.push(transfer)
                         root.pushChildren(transfer)
                         resolve()
-                    })
+                    }, reject)
                 } else if (item.isDirectory) {
                     const dirReader = item.createReader()
                     const childrenFolder = new DirectoryUpload(item.name)
-                    dirReader.readEntries(async (entries: any[]) => {
-                        for (const entry of entries) {
-                            await traverseFileTree(entry, childrenFolder)
-                        }
-                        resolve()
-                    })
                     root.pushChildren(childrenFolder)
+                    dirReader.readEntries(async (entries: any[]) => {
+                        try {
+                            for (const entry of entries) {
+                                await traverseFileTree(entry, childrenFolder)
+                            }
+                            resolve()
+                        } catch (error) {
+                            reject(error)
+                        }
+                    }, reject)
                 } else {
                     resolve()
                 }
@@ -217,7 +291,22 @@ export abstract class PlatformService {
                 }
             }
         }
-        return Promise.all(promises).then(() => result)
+        try {
+            await Promise.all(promises)
+        } catch (error) {
+            aborted = true
+            await Promise.allSettled(promises)
+            cancelCreated()
+            throw error
+        }
+        if (canAccept && !canAccept()) {
+            cancelCreated()
+            return result
+        }
+        for (const transfer of created) {
+            this.fileTransferStarted.next(transfer)
+        }
+        return result
     }
 
     getConfigPath (): string|null {
@@ -315,9 +404,19 @@ export class HTMLFileUpload extends FileUpload {
         return chunk
     }
 
+    private closed = false
+
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     bringToFront (): void { }
 
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
-    close (): void { }
+    close (): void {
+        if (this.closed) {
+            return
+        }
+        this.closed = true
+        if (!this.isCancelled() && this.getCompletedBytes() >= this.getSize()) {
+            this.setCompleted(true)
+        }
+        void this.reader.cancel().catch(() => null)
+    }
 }

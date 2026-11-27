@@ -40,7 +40,9 @@ terminal-toolbar([tab]='this')
 sftp-panel.bg-dark(
     @panelSlide,
     [@.disabled]='!config.store.accessibility.animations',
-    [(path)]='sftpPath',
+    [path]='sftpPath',
+    [stateScope]='sftpStateScope',
+    defaultPath='/',
     *ngIf='sftpPanelVisible && sshSession',
     (click)='$event.stopPropagation()',
     [session]='sshSession!',
