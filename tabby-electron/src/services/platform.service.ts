@@ -302,7 +302,14 @@ export class ElectronPlatformService extends PlatformService {
         return root
     }
 
-    async startDownload (name: string, mode: number, size: number, filePath?: string, atomic = false): Promise<FileDownload|null> {
+    async startDownload (
+        name: string,
+        mode: number,
+        size: number,
+        filePath?: string,
+        atomic = false,
+        canOpen?: () => boolean,
+    ): Promise<FileDownload|null> {
         if (!filePath) {
             const result = await this.electron.dialog.showSaveDialog(
                 this.hostWindow.getWindow(),
@@ -315,15 +322,25 @@ export class ElectronPlatformService extends PlatformService {
             }
             filePath = result.filePath
         }
+        if (canOpen && !canOpen()) {
+            return null
+        }
         const transfer = new ElectronFileDownload(filePath, mode, size, this.electron, atomic)
         await wrapPromise(this.zone, transfer.open())
         this.fileTransferStarted.next(transfer)
         return transfer
     }
 
-    async startDownloadDirectory (name: string, estimatedSize?: number): Promise<DirectoryDownload|null> {
+    async startDownloadDirectory (
+        name: string,
+        estimatedSize?: number,
+        canOpen?: () => boolean,
+    ): Promise<DirectoryDownload|null> {
         const selectedFolder = await this.pickDirectory(this.translate.instant('Select destination folder for {name}', { name }), this.translate.instant('Download here'))
         if (!selectedFolder) {
+            return null
+        }
+        if (canOpen && !canOpen()) {
             return null
         }
 

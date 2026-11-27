@@ -8,9 +8,9 @@ import './dropZone.directive.scss'
 })
 export class DropZoneDirective implements AfterViewInit {
     @Output() transfer = new EventEmitter<DirectoryUpload>()
-    // coport: Capture the destination before an asynchronous directory scan.
-    @Input() dropTarget?: () => string
-    @Output() transferAt = new EventEmitter<{ upload: DirectoryUpload, target?: string }>()
+    // coport: Capture the destination context before an asynchronous directory scan.
+    @Input() dropTarget?: () => any
+    @Output() transferAt = new EventEmitter<{ upload: DirectoryUpload, target?: any }>()
     private dropHint?: HTMLElement
 
     constructor (

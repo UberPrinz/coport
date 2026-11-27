@@ -32,6 +32,8 @@ import {
 } from '../src/utils/filePanelFilter.ts'
 import {
     SFTPChannelPool,
+    cancelPendingDirectoryUpload,
+    finalizeCanonicalDirectoryListing,
     isAdbDirectoryUnavailableError,
     isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
@@ -794,6 +796,218 @@ describe('filePanelFallback', () => {
         }, /Status\(Failure\)/)
         assert.equal(listedRoot, false)
         assert.equal(readlinkCalls, readlinkBeforeManual)
+    })
+
+    it('re-reads the final canonical directory when a symlink changes between initial readdir and readlink', async () => {
+        let linkTarget = '/parent-a/child'
+        const readdirCalls: string[] = []
+        const entriesByDir: Record<string, { name: string, fullPath: string }[]> = {
+            '/parent-a': [{ name: 'only-in-a.txt', fullPath: '/parent-a/only-in-a.txt' }],
+            '/parent-b': [{ name: 'only-in-b.txt', fullPath: '/parent-b/only-in-b.txt' }],
+        }
+        const readdir = async (dirPath: string) => {
+            readdirCalls.push(dirPath)
+            if (dirPath === '/link/..') {
+                // Initial readdir sees /parent-a, then symlink retargets before post-readdir readlink runs.
+                const entries = [{ name: 'only-in-a.txt', fullPath: '/link/../only-in-a.txt' }]
+                linkTarget = '/parent-b/child'
+                return entries
+            }
+            return entriesByDir[dirPath] ?? []
+        }
+        const readlink = async (target: string): Promise<string> => {
+            if (target === '/link') {
+                return linkTarget
+            }
+            throw new Error('Failure')
+        }
+
+        const initialEntries = await readdir('/link/..')
+        let recordedCanonical: string | null = null
+        const finalized = await finalizeCanonicalDirectoryListing(
+            '/link/..',
+            initialEntries,
+            dirPath => resolvePosixPathWithReadlink(dirPath, readlink),
+            readdir,
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+            resolved => {
+                recordedCanonical = resolved
+            },
+        )
+
+        assert.equal(finalized.cancelled, false)
+        assert.equal(finalized.path, '/parent-b')
+        assert.equal(recordedCanonical, '/parent-b')
+        assert.deepEqual(readdirCalls, ['/link/..', '/parent-b'])
+        assert.deepEqual(finalized.entries, [{ name: 'only-in-b.txt', fullPath: '/parent-b/only-in-b.txt' }])
+
+        // Normal path without relative segments performs zero resolvePath and zero extra readdir calls.
+        const callsBeforeNormal = readdirCalls.length
+        let resolveCalledOnNormal = false
+        const normalFinalized = await finalizeCanonicalDirectoryListing(
+            '/parent-b',
+            entriesByDir['/parent-b'],
+            async () => {
+                resolveCalledOnNormal = true
+                return '/parent-b'
+            },
+            readdir,
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+        )
+        assert.equal(normalFinalized.cancelled, false)
+        assert.equal(normalFinalized.path, '/parent-b')
+        assert.equal(resolveCalledOnNormal, false)
+        assert.equal(readdirCalls.length, callsBeforeNormal)
+    })
+
+    it('discards stale canonicalization and re-read results when backend closes mid-resolution', async () => {
+        let navigation = 1
+        let active = true
+        const request = navigation
+        const isStale = () => !active || request !== navigation
+
+        // Case 1: closed$ triggers while resolvePath is pending -> stale result discarded, no second readdir
+        let releaseResolve: ((value: string) => void) | null = null
+        let secondReaddirCalls = 0
+        const pendingResolvePromise = finalizeCanonicalDirectoryListing(
+            '/link/..',
+            [{ name: 'stale.txt', fullPath: '/link/../stale.txt' }],
+            () => new Promise<string>(resolve => {
+                releaseResolve = resolve
+            }),
+            async () => {
+                secondReaddirCalls++
+                return [{ name: 'fresh.txt', fullPath: '/real/fresh.txt' }]
+            },
+            raw => normalizeFilePanelPath(raw, true),
+            isStale,
+            true,
+        )
+        assert.ok(releaseResolve)
+        // Simulate backend.closed$: increment navigation & mark backend inactive
+        navigation++
+        active = false
+        releaseResolve('/real')
+        const result1 = await pendingResolvePromise
+        assert.equal(result1.cancelled, true)
+        assert.equal(secondReaddirCalls, 0)
+
+        // Case 2: closed$ triggers while canonical second readdir is pending -> stale entries discarded
+        navigation = 2
+        active = true
+        const request2 = navigation
+        let releaseSecondReaddir: ((entries: { name: string }[]) => void) | null = null
+        const pendingReaddirPromise = finalizeCanonicalDirectoryListing(
+            '/link/..',
+            [{ name: 'stale.txt' }],
+            async () => '/real',
+            () => new Promise<{ name: string }[]>(resolve => {
+                releaseSecondReaddir = resolve
+            }),
+            raw => normalizeFilePanelPath(raw, true),
+            () => !active || request2 !== navigation,
+            true,
+        )
+        await new Promise(resolve => setTimeout(resolve, 10))
+        assert.ok(releaseSecondReaddir)
+        navigation++
+        active = false
+        releaseSecondReaddir([{ name: 'late.txt' }])
+        const result2 = await pendingReaddirPromise
+        assert.equal(result2.cancelled, true)
+
+        // Case 3: channel-closed error inside readlink propagates instead of silently falling back to stale path
+        await assert.rejects(
+            () => finalizeCanonicalDirectoryListing(
+                '/link/..',
+                [{ name: 'stale.txt' }],
+                dirPath => resolvePosixPathWithReadlink(dirPath, async () => {
+                    throw new Error('SFTP channel closed')
+                }),
+                async () => [],
+                raw => normalizeFilePanelPath(raw, true),
+                () => false,
+                true,
+            ),
+            /SFTP channel closed/,
+        )
+    })
+
+    it('recursively cancels every remaining pending FileUpload in nested directories at most once', () => {
+        interface MockUpload {
+            name: string
+            size: number
+            cancelled: boolean
+            completed: boolean
+            cancelCalls: number
+            isCancelled: () => boolean
+            isComplete: () => boolean
+            getSize: () => number
+            cancel: () => void
+        }
+        interface MockDir {
+            children: (MockUpload | MockDir)[]
+            getChildrens: () => (MockUpload | MockDir)[]
+        }
+        const makeFile = (name: string, size: number, opts?: { cancelled?: boolean, completed?: boolean }): MockUpload => {
+            const file: MockUpload = {
+                name,
+                size,
+                cancelled: opts?.cancelled ?? false,
+                completed: opts?.completed ?? false,
+                cancelCalls: 0,
+                isCancelled: () => file.cancelled,
+                isComplete: () => !file.cancelled && (file.completed || file.size === 0),
+                getSize: () => file.size,
+                cancel: () => {
+                    file.cancelCalls++
+                    file.cancelled = true
+                },
+            }
+            return file
+        }
+        const makeDir = (children: (MockUpload | MockDir)[]): MockDir => ({
+            children,
+            getChildrens: () => children,
+        })
+
+        const firstHandled = makeFile('first.txt', 100)
+        const secondPending = makeFile('second.txt', 50)
+        const zeroBytePending = makeFile('empty.txt', 0)
+        const alreadyCancelled = makeFile('cancelled.txt', 25, { cancelled: true })
+        const alreadyCompleted = makeFile('done.txt', 40, { completed: true })
+        const nestedPending = makeFile('nested.txt', 75)
+        const deepPending = makeFile('deep.txt', 120)
+
+        const tree = makeDir([
+            firstHandled,
+            secondPending,
+            zeroBytePending,
+            alreadyCancelled,
+            alreadyCompleted,
+            makeDir([
+                nestedPending,
+                makeDir([deepPending]),
+            ]),
+        ])
+
+        const handled = new Set<MockUpload>([firstHandled])
+        const firstPassCancelled = cancelPendingDirectoryUpload(tree, handled)
+        const secondPassCancelled = cancelPendingDirectoryUpload(tree, handled)
+
+        assert.equal(firstPassCancelled, 4)
+        assert.equal(secondPassCancelled, 0)
+        assert.equal(firstHandled.cancelCalls, 0)
+        assert.equal(alreadyCancelled.cancelCalls, 0)
+        assert.equal(alreadyCompleted.cancelCalls, 0)
+        assert.equal(secondPending.cancelCalls, 1)
+        assert.equal(zeroBytePending.cancelCalls, 1)
+        assert.equal(nestedPending.cancelCalls, 1)
+        assert.equal(deepPending.cancelCalls, 1)
     })
 })
 

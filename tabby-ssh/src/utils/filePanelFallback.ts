@@ -183,7 +183,10 @@ export async function resolvePosixPathWithReadlink (
         try {
             linkTarget = await readlink(candidate)
         } catch (error) {
-            if (isSFTPChannelClosedError(error) || isSFTPDirectoryUnavailableError(error)) {
+            if (isSFTPChannelClosedError(error)) {
+                throw error
+            }
+            if (isSFTPDirectoryUnavailableError(error)) {
                 return rawPath
             }
             linkTarget = null
@@ -344,4 +347,107 @@ export async function resolveReadableDirectory<T> (
             currentPath = parentPath
         }
     }
+}
+
+export interface CanonicalDirectoryListingResult<T> {
+    cancelled: boolean
+    path: string
+    entries: T[]
+}
+
+export async function finalizeCanonicalDirectoryListing<T> (
+    listedPath: string,
+    initialEntries: T[],
+    resolvePath: ((dirPath: string) => Promise<string>) | undefined,
+    readdir: (dirPath: string) => Promise<T[]>,
+    normalizePath: (rawPath: string) => string,
+    isStale: () => boolean,
+    shouldResolveRelative: boolean,
+    onCanonicalPath?: (canonicalPath: string) => void,
+): Promise<CanonicalDirectoryListingResult<T>> {
+    if (isStale()) {
+        return { cancelled: true, path: listedPath, entries: [] }
+    }
+    if (!shouldResolveRelative || !resolvePath || !hasRelativePathSegment(listedPath)) {
+        return { cancelled: false, path: listedPath, entries: initialEntries }
+    }
+    let canonicalPath = listedPath
+    try {
+        const resolved = await resolvePath(listedPath)
+        if (isStale()) {
+            return { cancelled: true, path: listedPath, entries: [] }
+        }
+        canonicalPath = normalizePath(resolved)
+    } catch (error) {
+        if (isStale()) {
+            return { cancelled: true, path: listedPath, entries: [] }
+        }
+        if (isSFTPChannelClosedError(error)) {
+            throw error
+        }
+        canonicalPath = listedPath
+    }
+    if (canonicalPath === listedPath) {
+        return { cancelled: false, path: canonicalPath, entries: initialEntries }
+    }
+    onCanonicalPath?.(canonicalPath)
+    const freshEntries = await readdir(canonicalPath)
+    if (isStale()) {
+        return { cancelled: true, path: canonicalPath, entries: [] }
+    }
+    return { cancelled: false, path: canonicalPath, entries: freshEntries }
+}
+
+export interface CancellableFileUploadLike {
+    isCancelled?: () => boolean
+    isComplete?: () => boolean
+    getSize?: () => number
+    cancel: () => void
+}
+
+export interface DirectoryUploadTreeLike<T extends CancellableFileUploadLike = CancellableFileUploadLike> {
+    getChildrens: () => (T | DirectoryUploadTreeLike<T>)[]
+}
+
+function isDirectoryUploadTree<T extends CancellableFileUploadLike> (
+    item: T | DirectoryUploadTreeLike<T>,
+): item is DirectoryUploadTreeLike<T> {
+    return typeof (item as DirectoryUploadTreeLike<T>).getChildrens === 'function'
+}
+
+export function cancelPendingFileUpload<T extends CancellableFileUploadLike> (
+    transfer: T,
+    handled?: Set<T>,
+): boolean {
+    if (handled?.has(transfer)) {
+        return false
+    }
+    handled?.add(transfer)
+    if (typeof transfer.isCancelled === 'function' && transfer.isCancelled()) {
+        return false
+    }
+    if (
+        typeof transfer.isComplete === 'function' &&
+        (typeof transfer.getSize !== 'function' || transfer.getSize() > 0) &&
+        transfer.isComplete()
+    ) {
+        return false
+    }
+    transfer.cancel()
+    return true
+}
+
+export function cancelPendingDirectoryUpload<T extends CancellableFileUploadLike> (
+    transfer: DirectoryUploadTreeLike<T>,
+    handled?: Set<T>,
+): number {
+    let cancelledCount = 0
+    for (const child of transfer.getChildrens()) {
+        if (isDirectoryUploadTree(child)) {
+            cancelledCount += cancelPendingDirectoryUpload(child, handled)
+        } else if (cancelPendingFileUpload(child, handled)) {
+            cancelledCount++
+        }
+    }
+    return cancelledCount
 }

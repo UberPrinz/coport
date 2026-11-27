@@ -167,8 +167,8 @@ export abstract class PlatformService {
     abstract loadConfig (): Promise<string>
     abstract saveConfig (content: string): Promise<void>
 
-    abstract startDownload (name: string, mode: number, size: number, filePath?: string, atomic?: boolean): Promise<FileDownload|null>
-    abstract startDownloadDirectory (name: string, estimatedSize?: number): Promise<DirectoryDownload|null>
+    abstract startDownload (name: string, mode: number, size: number, filePath?: string, atomic?: boolean, canOpen?: () => boolean): Promise<FileDownload|null>
+    abstract startDownloadDirectory (name: string, estimatedSize?: number, canOpen?: () => boolean): Promise<DirectoryDownload|null>
     abstract startUpload (options?: FileUploadOptions): Promise<FileUpload[]>
     abstract startUploadDirectory (paths?: string[]): Promise<DirectoryUpload>
 

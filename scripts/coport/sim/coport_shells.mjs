@@ -69,6 +69,8 @@ async function prepareNavigationFixtures () {
     await mkdir(join(sshRoot, 'trail '), { recursive: true })
     await mkdir(join(sshRoot, 'real-parent', 'real-child'), { recursive: true })
     await mkdir(join(sshRoot, 'link-parent'), { recursive: true })
+    await mkdir(join(sshRoot, 'retarget-parent-a', 'child'), { recursive: true })
+    await mkdir(join(sshRoot, 'retarget-parent-b', 'child'), { recursive: true })
     await mkdir(join(sshRoot, 'readable', 'no-perm'), { recursive: true })
     await writeFile(join(sshRoot, 'sub-a', 'a.txt'), 'sub-a\n')
     await writeFile(join(sshRoot, 'sub-b', 'b.txt'), 'sub-b\n')
@@ -76,7 +78,10 @@ async function prepareNavigationFixtures () {
     await writeFile(join(sshRoot, 'trail ', 'space-marker.txt'), 'trail\n')
     await writeFile(join(sshRoot, 'real-parent', 'from-real-parent.txt'), 'real\n')
     await writeFile(join(sshRoot, 'link-parent', 'from-link-parent.txt'), 'link\n')
+    await writeFile(join(sshRoot, 'retarget-parent-a', 'only-in-parent-a.txt'), 'parent-a\n')
+    await writeFile(join(sshRoot, 'retarget-parent-b', 'only-in-parent-b.txt'), 'parent-b\n')
     await symlink(join(sshRoot, 'real-parent', 'real-child'), join(sshRoot, 'link-parent', 'to-real-child'))
+    await symlink(join(sshRoot, 'retarget-parent-a', 'child'), join(sshRoot, 'retarget-link'))
     await symlink('/Users', join(sshRoot, 'to-root-child'))
     await writeFile(join(sshRoot, 'readable', 'readable-marker.txt'), 'readable\n')
     await chmod(join(sshRoot, 'readable', 'no-perm'), 0o000)
@@ -987,6 +992,8 @@ try {
     })
 
     // SSH host/user isolation, first-open CWD vs savedLastPath priority, trailing spaces, symlink/.., SFTP channel close Retry, real sshd fallback
+    const keepDownloadFile = join(run, 'keep-existing-download.txt')
+    await writeFile(keepDownloadFile, 'MUST-NOT-BE-TRUNCATED\n')
     await open(title.ssh)
     await waitFor(() => evalJs("cpComponentEl(cpSshTabEl('127.0.0.1'))?.session?.open"))
     await open(title.ssh2)
@@ -1240,8 +1247,174 @@ try {
             bannerText: s1SymlinkRootFallback.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent ?? '',
         }
 
-        // Restore sub-a for restart check
-        await s1SymlinkRootFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        // 4c. Symlink retargeting AFTER initial readdir succeeds and BEFORE post-readdir readlink runs (both manual nav and startup fallback)
+        const fsMod = require('fs')
+        const retargetLinkPath = ${JSON.stringify(join(sshRoot, 'retarget-link'))}
+        const retargetParentAChild = ${JSON.stringify(join(sshRoot, 'retarget-parent-a', 'child'))}
+        const retargetParentBChild = ${JSON.stringify(join(sshRoot, 'retarget-parent-b', 'child'))}
+        const setRetargetLink = targetPath => {
+            try { fsMod.unlinkSync(retargetLinkPath) } catch {}
+            fsMod.symlinkSync(targetPath, retargetLinkPath)
+        }
+
+        // Manual navigation with symlink retargeted mid-flight
+        setRetargetLink(retargetParentAChild)
+        const manualRetargetBackend = s1SymlinkRootFallback.panel.sftp
+        const origManualResolvePath = manualRetargetBackend.resolvePath.bind(manualRetargetBackend)
+        let manualRetargetSwapped = false
+        manualRetargetBackend.resolvePath = async p => {
+            if (!manualRetargetSwapped && p === retargetLinkPath + '/..') {
+                manualRetargetSwapped = true
+                setRetargetLink(retargetParentBChild)
+            }
+            return origManualResolvePath(p)
+        }
+        try {
+            await s1SymlinkRootFallback.panel.navigate(retargetLinkPath + '/..')
+        } finally {
+            manualRetargetBackend.resolvePath = origManualResolvePath
+        }
+        s1SymlinkRootFallback.panel.cdr.detectChanges()
+        const symlinkRetargetManual = {
+            path: s1SymlinkRootFallback.panel.path,
+            names: (s1SymlinkRootFallback.panel.fileList || []).map(e => e.name),
+            entryBFullPath: (s1SymlinkRootFallback.panel.fileList || []).find(e => e.name === 'only-in-parent-b.txt')?.fullPath ?? null,
+        }
+
+        // Startup fallback with symlink retargeted after fallback readdir succeeds and before post-readdir readlink runs
+        setRetargetLink(retargetParentAChild)
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: retargetLinkPath + '/../missing-retarget-child',
+        })
+        const origOpenForRetarget = tab1.sshSession.openSFTP.bind(tab1.sshSession)
+        let fallbackRetargetSwapped = false
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForRetarget(...args)
+            const origRes = backend.resolvePath.bind(backend)
+            backend.resolvePath = async p => {
+                if (!fallbackRetargetSwapped && p === retargetLinkPath + '/..') {
+                    fallbackRetargetSwapped = true
+                    setRetargetLink(retargetParentBChild)
+                }
+                return origRes(p)
+            }
+            return backend
+        }
+        let s1RetargetFallback
+        try {
+            s1RetargetFallback = await openSftpFor('127.0.0.1')
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForRetarget
+        }
+        s1RetargetFallback.panel.cdr.detectChanges()
+        const symlinkRetargetFallback = {
+            path: s1RetargetFallback.panel.path,
+            names: (s1RetargetFallback.panel.fileList || []).map(e => e.name),
+            entryBFullPath: (s1RetargetFallback.panel.fileList || []).find(e => e.name === 'only-in-parent-b.txt')?.fullPath ?? null,
+        }
+
+        // 4d. Channel closed$ firing during post-readdir resolvePath MUST keep loadError & Retry visible (both manual nav and startup fallback)
+        const triggerBackendClose = async (tab, panel, backend) => {
+            const raw = tab.sshSession.sftp
+            if (raw) {
+                await raw.close().catch(() => null)
+            }
+            const waitClose = Date.now() + 250
+            while (!panel.loadError && Date.now() < waitClose) {
+                await new Promise(r => setTimeout(r, 20))
+            }
+            if (!panel.loadError && backend?.closed?.next) {
+                backend.closed.next()
+            }
+            const waitErr = Date.now() + 3000
+            while (!panel.loadError && Date.now() < waitErr) {
+                await new Promise(r => setTimeout(r, 20))
+            }
+        }
+
+        // 4d-manual: manual navigate('/link-parent/to-real-child/..') -> readdir succeeds -> closed$ fires while resolvePath pending -> Retry stays visible
+        const manualCloseBackend = s1RetargetFallback.panel.sftp
+        const origCloseManualResolve = manualCloseBackend.resolvePath.bind(manualCloseBackend)
+        let releaseCloseManualResolve = null
+        manualCloseBackend.resolvePath = () => new Promise(resolve => { releaseCloseManualResolve = resolve })
+        const pendingManualCloseNav = s1RetargetFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'link-parent', 'to-real-child') + '/..')})
+        const waitManualResolveDeadline = Date.now() + 5000
+        while (!releaseCloseManualResolve && Date.now() < waitManualResolveDeadline) {
+            await new Promise(r => setTimeout(r, 20))
+        }
+        await triggerBackendClose(tab1, s1RetargetFallback.panel, manualCloseBackend)
+        s1RetargetFallback.panel.cdr.detectChanges()
+        releaseCloseManualResolve(${JSON.stringify(join(sshRoot, 'real-parent'))})
+        await pendingManualCloseNav
+        await new Promise(r => setTimeout(r, 80))
+        s1RetargetFallback.panel.cdr.detectChanges()
+        const disconnectDuringResolveManual = {
+            hasLoadError: Boolean(s1RetargetFallback.panel.loadError),
+            retryVisible: Boolean(s1RetargetFallback.tabEl.querySelector('[data-testid="retry-button"]')),
+            fileListIsNull: s1RetargetFallback.panel.fileList === null,
+        }
+        manualCloseBackend.resolvePath = origCloseManualResolve
+        s1RetargetFallback.tabEl.querySelector('[data-testid="retry-button"]').click()
+        const manualCloseRecoverDeadline = Date.now() + 5000
+        while ((!Array.isArray(s1RetargetFallback.panel.fileList) || s1RetargetFallback.panel.loadError) && Date.now() < manualCloseRecoverDeadline) {
+            await new Promise(r => setTimeout(r, 30))
+        }
+        disconnectDuringResolveManual.recoveredAfterRetry = Array.isArray(s1RetargetFallback.panel.fileList) && !s1RetargetFallback.panel.loadError
+
+        // 4d-fallback: startup fallback from '/to-root-child/../missing' -> readdir('/to-root-child/..') succeeds -> closed$ fires while resolvePath pending -> Retry stays visible
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: ${JSON.stringify(join(sshRoot, 'to-root-child') + '/../missing-for-close-during-resolve')},
+        })
+        const origOpenForCloseFallback = tab1.sshSession.openSFTP.bind(tab1.sshSession)
+        let releaseCloseFallbackResolve = null
+        let closeFallbackBackend = null
+        let wrappedOnceForCloseFallback = false
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForCloseFallback(...args)
+            if (!wrappedOnceForCloseFallback) {
+                wrappedOnceForCloseFallback = true
+                closeFallbackBackend = backend
+                backend.resolvePath = () => new Promise(resolve => { releaseCloseFallbackResolve = resolve })
+            }
+            return backend
+        }
+        let disconnectDuringResolveFallback = null
+        try {
+            const tabEl1 = cpSshTabEl('127.0.0.1')
+            const sftpBtn1 = [...tabEl1.querySelectorAll('terminal-toolbar button')].find(item => item.textContent.trim() === 'SFTP')
+            sftpBtn1.click()
+            const waitFallbackResolveDeadline = Date.now() + 5000
+            while (!releaseCloseFallbackResolve && Date.now() < waitFallbackResolveDeadline) {
+                await new Promise(r => setTimeout(r, 20))
+            }
+            const fallbackPanel = cpPanelForEl(tabEl1)
+            await triggerBackendClose(tab1, fallbackPanel, closeFallbackBackend)
+            fallbackPanel.cdr.detectChanges()
+            releaseCloseFallbackResolve('/')
+            await new Promise(r => setTimeout(r, 100))
+            fallbackPanel.cdr.detectChanges()
+            disconnectDuringResolveFallback = {
+                hasLoadError: Boolean(fallbackPanel.loadError),
+                retryVisible: Boolean(tabEl1.querySelector('[data-testid="retry-button"]')),
+                fileListIsNull: fallbackPanel.fileList === null,
+            }
+            tabEl1.querySelector('[data-testid="retry-button"]').click()
+            const fallbackRecoverDeadline = Date.now() + 5000
+            while ((!Array.isArray(fallbackPanel.fileList) || fallbackPanel.loadError) && Date.now() < fallbackRecoverDeadline) {
+                await new Promise(r => setTimeout(r, 30))
+            }
+            disconnectDuringResolveFallback.recoveredAfterRetry = Array.isArray(fallbackPanel.fileList) && !fallbackPanel.loadError
+            disconnectDuringResolveFallback.recoveredPath = fallbackPanel.path
+            await fallbackPanel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForCloseFallback
+        }
 
         // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch with independent Bob backend (delete/upload isolation) + LRU eviction live refresh
         await closeSftpFor('127.0.0.1')
@@ -1289,15 +1462,17 @@ try {
             const SFTPSessionCtor = aliceBackend.constructor
             bobRawSftp = await origSshSession.ssh.activateSFTP(await origSshSession.ssh.openSessionChannel())
             const bobBackend = new SFTPSessionCtor(bobRawSftp, tab1.injector)
-            const bobOps = { unlink: 0, rmdir: 0, upload: 0, mkdir: 0 }
+            const bobOps = { unlink: 0, rmdir: 0, upload: 0, mkdir: 0, download: 0 }
             const origBobUnlink = bobBackend.unlink.bind(bobBackend)
             const origBobRmdir = bobBackend.rmdir.bind(bobBackend)
             const origBobUpload = bobBackend.upload.bind(bobBackend)
             const origBobMkdir = bobBackend.mkdir.bind(bobBackend)
+            const origBobDownload = bobBackend.download.bind(bobBackend)
             bobBackend.unlink = async (...args) => { bobOps.unlink++; return origBobUnlink(...args) }
             bobBackend.rmdir = async (...args) => { bobOps.rmdir++; return origBobRmdir(...args) }
             bobBackend.upload = async (...args) => { bobOps.upload++; return origBobUpload(...args) }
             bobBackend.mkdir = async (...args) => { bobOps.mkdir++; return origBobMkdir(...args) }
+            bobBackend.download = async (...args) => { bobOps.download++; return origBobDownload(...args) }
 
             let bobSessionOpenCalls = 0
             let failFirstBobOpen = true
@@ -1317,6 +1492,8 @@ try {
             const origShowMessageBox = samePanelBefore.platform.showMessageBox
             const origPopupMenu = samePanelBefore.platform.popupContextMenu
             const origStartUpload = samePanelBefore.platform.startUpload
+            const origStartUploadFromDrag = samePanelBefore.platform.startUploadFromDragEvent
+            const origElectronDialog = samePanelBefore.platform.electron.dialog
             let releaseDeleteConfirm = null
             let aliceMenu = null
             let deleteClickPromise = null
@@ -1326,7 +1503,43 @@ try {
             let bobRecoveredFavorites = []
             let bobLeakedAlicePath = false
             let uploadTransferCancelled = false
+            let dragCancelCounts = null
+            let midDirCancelCounts = null
             try {
+                const switchLiveToAlice = async () => {
+                    tab1.sshSession = origSshSession
+                    tab1.sshSession.authUsername = 'alice'
+                    tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                    const dl = Date.now() + 5000
+                    while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-a'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < dl) {
+                        await new Promise(r => setTimeout(r, 25))
+                    }
+                }
+                const switchLiveToBob = async () => {
+                    tab1.sshSession = bobSessionProxy
+                    tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                    const dl = Date.now() + 5000
+                    while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-b'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < dl) {
+                        await new Promise(r => setTimeout(r, 25))
+                    }
+                }
+                const makeTrackedUpload = (name, size = 10) => {
+                    let cancelled = false
+                    let cancelCalls = 0
+                    return {
+                        getName: () => name,
+                        getSize: () => size,
+                        getMode: () => 0o644,
+                        read: async () => Buffer.alloc(0),
+                        cancel () { cancelCalls++; cancelled = true },
+                        close () {},
+                        setStatus () {},
+                        isCancelled: () => cancelled,
+                        isComplete: () => false,
+                        getCancelCalls: () => cancelCalls,
+                    }
+                }
+
                 samePanelBefore.platform.popupContextMenu = items => { aliceMenu = items }
                 samePanelBefore.platform.showMessageBox = () => new Promise(resolve => { releaseDeleteConfirm = resolve })
                 const aliceRowA = aliceReopen.tabEl.querySelector('.list-group-item.file-row[data-name="a.txt"]')
@@ -1365,26 +1578,14 @@ try {
                 await new Promise(r => setTimeout(r, 80))
 
                 // 5b. Switch back to Alice on the SAME open panel, start pending upload(), switch to Bob before picker resolves -> 0 upload/mkdir on Bob
-                tab1.sshSession = origSshSession
-                tab1.sshSession.authUsername = 'alice'
-                tab1.injector.get(require('@angular/core').ApplicationRef).tick()
-                const backToAliceDeadline = Date.now() + 5000
-                while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-a'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < backToAliceDeadline) {
-                    await new Promise(r => setTimeout(r, 25))
-                }
+                await switchLiveToAlice()
                 let releaseUploadPicker = null
                 samePanelBefore.platform.startUpload = () => new Promise(resolve => { releaseUploadPicker = resolve })
                 const pendingAliceUpload = samePanelBefore.upload()
                 const uploadPickerDeadline = Date.now() + 5000
                 while (!releaseUploadPicker && Date.now() < uploadPickerDeadline) await new Promise(r => setTimeout(r, 20))
 
-                // Switch live to Bob while Alice's upload picker is waiting
-                tab1.sshSession = bobSessionProxy
-                tab1.injector.get(require('@angular/core').ApplicationRef).tick()
-                const backToBobDeadline = Date.now() + 5000
-                while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-b'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < backToBobDeadline) {
-                    await new Promise(r => setTimeout(r, 25))
-                }
+                await switchLiveToBob()
                 const staleUploadTransfer = {
                     getName: () => 'should-never-hit-bob.txt',
                     read: async () => Buffer.alloc(0),
@@ -1396,10 +1597,91 @@ try {
                 releaseUploadPicker([staleUploadTransfer])
                 await pendingAliceUpload
                 await new Promise(r => setTimeout(r, 80))
+
+                // 5b-drag (P1): Trigger real drop on Alice's open panel with delayed directory scan, switch live to Bob before scan completes -> Bob receives 0 upload/mkdir and all dragged files are cancelled once
+                await switchLiveToAlice()
+                let releaseDragScan = null
+                samePanelBefore.platform.startUploadFromDragEvent = () => new Promise(resolve => { releaseDragScan = resolve })
+                aliceReopen.tabEl.querySelector('sftp-panel .body').dispatchEvent(new Event('drop'))
+                const dragDeadline = Date.now() + 5000
+                while (!releaseDragScan && Date.now() < dragDeadline) await new Promise(r => setTimeout(r, 20))
+                await switchLiveToBob()
+                const { DirectoryUpload } = require('tabby-core')
+                const dragTree = new DirectoryUpload()
+                const dragRootFile = makeTrackedUpload('drag-root.txt')
+                const dragSubDir = new DirectoryUpload('drag-sub')
+                const dragNestedFile = makeTrackedUpload('drag-nested.txt')
+                dragSubDir.pushChildren(dragNestedFile)
+                dragTree.pushChildren(dragRootFile)
+                dragTree.pushChildren(dragSubDir)
+                releaseDragScan(dragTree)
+                await new Promise(r => setTimeout(r, 100))
+                dragCancelCounts = {
+                    root: dragRootFile.getCancelCalls(),
+                    nested: dragNestedFile.getCancelCalls(),
+                }
+
+                // 5b-download (P2): Existing non-empty local file chosen in Save dialog after switching Alice -> Bob MUST NOT be truncated & Bob receives 0 downloads
+                await switchLiveToAlice()
+                let releaseSaveDialog = null
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: () => new Promise(resolve => { releaseSaveDialog = resolve }),
+                }
+                const pendingAliceDownload = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                const saveDeadline = Date.now() + 5000
+                while (!releaseSaveDialog && Date.now() < saveDeadline) await new Promise(r => setTimeout(r, 20))
+                await switchLiveToBob()
+                releaseSaveDialog({ canceled: false, filePath: ${JSON.stringify(keepDownloadFile)} })
+                await pendingAliceDownload
+                await new Promise(r => setTimeout(r, 80))
+                samePanelBefore.platform.electron.dialog = origElectronDialog
+
+                // 5b-mid-dir-upload (P2): Multi-file + nested DirectoryUpload paused during first file while switching Alice -> Bob cancels every remaining unsubmitted FileUpload exactly once & 0 writes to Bob
+                await switchLiveToAlice()
+                const activeAliceBackend = samePanelBefore.sftp
+                const origAliceUpload = activeAliceBackend.upload.bind(activeAliceBackend)
+                let releaseFirstUpload = null
+                activeAliceBackend.upload = async (_targetPath, transfer) => {
+                    await new Promise(resolve => { releaseFirstUpload = resolve })
+                    transfer.close()
+                }
+                try {
+                    const midTree = new DirectoryUpload()
+                    const midFirst = makeTrackedUpload('first.txt', 12)
+                    const midSecond = makeTrackedUpload('second.txt', 14)
+                    const midSub = new DirectoryUpload('nested')
+                    const midThird = makeTrackedUpload('third.txt', 16)
+                    const midDeep = new DirectoryUpload('deep')
+                    const midFourth = makeTrackedUpload('fourth.txt', 0)
+                    midDeep.pushChildren(midFourth)
+                    midSub.pushChildren(midThird)
+                    midSub.pushChildren(midDeep)
+                    midTree.pushChildren(midFirst)
+                    midTree.pushChildren(midSecond)
+                    midTree.pushChildren(midSub)
+
+                    const midUploadPromise = samePanelBefore.uploadOneFolder(midTree)
+                    const midDeadline = Date.now() + 5000
+                    while (!releaseFirstUpload && Date.now() < midDeadline) await new Promise(r => setTimeout(r, 20))
+                    await switchLiveToBob()
+                    releaseFirstUpload()
+                    await midUploadPromise
+                    await new Promise(r => setTimeout(r, 80))
+                    midDirCancelCounts = {
+                        first: midFirst.getCancelCalls(),
+                        second: midSecond.getCancelCalls(),
+                        third: midThird.getCancelCalls(),
+                        fourth: midFourth.getCancelCalls(),
+                    }
+                } finally {
+                    activeAliceBackend.upload = origAliceUpload
+                }
             } finally {
                 samePanelBefore.platform.showMessageBox = origShowMessageBox
                 samePanelBefore.platform.popupContextMenu = origPopupMenu
                 samePanelBefore.platform.startUpload = origStartUpload
+                samePanelBefore.platform.startUploadFromDragEvent = origStartUploadFromDrag
+                samePanelBefore.platform.electron.dialog = origElectronDialog
             }
 
             liveReconnectAccountSwitch = {
@@ -1413,6 +1695,8 @@ try {
                 bobLeakedAlicePath,
                 bobOps,
                 uploadTransferCancelled,
+                dragCancelCounts,
+                midDirCancelCounts,
             }
 
             // 5c. LRU eviction live refresh: Bob's panel is currently OPEN with favorite [sub-b]; write 50 new SSH scopes -> Bob's open panel immediately clears favorites, recent & star
@@ -1492,6 +1776,10 @@ try {
             sshMissingFallback,
             sshNoPermFallback,
             sshSymlinkRootFallback,
+            symlinkRetargetManual,
+            symlinkRetargetFallback,
+            disconnectDuringResolveManual,
+            disconnectDuringResolveFallback,
             authUserIsolation,
             liveReconnectAccountSwitch,
             lruEvictionLiveRefresh,
@@ -1551,6 +1839,30 @@ try {
         sshIsolationPhase1.sshSymlinkRootFallback.bannerText.includes('missing-for-root-fallback'),
         sshIsolationPhase1.sshSymlinkRootFallback.bannerText,
     )
+    assert.deepEqual(sshIsolationPhase1.symlinkRetargetManual, {
+        path: join(sshRoot, 'retarget-parent-b'),
+        names: ['child', 'only-in-parent-b.txt'],
+        entryBFullPath: join(sshRoot, 'retarget-parent-b', 'only-in-parent-b.txt'),
+    })
+    assert.deepEqual(sshIsolationPhase1.symlinkRetargetFallback, {
+        path: join(sshRoot, 'retarget-parent-b'),
+        names: ['child', 'only-in-parent-b.txt'],
+        entryBFullPath: join(sshRoot, 'retarget-parent-b', 'only-in-parent-b.txt'),
+    })
+    assert.deepEqual(sshIsolationPhase1.disconnectDuringResolveManual, {
+        hasLoadError: true,
+        retryVisible: true,
+        fileListIsNull: true,
+        recoveredAfterRetry: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.disconnectDuringResolveFallback, {
+        hasLoadError: true,
+        retryVisible: true,
+        fileListIsNull: true,
+        recoveredAfterRetry: true,
+        recoveredPath: '/',
+    })
+    assert.equal(await readFile(keepDownloadFile, 'utf8'), 'MUST-NOT-BE-TRUNCATED\n')
     assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
         aliceScope: `ssh:alice@127.0.0.1:${port}`,
         bobScope: `ssh:bob@127.0.0.1:${port}`,
@@ -1562,14 +1874,16 @@ try {
     assert.deepEqual(sshIsolationPhase1.liveReconnectAccountSwitch, {
         samePanelReused: true,
         distinctBobBackend: true,
-        bobSessionOpenCalls: 3,
+        bobSessionOpenCalls: 6,
         bobRetryTargetPath: join(sshRoot, 'sub-b'),
         bobFavoritesDuringError: [join(sshRoot, 'sub-b')],
         bobRecoveredPath: join(sshRoot, 'sub-b'),
         bobRecoveredFavorites: [join(sshRoot, 'sub-b')],
         bobLeakedAlicePath: false,
-        bobOps: { unlink: 0, rmdir: 0, upload: 0, mkdir: 0 },
+        bobOps: { unlink: 0, rmdir: 0, upload: 0, mkdir: 0, download: 0 },
         uploadTransferCancelled: true,
+        dragCancelCounts: { root: 1, nested: 1 },
+        midDirCancelCounts: { first: 0, second: 1, third: 1, fourth: 1 },
     })
     assert.deepEqual(sshIsolationPhase1.lruEvictionLiveRefresh, {
         favoritesBeforeEvict: [join(sshRoot, 'sub-b')],
