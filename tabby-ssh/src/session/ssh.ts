@@ -13,6 +13,8 @@ import { HostKeyPromptModalComponent } from '../components/hostKeyPromptModal.co
 import { PasswordStorageService } from '../services/passwordStorage.service'
 import { SSHKnownHostsService } from '../services/sshKnownHosts.service'
 import { SFTPSession } from './sftp'
+import type { FileBackend } from '../api/fileBackend'
+import { SFTPChannelPool } from '../utils/filePanelFallback'
 import { SSHAlgorithmType, SSHProfile, AutoPrivateKeyLocator, PortForwardType } from '../api'
 import { ForwardedPort } from './forwards'
 import { X11Socket } from './x11'
@@ -99,7 +101,7 @@ export class KeyboardInteractivePrompt {
 export class SSHSession {
     shell?: russh.Channel
     ssh: russh.SSHClient|russh.AuthenticatedSSHClient
-    sftp?: russh.SFTP | null
+    get sftp (): russh.SFTP | null { return this.sftpPool.current }
     forwardedPorts: ForwardedPort[] = []
     jumpChannel: russh.NewChannel|null = null
     savedPassword?: string
@@ -129,6 +131,12 @@ export class SSHSession {
     private knownHosts: SSHKnownHostsService
     private privateKeyImporters: AutoPrivateKeyLocator[]
     private previouslyDisconnected = false
+    private sftpPool = new SFTPChannelPool<russh.SFTP>(async () => {
+        if (!(this.ssh instanceof russh.AuthenticatedSSHClient)) {
+            throw new Error('Cannot open SFTP session before auth')
+        }
+        return this.ssh.activateSFTP(await this.ssh.openSessionChannel())
+    })
 
     constructor (
         private injector: Injector,
@@ -364,29 +372,14 @@ export class SSHSession {
         return null
     }
 
-    async openSFTP (forceNew = false): Promise<SFTPSession> {
+    async openSFTP (failedBackend?: FileBackend): Promise<SFTPSession> {
         if (!(this.ssh instanceof russh.AuthenticatedSSHClient)) {
             throw new Error('Cannot open SFTP session before auth')
         }
-        if (forceNew && this.sftp) {
-            const stale = this.sftp
-            this.sftp = null
-            void stale.close().catch(() => null)
-        }
-        if (!this.sftp) {
-            const sftp = await this.ssh.activateSFTP(await this.ssh.openSessionChannel())
-            this.sftp = sftp
-            sftp.closed$.subscribe(() => {
-                if (this.sftp === sftp) {
-                    this.sftp = null
-                }
-            })
-        }
-        const activeSftp = this.sftp
+        const failedRaw = (failedBackend as { rawSftp?: russh.SFTP } | undefined)?.rawSftp ?? null
+        const activeSftp = await this.sftpPool.acquire(failedRaw)
         return new SFTPSession(activeSftp, this.injector, () => {
-            if (this.sftp === activeSftp) {
-                this.sftp = null
-            }
+            this.sftpPool.invalidate(activeSftp)
         })
     }
 

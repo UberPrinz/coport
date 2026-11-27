@@ -4,7 +4,7 @@
 
 | 上游文件 | Coport 改动 |
 |---|---|
-| `app/lib/index.ts` | 注册主进程串口与 ADB IPC、MCP host 及安全退出流程，处理后台启动和隔离数据目录，避免隔离启动改写宿主协议注册 |
+| `app/lib/index.ts` | 注册主进程串口、ADB 与文件面板状态 IPC、MCP host 及安全退出流程，处理后台启动和隔离数据目录，避免隔离启动改写宿主协议注册 |
 | `app/lib/app.ts`、`app/lib/window.ts` | 菜单、托盘和窗口使用打包后的名称。移除主进程自动更新器 |
 | `app/lib/sentry.ts` | 保留构建和 preload 入口，移除 Sentry 初始化 |
 | `app/package.json` | 为 Electron 声明产品名，加入 headless、serialize 与锁定的 MCP SDK 1.29.0 |

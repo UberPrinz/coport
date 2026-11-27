@@ -1,20 +1,28 @@
 import assert from 'node:assert/strict'
+import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { describe, it } from 'node:test'
 import {
     ADB_FILE_PANEL_SCOPE,
+    FILE_PANEL_STATE_IPC_CHANGED,
+    FILE_PANEL_STATE_IPC_OP,
     FILE_PANEL_STATE_STORAGE_KEY,
     FilePanelStateStore,
+    IpcFilePanelStateClient,
     MAX_FAVORITE_PATHS,
     MAX_RECENT_PATHS,
     MAX_SSH_SCOPES,
     createSSHFilePanelScope,
+    executeFilePanelStateOp,
     getFilePanelScopeStorageKey,
     normalizeFilePanelPath,
     parseFilePanelScopeRecord,
+    parseFilePanelStateSnapshot,
     subscribeFilePanelStateChanges,
 } from '../src/utils/filePanelState.ts'
-import type { FilePanelStorageLike } from '../src/utils/filePanelState.ts'
+import type { FilePanelIpcRendererLike, FilePanelStorageLike } from '../src/utils/filePanelState.ts'
 import {
     filterAndSortEntries,
     matchFileName,
@@ -22,8 +30,11 @@ import {
     splitTextByHighlights,
 } from '../src/utils/filePanelFilter.ts'
 import {
+    SFTPChannelPool,
     isAdbDirectoryUnavailableError,
+    isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
+    resolvePosixPathWithReadlink,
     resolveReadableDirectory,
 } from '../src/utils/filePanelFallback.ts'
 
@@ -283,6 +294,162 @@ describe('filePanelState', () => {
         assert.equal(store.getLastPath(ADB_FILE_PANEL_SCOPE), '/data/app')
         assert.deepEqual(store.getFavorites(ADB_FILE_PANEL_SCOPE), ['/data/app'])
     })
+
+    it('preserves in-memory updates when storage write fails on a scope that already has a stored record', () => {
+        const { storage } = createMemoryStorage()
+        let failWrites = false
+        const flakyStorage: FilePanelStorageLike = {
+            get length () {
+                return storage.length
+            },
+            key: index => storage.key(index),
+            getItem: key => storage.getItem(key),
+            setItem: (key, value) => {
+                if (failWrites) {
+                    throw new Error('QuotaExceededError')
+                }
+                storage.setItem(key, value)
+            },
+            removeItem: key => storage.removeItem(key),
+        }
+
+        const store = new FilePanelStateStore(flakyStorage)
+        store.recordVisit(ADB_FILE_PANEL_SCOPE, '/old')
+        assert.equal(store.getLastPath(ADB_FILE_PANEL_SCOPE), '/old')
+
+        failWrites = true
+        store.recordVisit(ADB_FILE_PANEL_SCOPE, '/new')
+        assert.equal(store.toggleFavorite(ADB_FILE_PANEL_SCOPE, '/new'), true)
+
+        const state = store.getScopeState(ADB_FILE_PANEL_SCOPE)
+        assert.deepEqual(state.recent, ['/new', '/old'])
+        assert.deepEqual(state.favorites, ['/new'])
+        assert.deepEqual(store.getSnapshot().scopes[ADB_FILE_PANEL_SCOPE].recent, ['/new', '/old'])
+        assert.deepEqual(store.getSnapshot().scopes[ADB_FILE_PANEL_SCOPE].favorites, ['/new'])
+
+        // External write to underlying storage supersedes the failed cached record cleanly.
+        const scopeKey = getFilePanelScopeStorageKey(ADB_FILE_PANEL_SCOPE)
+        storage.setItem(scopeKey, JSON.stringify({
+            version: 1,
+            recent: ['/external'],
+            favorites: ['/external-fav'],
+            updatedAt: 9999999999999,
+        }))
+        const afterExternal = store.getScopeState(ADB_FILE_PANEL_SCOPE)
+        assert.deepEqual(afterExternal.recent, ['/external'])
+        assert.deepEqual(afterExternal.favorites, ['/external-fav'])
+    })
+
+    it('serializes multi-window timestamps, 50 SSH LRU pruning, broadcasts, and disk write failure retention through a single coordinator', () => {
+        const tempDir = mkdtempSync(join(tmpdir(), 'coport-file-panel-state-'))
+        const filePath = join(tempDir, 'coport-file-panel-state.json')
+        const originalNow = Date.now
+        Date.now = () => 1700000000000
+        try {
+            const masterStore = new FilePanelStateStore(null)
+            const broadcastListeners: ((event: unknown, payload: unknown) => void)[] = []
+            let writeCount = 0
+            let failDiskPersist = false
+
+            const dispatchOp = (request: unknown) => {
+                const response = executeFilePanelStateOp(masterStore, request)
+                if (response.ok && response.changedScope) {
+                    const tempFile = `${filePath}.${++writeCount}.tmp`
+                    try {
+                        if (failDiskPersist) {
+                            throw Object.assign(new Error('EACCES: read-only'), { code: 'EACCES' })
+                        }
+                        writeFileSync(tempFile, JSON.stringify(masterStore.getSnapshot()), 'utf8')
+                        renameSync(tempFile, filePath)
+                    } catch {
+                        rmSync(tempFile, { force: true })
+                    }
+                    for (const listener of broadcastListeners) {
+                        listener({}, { scope: response.changedScope })
+                    }
+                }
+                return response
+            }
+
+            const makeWindowClient = (): IpcFilePanelStateClient => {
+                const ipc: FilePanelIpcRendererLike = {
+                    sendSync: (channel, payload) => {
+                        assert.equal(channel, FILE_PANEL_STATE_IPC_OP)
+                        return dispatchOp(payload)
+                    },
+                    on: (channel, listener) => {
+                        if (channel === FILE_PANEL_STATE_IPC_CHANGED) {
+                            broadcastListeners.push(listener)
+                        }
+                    },
+                }
+                return new IpcFilePanelStateClient(ipc)
+            }
+
+            const winA = makeWindowClient()
+            const winB = makeWindowClient()
+            const observedScopes: string[] = []
+            const unsubscribe = subscribeFilePanelStateChanges(event => {
+                if (event.source === null) {
+                    observedScopes.push(event.scope)
+                }
+            })
+
+            try {
+                winA.recordVisit(ADB_FILE_PANEL_SCOPE, '/etc')
+                for (let i = 1; i <= MAX_SSH_SCOPES; i++) {
+                    winA.recordVisit(createSSHFilePanelScope('dev', `host-${String(i).padStart(2, '0')}`, 22), `/srv/${i}`)
+                }
+                // Interleave writes from both windows at the exact same frozen millisecond around the 50-host cap
+                const host05 = createSSHFilePanelScope('dev', 'host-05', 22)
+                const host51 = createSSHFilePanelScope('dev', 'host-51', 22)
+                const host52 = createSSHFilePanelScope('dev', 'host-52', 22)
+                const rec05 = winB.recordVisit(host05, '/srv/05-refreshed')
+                const rec51 = winA.recordVisit(host51, '/srv/51')
+                const rec52 = winB.recordVisit(host52, '/srv/52')
+
+                assert.ok(rec05 && rec51 && rec52)
+                assert.ok(rec51.updatedAt > rec05.updatedAt, 'timestamps must strictly increase across windows')
+                assert.ok(rec52.updatedAt > rec51.updatedAt, 'timestamps must strictly increase across windows')
+
+                const snapshot = winA.getSnapshot()
+                const sshScopes = Object.keys(snapshot.scopes).filter(k => k.startsWith('ssh:'))
+                assert.equal(sshScopes.length, MAX_SSH_SCOPES)
+                assert.equal(winB.getLastPath(host05), '/srv/05-refreshed')
+                assert.equal(winB.getLastPath(host51), '/srv/51')
+                assert.equal(winA.getLastPath(host52), '/srv/52')
+                assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-01', 22)), null)
+                assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-02', 22)), null)
+                assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-03', 22)), '/srv/3')
+                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/etc')
+                assert.ok(observedScopes.includes(host51) && observedScopes.includes(host52))
+
+                // Reloading from the atomic JSON file preserves full state across restart
+                const reloaded = new FilePanelStateStore(null)
+                reloaded.loadSnapshot(parseFilePanelStateSnapshot(readFileSync(filePath, 'utf8')))
+                assert.equal(reloaded.getLastPath(host51), '/srv/51')
+                assert.equal(reloaded.getLastPath(host52), '/srv/52')
+                assert.equal(reloaded.getLastPath(ADB_FILE_PANEL_SCOPE), '/etc')
+
+                // Disk write failure (e.g. EACCES / read-only) retains in-memory updates without rolling back to old JSON
+                failDiskPersist = true
+                winA.recordVisit(ADB_FILE_PANEL_SCOPE, '/new-while-readonly')
+                assert.equal(winA.toggleFavorite(ADB_FILE_PANEL_SCOPE, '/new-while-readonly'), true)
+                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/new-while-readonly')
+                assert.deepEqual(winB.getFavorites(ADB_FILE_PANEL_SCOPE), ['/new-while-readonly'])
+            } finally {
+                unsubscribe()
+            }
+        } finally {
+            Date.now = originalNow
+            try {
+                chmodSync(tempDir, 0o700)
+            } catch {
+                // Ignore cleanup chmod error.
+            }
+            rmSync(tempDir, { recursive: true, force: true })
+        }
+    })
 })
 
 describe('filePanelFallback', () => {
@@ -390,6 +557,122 @@ describe('filePanelFallback', () => {
         assert.equal(result.cancelled, true)
         assert.deepEqual(attempted, ['/a/b/c'])
     })
+
+    it('reuses a recovered shared SFTP channel across sequential retries and never leaks or prematurely closes healthy channels', async () => {
+        interface MockChannel {
+            id: number
+            closeCalls: number
+            closedListeners: (() => void)[]
+            closed$: { subscribe: (fn: () => void) => void }
+            close: () => Promise<void>
+            emitClose: () => void
+        }
+        const created: MockChannel[] = []
+        let nextId = 0
+        const pool = new SFTPChannelPool<MockChannel>(async () => {
+            const closedListeners: (() => void)[] = []
+            const ch: MockChannel = {
+                id: ++nextId,
+                closeCalls: 0,
+                closedListeners,
+                closed$: {
+                    subscribe: fn => {
+                        closedListeners.push(fn)
+                    },
+                },
+                close: async () => {
+                    ch.closeCalls++
+                },
+                emitClose: () => {
+                    for (const fn of closedListeners) {
+                        fn()
+                    }
+                },
+            }
+            created.push(ch)
+            return ch
+        })
+
+        // Two panels share ch1
+        const [p1Initial, p2Initial] = await Promise.all([pool.acquire(), pool.acquire()])
+        assert.equal(p1Initial, p2Initial)
+        assert.equal(created.length, 1)
+
+        // Normal SFTP operational Failure must NOT invalidate or leak ch1
+        assert.equal(isSFTPChannelClosedError(new Error('Failure')), false)
+        assert.equal(isSFTPChannelClosedError(new Error('Status(Failure)')), false)
+        assert.equal(isSFTPChannelClosedError(new Error('No such file')), false)
+        assert.equal(isSFTPChannelClosedError(new Error('Permission denied')), false)
+        assert.equal(isSFTPChannelClosedError(new Error('Request timed out')), false)
+        assert.equal(isSFTPChannelClosedError(new Error('SFTP channel closed')), true)
+        assert.equal(isSFTPChannelClosedError(new Error('UnexpectedEof')), true)
+        assert.equal(isSFTPChannelClosedError(new Error('broken pipe')), true)
+        assert.equal(isSFTPChannelClosedError(new Error('disconnected')), true)
+        assert.equal(pool.current, p1Initial)
+
+        // Panel 1 retries with failed channel ch1 -> closes ch1 exactly once and opens ch2
+        const p1Recovered = await pool.acquire(p1Initial)
+        assert.notEqual(p1Recovered, p1Initial)
+        assert.equal(p1Initial.closeCalls, 1)
+        assert.equal(p1Recovered.closeCalls, 0)
+        assert.equal(created.length, 2)
+
+        // Panel 2 then retries with its stale failed channel ch1 -> MUST reuse ch2 and NEVER close ch2
+        const p2Recovered = await pool.acquire(p2Initial)
+        assert.equal(p2Recovered, p1Recovered)
+        assert.equal(p1Recovered.closeCalls, 0)
+        assert.equal(created.length, 2)
+
+        // Invalidate on genuine channel-closed error clears cache and calls close() on ch2
+        pool.invalidate(p1Recovered)
+        assert.equal(pool.current, null)
+        assert.equal(p1Recovered.closeCalls, 1)
+    })
+
+    it('resolves POSIX symlink paths containing .. via readlink and converges to / without extra RTTs on normal paths', async () => {
+        let readlinkCalls = 0
+        const links = new Map<string, string>([
+            ['/link', '/real'],
+            ['/a/link-parent/to-real-child', '/a/real-parent/real-child'],
+            ['/a/b/rel', '../c/d'],
+            ['/loop-a', '/loop-b'],
+            ['/loop-b', '/loop-a'],
+        ])
+        const readlink = async (target: string): Promise<string> => {
+            readlinkCalls++
+            if (target === '/missing') {
+                throw new Error('No such file')
+            }
+            const found = links.get(target)
+            if (found !== undefined) {
+                return found
+            }
+            throw new Error('Failure')
+        }
+
+        // Normal path without '..' triggers zero readlink calls and preserves trailing spaces
+        assert.equal(await resolvePosixPathWithReadlink('/tmp/trail ', readlink), '/tmp/trail ')
+        assert.equal(readlinkCalls, 0)
+
+        // Symlink directly under / followed by .. converges cleanly to /
+        assert.equal(await resolvePosixPathWithReadlink('/link/..', readlink), '/')
+        assert.equal(await resolvePosixPathWithReadlink('/link/../..', readlink), '/')
+
+        // Cross-parent absolute symlink + .. resolves to server's real parent
+        assert.equal(
+            await resolvePosixPathWithReadlink('/a/link-parent/to-real-child/..', readlink),
+            '/a/real-parent',
+        )
+
+        // Relative symlink + .. resolves against symlink's parent directory
+        assert.equal(await resolvePosixPathWithReadlink('/a/b/rel/..', readlink), '/a/c')
+
+        // Symlink loop respects depth limit and falls back to original path cleanly
+        assert.equal(await resolvePosixPathWithReadlink('/loop-a/..', readlink), '/loop-a/..')
+
+        // Missing intermediate falls back to original path so readdir reports the exact server error
+        assert.equal(await resolvePosixPathWithReadlink('/missing/..', readlink), '/missing/..')
+    })
 })
 
 describe('filePanelFilter', () => {
@@ -455,6 +738,16 @@ describe('filePanelFilter', () => {
         assert.ok(matchSubseq)
         assert.equal(matchSubseq.tier, 3)
         assert.deepEqual(matchSubseq.ranges, [[1, 2], [4, 5], [6, 7]])
+
+        // Context-sensitive Unicode lowercase (Greek final sigma Σ -> ς alongside expanding İ -> i\u0307)
+        const matchGreek = matchFileName('İΟΣ', 'ος')
+        assert.ok(matchGreek)
+        assert.equal(matchGreek.tier, 2)
+        assert.deepEqual(matchGreek.ranges, [[1, 3]])
+        assert.deepEqual(splitTextByHighlights('İΟΣ', matchGreek.ranges), [
+            { text: 'İ', highlighted: false },
+            { text: 'ΟΣ', highlighted: true },
+        ])
     })
 
     it('preserves directory-first lexicographical order when query is empty', () => {

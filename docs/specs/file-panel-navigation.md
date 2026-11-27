@@ -27,14 +27,14 @@
 | Total Commander Quick Filter（跨行业交互借鉴） | 面板内直接输入即增量隐藏不匹配项，`Esc` 立即还原完整列表，适合高频目录钻取 | 已有充分证据：Total Commander 长期稳定特性 | [Total Commander Quick Search / Quick Filter](https://www.ghisler.ch/wiki/index.php/Quick_search)（2026-11-27 查证） | 采用其「直接输入默认过滤而非仅跳转光标」与 `Esc` 还原语义 |
 | 仓库既有 `fuzzy-search`（评估复用） | `tabby-core` 的 `SelectorModalComponent` 已依赖 `fuzzy-search`，可做基础模糊筛选 | 有条件可用：仅返回匹配对象数组，不提供命中字符索引区间，且 `tabby-ssh/package.json` 未声明该依赖 | 仓库源码 `tabby-core/src/components/selectorModal.component.ts:4`（2026-11-27 核实） | 排除。无法在不二次扫描/自研的前提下提供命中字符高亮与可控的分级排序，且不希望为上游 `tabby-ssh` 新增第三方依赖 |
 | 轻量自研顺序子序列 + 子串分级匹配器（必要自研） | ~80 行零依赖纯 TypeScript 函数，一次遍历完成精确/前缀/子串/子序列分级打分并返回合并后的 `[start, end)` 高亮区间，1,000 条目耗时 < 2 ms | 已有充分证据：无外部依赖，纯算法可直接在 L0 `node --test` 验证性能与边界 | 本文设计 `tabby-ssh/src/utils/filePanelFilter.ts` | 采用。零新增依赖、满足 ≤ 16 ms 性能指标、支持安全模板分段渲染（无 `innerHTML`） |
-| Tabby `window.localStorage`（直接复用） | Tabby 既有 UI 状态（`recentProfiles`、`tabsRecovery`、`profileTreeWidth`、`sshCWDTipDismissed`）均存放在 `window.localStorage`，自动随 Electron `--user-data-dir` 隔离，支持跨窗口 `storage` 事件 | 已有充分证据：Tabby 1.0.238 生产代码及 `sftpPanel.component.ts:380` 现已使用 | 仓库源码 `tabby-core/src/services/profiles.service.ts:205`、`tabby-ssh/src/components/sftpPanel.component.ts:380`（2026-11-27 核实） | 采用。按作用域独立键 `coport.filePanelState.v1:<scope>` 存储，零迁移成本、消除跨作用域多窗口写入互相覆盖，且天然兼容现有 `coport_shells.mjs` 隔离数据目录重启验证 |
+| Tabby 主进程原子文件存储（借鉴本仓库串口参数落盘模式） + 纯逻辑 `FilePanelStateStore` 引擎 | 主进程单线程串行执行时间戳分配、写入与 50 主机 LRU 裁剪，通过临时文件 + 原子 `rename` 持久化到 `userData/coport-file-panel-state.json`，并向所有窗口广播变更；非 Electron/单测环境可回退至 `StorageLike` | 已有充分证据：本仓库 `app/lib/coport/` 已有成熟主进程 IPC 与隔离 `userData` 机制，彻底消除多窗口 `localStorage` 并发写/裁剪竞态 | 仓库源码 `app/lib/index.ts`、`app/lib/coport/adbIpc.ts`（2026-11-27 核实） | 采用。单一纯逻辑引擎被主进程 IPC 与 L0 单测共用（零重复实现），天然随 Electron `--user-data-dir` 隔离，同窗/跨窗多标签自动实时同步 |
 | Tabby `ConfigService` / `config.yaml`（评估复用） | 适合用户显式编辑的配置项，但高频目录切换会频繁触发全量 YAML 序列化落盘，且目录路径属于运行态导航历史而非静态配置 | 已有充分证据：Tabby 自身亦将 `recentProfiles` 等高频导航状态放入 `localStorage` 而非 `config.yaml` | 仓库源码 `tabby-core/src/services/config.service.ts`（2026-11-27 核实） | 排除。避免高频 `cd` 导致 `config.yaml` 反复写盘和与用户手动编辑配置冲突 |
 
 无阻塞技术假设，无需前置预研。所有依赖（Angular 15 宿主事件与模板渲染、`window.localStorage`、`FileBackend`、Node 22 `node --test`、`coport_shells.mjs` Electron+ADB+sshd 仿真套件）均已在当前仓库运行并验证。
 
 ## 目标架构与影响范围
 
-运行边界位于渲染进程与主进程之间：本次所有新增状态与交互逻辑均驻留在渲染进程的 `tabby-ssh`（共用面板与纯逻辑工具）和 `tabby-adb`（ADB 面板挂载与错误标记）内，主进程 `adbIpc.ts` / `adbService.ts` 保持零改动（主进程已返回结构化 `error.reason = 'unreadable_directory'`）。下图中实线箭头表示调用或数据读写方向，虚线表示事件或跨进程 IPC。
+运行边界位于渲染进程与主进程之间：面板 UI、过滤与回退逻辑驻留在渲染进程的 `tabby-ssh` 与 `tabby-adb` 内；主进程 `adbIpc.ts` / `adbService.ts` 保持零改动，仅在 `app/lib/coport/` 新增轻量主进程状态存储 IPC（`filePanelStateIpc.ts`），复用同一份纯逻辑 `filePanelState.ts` 引擎为多窗口提供单点原子读写、严格递增时间戳、LRU 裁剪与全窗口变更广播。下图中实线箭头表示调用或数据读写方向，虚线表示事件或跨进程 IPC。
 
 ```mermaid
 flowchart TB
@@ -42,7 +42,7 @@ flowchart TB
         direction TB
         subgraph UI["交互层"]
             ADBTAB["tabby-adb / AdbTabComponent<br/>scope='adb:shared', defaultPath='/'"]
-            SSHTAB["tabby-ssh / SSHTabComponent<br/>scope='ssh:user@host:port', CWD 优先"]
+            SSHTAB["tabby-ssh / SSHTabComponent<br/>scope='ssh:authUsername@host:port', 无历史时首开用 CWD"]
             PANEL["tabby-ssh / SFTPPanelComponent<br/>路径栏、星标、收藏条、历史下拉、直接过滤与键盘流"]
         end
         subgraph LOGIC["纯逻辑与状态层（零 DOM 依赖，L0 直测）"]
@@ -51,11 +51,10 @@ flowchart TB
             FALLBACK["tabby-ssh / filePanelFallback.ts<br/>目录不可读判定、父级逐级回退与过期取消"]
         end
         subgraph BACKEND["文件后端适配层"]
-            IFACE["tabby-ssh / FileBackend 接口<br/>readdir/stat/upload/download + isDirectoryUnavailable?"]
+            IFACE["tabby-ssh / FileBackend 接口<br/>readdir/stat/upload/download + isDirectoryUnavailable?/resolvePath?"]
             ADBFB["tabby-adb / AdbFileBackend<br/>透传 IPC error.reason"]
-            SFTPS["tabby-ssh / SFTPSession<br/>russh SFTP 错误分类"]
+            SFTPS["tabby-ssh / SFTPSession<br/>russh SFTP 错误分类与符号链接路径解析"]
         end
-        STORE[("window.localStorage<br/>coport.filePanelState.v1:&lt;scope&gt;")]
 
         ADBTAB -->|"绑定 session/stateScope/defaultPath"| PANEL
         SSHTAB -->|"绑定 session/stateScope/initialPath"| PANEL
@@ -66,17 +65,20 @@ flowchart TB
         PANEL -->|"文件操作"| IFACE
         IFACE -.->|"实现"| ADBFB
         IFACE -.->|"实现"| SFTPS
-        STATE -->|"原子读取与合并写回"| STORE
     end
-    subgraph MAIN["Coport 主进程 app/lib/coport（未变更）"]
-        AIPC["adbIpc.ts / AdbService<br/>已返回 reason: 'unreadable_directory'"]
+    subgraph MAIN["Coport 主进程 app/lib/coport"]
+        AIPC["adbIpc.ts / AdbService（未变更）<br/>已返回 reason: 'unreadable_directory'"]
+        FIPC["filePanelStateIpc.ts<br/>复用 filePanelState.ts，单线程原子读写与全窗口广播"]
+        STORE[("userData/coport-file-panel-state.json")]
+        FIPC -->|"临时文件+原子 rename"| STORE
     end
     ADBFB -.->|"IPC coport-adb:fs:*"| AIPC
+    STATE -.->|"IPC coport-file-panel-state:*"| FIPC
 ```
 
 源码定位与设计提议：
 - 既有模块：`tabby-ssh/src/components/sftpPanel.component.{ts,pug,scss}`、`tabby-ssh/src/components/sshTab.component.{ts,pug}`、`tabby-ssh/src/api/fileBackend.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-adb/src/adbTab.component.ts`、`tabby-adb/src/adbPanel.pug`、`tabby-adb/src/adbFileBackend.ts`、`app/lib/coport/adbIpc.ts`、`app/lib/coport/adbService.ts`。
-- 新增设计提议模块：`tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts`。
+- 新增设计提议模块：`app/lib/coport/filePanelStateIpc.ts`、`tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts`。
 
 影响范围：
 - **业务与 UI 改动**：上述 `tabby-ssh` 与 `tabby-adb` 文件。
@@ -89,7 +91,7 @@ flowchart TB
 1. **将纯状态、过滤、回退拆为 `tabby-ssh/src/utils/` 零 Angular 依赖模块**：最小改动可直接堆进 `sftpPanel.component.ts`，但拆出纯模块后既减少对上游大文件的行级冲突，又让 L0 `node --test` 能无头直接覆盖全部边界与 1,000 条目性能阈值。
 2. **模糊匹配排序策略**：输入非空过滤词时，按「匹配档位（精确 > 前缀 > 连续子串 > 顺序子序列）→ 目录优先于文件 → 名称字典序」排序，保证最优命中排在第 0 行，配合 `Enter` 实现一步直达；过滤词为空时保持既有「目录优先 → 名称字典序」。
 3. **过滤态下的 `Backspace` 防误触**：仅当过滤输入框未处于有内容编辑态且事件非长按连发（`!event.repeat`）且过滤词为空时，`Backspace` 触发 `goUp()`，避免用户按住 `Backspace` 清空过滤词时意外退回上级目录。
-4. **单窗口/多窗口 `localStorage` 一致性**：`FilePanelStateStore` 按作用域分键存储（`coport.filePanelState.v1:<scope>`），两个窗口并发写入不同作用域不会互相覆盖；每次写入生成严格大于当前快照最大时间戳的 `updatedAt` 且保护当前写入作用域不被裁剪；同窗口内通过状态变更订阅同步多标签星标与历史，跨窗口通过 `window` `storage` 事件同步。
+4. **单窗口/多窗口状态一致性**：Electron 运行时由主进程 `filePanelStateIpc.ts` 持有唯一 `FilePanelStateStore` 实例并在单线程内完成时间戳分配、写入、50 主机 LRU 裁剪与原子文件落盘（`userData/coport-file-panel-state.json`），随后向所有打开窗口广播 `coport-file-panel-state:changed`，彻底杜绝多窗口并发裁剪误删或同毫秒时间戳冲突；单测及非 Electron 环境复用同一纯逻辑引擎并支持 `StorageLike` 回退（写入失败时保留内存副本不被旧磁盘值覆写）。
 5. **面板布局与遮挡控制**：
    - 顶栏（`.header`）：路径面包屑（单击空白区或铅笔按钮进入编辑态，保留原双击） + 星标收藏按钮 + 收藏/历史下拉触发按钮 + Refresh / Filter / Create directory / Upload files / Upload folder / Close。
    - 收藏快捷条（`.favorites-bar`，有收藏时显示）：单行可横向滚动的紧凑标签芯片，点击直达，悬浮/尾部小 `×` 移除。
@@ -176,27 +178,27 @@ sequenceDiagram
 
 本功能不涉及跨进程或网络协议变更，以下定义渲染进程内部模块契约与持久化存储结构，确保实现与 L0/L2 测试精确对齐。
 
-### 内部契约一：`FileBackend` 目录不可读判定扩展
+### 内部契约一：`FileBackend` 目录不可读判定与路径解析扩展
 
-供 `SFTPPanelComponent` 区分「目录不存在/无权限（可向上回退）」与「设备离线/通道断开/超时（应立即报错并允许重试）」。
+供 `SFTPPanelComponent` 区分「目录不存在/无权限（可向上回退）」与「设备离线/通道断开/超时（应立即报错并允许重试）」，并在 SSH 含 `..` 路径下准确解析服务器真实目录身份以识别根目录。
 
 | 项目 | 定义 |
 |---|---|
 | 调用方 / 实现方 | `tabby-ssh/src/components/sftpPanel.component.ts` → `AdbFileBackend` / `SFTPSession` |
-| 入口签名 | `FileBackend.isDirectoryUnavailable?: (error: unknown) => boolean` |
+| 入口签名 | `FileBackend.isDirectoryUnavailable?: (error: unknown) => boolean`；`FileBackend.resolvePath?: (path: string) => Promise<string>` |
 | ADB 适配 | `adbFileBackend.ts` 在 `adbRequest` 抛出的 `Error` 上保留 `reason: string` 属性；`isDirectoryUnavailable` 仅在 `error.reason === 'unreadable_directory'` 时返回 `true` |
-| SFTP 适配 | `SFTPSession.isDirectoryUnavailable` 当错误包含 SFTP 缺失/权限语义（`No such file`、`Permission denied`、`Not a directory`、`ENOENT`、`EACCES`、`ENOTDIR` 或对应状态码 `2`/`3`）时返回 `true`；连接断开、超时、channel closed 返回 `false` |
+| SFTP 适配 | `SFTPSession.isDirectoryUnavailable` 当错误包含 SFTP 缺失/权限语义（`No such file`、`Permission denied`、`Not a directory`、`ENOENT`、`EACCES`、`ENOTDIR` 或对应状态码 `2`/`3`）时返回 `true`；连接断开、超时、channel closed 返回 `false`。`SFTPSession.resolvePath` 在路径包含 `..` 时通过 `readlink` 按服务器符号链接语义解析真实规范路径（无 `..` 路径不增加额外往返），抵达 `/` 时准确收敛为 `'/'` |
 
-### 内部契约二：`localStorage` 持久化数据结构（按作用域分键 `coport.filePanelState.v1:<scope>`）
+### 内部契约二：主进程原子持久化结构（`userData/coport-file-panel-state.json` 与 `coport-file-panel-state:*` IPC）
 
-每个作用域独占一条键 `coport.filePanelState.v1:<scope>`，其中 `<scope>` 为 `'adb:shared'` 或 `'ssh:<authUsername>@<host>:<port>'`（SSH 优先取已认证的 `authUsername`，缺失时回退配置 `user`）。
+主进程 `app/lib/coport/filePanelStateIpc.ts` 复用 `tabby-ssh/src/utils/filePanelState.ts` 的唯一状态引擎，以临时文件 + 原子 `rename` 持久化全部作用域（键为 `'adb:shared'` 或 `'ssh:<authUsername>@<host>:<port>'`，SSH 优先取已认证的 `authUsername`，缺失时回退配置 `user`），并通过 `coport-file-panel-state:op`（同步调用，仅限主窗口主 frame）与 `coport-file-panel-state:changed`（全窗口广播）向渲染进程提供服务；非 Electron 环境回退为 `FilePanelStateStore` + `StorageLike`。
 
 | 字段路径 | 类型 | 必填 | 含义 | 约束 |
 |---|---|---|---|---|
 | `version` | `number` | 是 | 结构版本 | 固定为 `1`；非 `1` 或非法 JSON 时按空状态降级 |
-| `recent` | `string[]` | 是 | 最近成功打开的目录列表 | 规范化绝对路径（保留合法目录名尾随空格、区分大小写去重），最近访问排首位（`recent[0]` 即上次目录），上限 **20** |
-| `favorites` | `string[]` | 是 | 收藏目录列表 | 绝对路径，区分大小写去重，上限 **50**（新增超出上限时保留最新 50 条） |
-| `updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 严格递增（高于已有全部 SSH 作用域最大值）；`ssh:*` 键总数上限 **50**，超限时按 `updatedAt` 淘汰最久未更新项，永不淘汰当前写入作用域与 `'adb:shared'` |
+| `scopes[key].recent` | `string[]` | 是 | 最近成功打开的目录列表 | 规范化绝对路径（保留合法目录名尾随空格、区分大小写去重），最近访问排首位（`recent[0]` 即上次目录），上限 **20** |
+| `scopes[key].favorites` | `string[]` | 是 | 收藏目录列表 | 绝对路径，区分大小写去重，上限 **50**（新增超出上限时保留最新 50 条） |
+| `scopes[key].updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 在主进程单线程内严格递增；`ssh:*` 键总数上限 **50**，超限时按 `updatedAt` 淘汰最久未更新项，永不淘汰当前写入作用域与 `'adb:shared'` |
 
 场景处理规则：
 

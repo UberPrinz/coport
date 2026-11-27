@@ -5,7 +5,11 @@ import { Injector } from '@angular/core'
 import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
 import type { FileBackend } from '../api/fileBackend'
-import { isSFTPDirectoryUnavailableError } from '../utils/filePanelFallback'
+import {
+    isSFTPChannelClosedError,
+    isSFTPDirectoryUnavailableError,
+    resolvePosixPathWithReadlink,
+} from '../utils/filePanelFallback'
 
 export interface SFTPFile {
     name: string
@@ -46,6 +50,7 @@ export class SFTPFileHandle {
 
 export class SFTPSession implements FileBackend {
     get closed$ (): Observable<void> { return this.closed }
+    get rawSftp (): russh.SFTP { return this.sftp }
     private closed = new Subject<void>()
     private logger: Logger
 
@@ -66,6 +71,10 @@ export class SFTPSession implements FileBackend {
         return isSFTPDirectoryUnavailableError(error)
     }
 
+    resolvePath (rawPath: string): Promise<string> {
+        return resolvePosixPathWithReadlink(rawPath, target => this.sftp.readlink(target))
+    }
+
     async readdir (p: string): Promise<SFTPFile[]> {
         this.logger.debug('readdir', p)
         try {
@@ -77,7 +86,7 @@ export class SFTPSession implements FileBackend {
                 return this._makeFile(fullPath, entry)
             })
         } catch (error) {
-            if (!this.isDirectoryUnavailable(error)) {
+            if (isSFTPChannelClosedError(error)) {
                 this.onInvalidate?.()
             }
             throw error

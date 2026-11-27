@@ -90,21 +90,24 @@ export function splitTextByHighlights (text: string, ranges: readonly (readonly 
     return segments
 }
 
-function buildLowerToOrigMap (name: string): { lower: string, map: number[] } {
-    let lower = ''
+function buildLowerToOrigMap (name: string, fullLower: string): number[] {
     const map: number[] = []
+    let prevLowerLen = 0
     for (let i = 0; i < name.length; ) {
         const code = name.charCodeAt(i)
         const step = code >= 0xD800 && code <= 0xDBFF && i + 1 < name.length ? 2 : 1
-        const chunk = name.slice(i, i + step)
-        const low = chunk.toLowerCase()
-        lower += low
-        for (let j = 0; j < low.length; j++) {
+        const nextLowerLen = name.slice(0, i + step).toLowerCase().length
+        const delta = nextLowerLen - prevLowerLen
+        for (let j = 0; j < delta; j++) {
             map.push(i + Math.min(j, step - 1))
         }
+        prevLowerLen = nextLowerLen
         i += step
     }
-    return { lower, map }
+    while (map.length < fullLower.length) {
+        map.push(Math.max(0, name.length - 1))
+    }
+    return map
 }
 
 function mapLowerSpanToRanges (
@@ -128,10 +131,8 @@ export function matchFileName (name: string, query: string): FileMatchResult | n
     if (!lowerQuery) {
         return { tier: 0, ranges: [] }
     }
-    const fastLower = name.toLowerCase()
-    const mapped = fastLower.length === name.length ? null : buildLowerToOrigMap(name)
-    const lowerName = mapped ? mapped.lower : fastLower
-    const lowerToOrig = mapped ? mapped.map : null
+    const lowerName = name.toLowerCase()
+    const lowerToOrig = lowerName.length === name.length ? null : buildLowerToOrigMap(name, lowerName)
     const queryLen = lowerQuery.length
     const nameLen = lowerName.length
 
