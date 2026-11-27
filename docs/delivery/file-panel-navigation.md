@@ -7,19 +7,20 @@
   - 首版实现提交：`dd1369e9`（`dd1369e9ccb56bda550b66d9355d2125d8a0b827`）
   - Codex 第 1 轮审查修复提交：`f00e4bba`（`f00e4bbad8d02f615046f472ffc43b9bf2b517b1`）
   - Codex 第 2 轮审查修复提交：`ae12c12f`（`ae12c12f86e84e845fc6aaa29b61a261b5dc0b9e`）
-- **当前状态**：`L4 就绪`（Codex 第 2 轮独立复审全部 12 项发现已根因修复并完成全量 L0/L2 自动验收；未覆盖 `/Applications/Coport.app`、未推送、未创建 PR）
-- **累计审查轮次**：2（已完成 Codex 第 1 轮与第 2 轮独立审查与全部修复，等待编排方确认或派发后续复核）
+  - Codex 第 3 轮审查修复提交：`a0ee4ad5`（`a0ee4ad568694fb01dfd09bfc2d96be6fbb582ab`）
+- **当前状态**：`L4 就绪`（Codex 第 3 轮独立复审全部 9 项发现已根因修复并完成全量 L0/L2 自动验收；未覆盖 `/Applications/Coport.app`、未推送、未创建 PR）
+- **累计审查轮次**：3（已完成 Codex 第 1/2/3 轮独立审查与全部修复，等待编排方确认或派发后续复核）
 - **累计 CI 修复轮次**：0（未推送 / 无远端 CI 触发）
-- **下一动作**：返回编排方，由编排方复核第 2 轮修复（`c7aa3aa2..HEAD` / `e6083033..HEAD`）并决定是否进入本机安装 `/Applications/Coport.app` 与 G3/L4 真机人工验收。
+- **下一动作**：返回编排方，由编排方复核第 3 轮修复（`bb2587e9..HEAD` / `e6083033..HEAD`）并决定是否进入本机安装 `/Applications/Coport.app` 与 G3/L4 真机人工验收。
 
 ## 实现摘要与偏差记录
 
-1. **主进程原子状态存储与零 DOM 纯逻辑模块（`app/lib/coport/filePanelStateIpc.ts`、`tabby-ssh/src/utils/`）**：
-   - `app/lib/coport/filePanelStateIpc.ts`（在 `app/lib/index.ts` 注册，仅接受主窗口主 frame 请求）：直接复用 `tabby-ssh/src/utils/filePanelState.ts` 的唯一 `FilePanelStateStore` 引擎，在 Node 单线程内原子执行 `coport-file-panel-state:op`（`getScope` / `recordVisit` / `addFavorite` / `toggleFavorite` / `removeFavorite` / `getSnapshot`）并完成严格递增时间戳分配与 50 SSH 作用域 LRU 裁剪，通过临时文件 + `renameSync` 原子持久化至 `userData/coport-file-panel-state.json`（落盘失败保留内存态不回滚），同时向全部未销毁 `BrowserWindow` 广播 `coport-file-panel-state:changed` 实现同窗/跨窗实时同步。
-   - `filePanelState.ts`：提供 `IpcFilePanelStateClient` 与 `createDefaultFilePanelStateClient()`（Electron 渲染进程走主进程 IPC + 全窗口广播，非 Electron/单测回退至 `FilePanelStateStore` + `FilePanelStorageLike`），修复已有存储记录遭遇 `QuotaExceededError` / 只读写入失败时通过 `failedStorageRaw` 保留内存最新副本不被旧存储值覆盖的问题。
-   - `filePanelFilter.ts`：实现大小写不敏感精确 > 前缀 > 连续子串 > 顺序子序列分级排序（同档目录优先 + `Intl.Collator` 字典序）；始终基于完整原串 `name.toLowerCase()` 匹配以保留希腊语词尾 `Σ→ς` 等上下文小写规则，仅在 `lowerName.length !== name.length` 时按前缀增量长度差构造 `lowerToOrig` 映射换算高亮区间（支持 `İΟΣ` 命中 `ος` 高亮 `ΟΣ` 及 `İxa.txt` 命中 `x`）。
-   - `filePanelFallback.ts`：实现 ADB/SFTP 目录不可读与通道关闭错误分类（`isSFTPChannelClosedError` 区分普通 SFTP `Failure` 与真实通道断开）、逐级回退至 `/`、共享 SFTP 通道池 `SFTPChannelPool`（按失败通道精确比对失效、并发 `openSFTP` 复用同一 `openingChannel` Promise、不关闭已被其他面板恢复的健康通道）以及基于 `readlink` 的 POSIX `..` 路径解析 `resolvePosixPathWithReadlink`（含深度 40 循环保护，普通路径 0 额外 RTT）。
-   - 三个纯逻辑模块均无外部/相对运行时导入、无 TS `enum`、无构造函数参数属性，同时兼容 webpack TypeScript 4 编译与 Node `--experimental-strip-types` 直接单测。
+1. **主进程原子状态协调器与零 DOM 纯逻辑模块（`app/lib/coport/filePanelStateCoordinator.ts`、`app/lib/coport/filePanelStateIpc.ts`、`tabby-ssh/src/utils/`）**：
+   - `app/lib/coport/filePanelStateCoordinator.ts`（零 Electron 依赖纯模块，供 `filePanelStateIpc.ts` 与 L0 单测直接导入）：封装快照加载、单线程原子执行 `coport-file-panel-state:op`、仅由主进程内部单调时钟分配时间戳（完全拒绝/忽略渲染端传入 `now`）、临时文件 + `renameSync` 原子持久化至 `userData/coport-file-panel-state.json`（`writeFileSync`/`renameSync` 失败时清理临时文件并保留内存最新态不回滚）以及变更与 LRU 淘汰广播（携带 `scope` 与 `evictedScopes`）。`app/lib/coport/filePanelStateIpc.ts`（在 `app/lib/index.ts` 注册，仅接受主窗口主 frame 请求）仅保留薄 Electron 接线，向全部未销毁 `BrowserWindow` 广播 `coport-file-panel-state:changed`。
+   - `filePanelState.ts`：提供 `IpcFilePanelStateClient`（不向主进程透传 `now`、透传 `evictedScopes`）与 `createDefaultFilePanelStateClient()`，`pruneSSHScopes`/`pruneMemorySSHScopes` 返回 `evictedScopes: string[]` 并随通知与 IPC 响应下发；非 Electron/单测回退至 `FilePanelStateStore` + `FilePanelStorageLike`，通过 `failedStorageRaw` 保留写入失败后的内存最新副本不被旧存储值覆盖。
+   - `filePanelFilter.ts`：实现大小写不敏感精确 > 前缀 > 连续子串 > 顺序子序列分级排序（同档目录优先 + `Intl.Collator` 字典序）；始终基于完整原串 `name.toLowerCase()` 匹配并将希腊语词尾 `ς`（`\u03C2`）1:1 归一化为 `σ`（`\u03C3`），仅在 `lowerName.length !== name.length` 时按前缀增量长度差构造 `lowerToOrig` 映射换算高亮区间（支持 `'İΟΣ'` 分别命中 `'ος'`、`'Σ'`、`'σ'`、`'ς'` 并准确高亮 `'ΟΣ'` / `'Σ'`，以及 `'İxa.txt'` 命中 `'x'`）。
+   - `filePanelFallback.ts`：实现 ADB/SFTP 目录不可读、瞬时断线（`isTransientConnectionError`）与通道关闭错误分类（`isSFTPChannelClosedError` 区分普通 SFTP `Status(Failure)` 与真实通道断开）、逐级回退至 `/`、共享 SFTP 通道池 `SFTPChannelPool` 以及基于 `readlink` 的 POSIX 相对路径解析 `resolvePosixPathWithReadlink`（含深度 40 循环保护，普通路径 0 额外 RTT）。
+   - 三个纯逻辑模块均无外部/相对运行时导入、无 TS `enum`、无构造函数参数属性，与 `filePanelStateCoordinator.ts` 均兼容 webpack TypeScript 4 编译与 Node `--experimental-strip-types` 直接单测。
 2. **后端与标签页适配**：
    - `tabby-ssh/src/api/fileBackend.ts` 扩展可选属性/方法 `closed$?`、`resolvePath?` 与 `isDirectoryUnavailable?`。
    - `tabby-adb/src/adbFileBackend.ts` 在 `adbRequest` 抛出的 `Error` 上透传 `reason` 与 `stderr`，实现 `isDirectoryUnavailable`。
@@ -29,12 +30,12 @@
    - `tabby-ssh/src/index.ts` 收敛公开导出，仅导出 `tabby-adb` 所需的 `ADB_FILE_PANEL_SCOPE`。
 3. **共用文件面板（`tabby-ssh/src/components/sftpPanel.component.{ts,pug,scss}`）**：
    - 初始化路径优先级：`overrideStartPath ?? savedLastPath ?? initialPath ?? defaultPath`。
-   - 实现 `ngOnChanges`：在面板保持打开状态下切换 `session` 或 `stateScope`（如 SSH 同主机重连换账号）时，立即递增 `navigation` 取消旧请求、清理旧后端/旧错误/旧路径与下拉状态、切换到新作用域收藏/历史并重新初始化，不沿用旧账号 `currentPath`。
-   - 异步请求编号防竞态：`initializeBackendAndNavigate` 在 `openSFTP()` 之前分配 `request` 并透传给 `navigateWithFallback`；`open()` 在 `resolveLink()` 之前分配独立 `request` 并透传给 `navigateWithRequest`，确保慢速 `openSFTP()` 与连续点击两个符号链接严格由最新操作胜出。
-   - 含 `..` 的 SSH 路径经 `backend.resolvePath` 解析为服务器规范路径后再列出与保存，向上浏览抵达 `/` 时准确收敛为 `/` 并隐藏 `Go up`。
-   - 实现 `ngAfterViewInit` 首次聚焦与 `focusPanelIfOwned()` 焦点保护（仅当焦点为空、`document.body` 或位于面板内部时才聚焦面板，绝不在异步目录加载完成后从终端抢回焦点）及 `ResizeObserver` 视口增高实时重算虚拟列表可见范围。
-   - 保留星标收藏按钮、紧凑收藏芯片条、收藏+最近快捷下拉、直接敲字模糊过滤（0 次远端请求，1,000 条目首键与后续键入均 `≤ 16 ms`）、`<mark>` 高亮、`↑/↓/Enter/Backspace/Esc` 纯键盘钻取与路径栏单击编辑（含 IME 组字防护与尾随空格保留）。
-4. **偏差记录**：无影响验收标准、对外协议或架构职责的方案偏差。`docs/specs/file-panel-navigation.md` 已同步更新主进程原子持久化、SSH 无历史首开用 CWD / 已有历史恢复上次目录契约以及 `FileBackend.resolvePath?` 扩展。
+   - 实现 `ngOnChanges` 与严格递增 `sessionEpoch`：在面板保持打开状态下切换 `session` 或 `stateScope`（如 SSH 同主机重连换账号）以及 `ngOnDestroy` 时，递增 `sessionEpoch` 与 `navigation`、主动关闭面板打开中的删除/新建目录弹窗、取消旧请求与订阅，并暴露 `isSessionActive(epoch, backend)`；所有删除、上传、下载、新建目录与符号链接解析在首个 `await` 前捕获 `backend` 与 `epoch` 并逐点校验，确保账号切换后绝不误删或写入新账号文件。
+   - 区分真实通道关闭与普通 SFTP 业务错误：仅在 `closed$` 触发或 `isSFTPChannelClosedError(error)` 为真时标记 `failedBackendForReopen`，普通 `Status(Failure)` 下 Retry 直接复用当前健康通道而不关闭同会话兄弟面板共享通道。
+   - SSH 含 `..` 路径先将原始路径直接发往服务端 `readdir` 校验，仅在 `readdir` 成功后若含相对段再后置调用 `backend.resolvePath` 确定服务器真实规范目录（并同步改写列表项 `fullPath`），既阻断 `/普通文件/..` 绕过服务端错误列出 `/`，又在 `/link/../missing` 回退至 `/link/..` 后收敛为 `'/'`、隐藏 `Go up` 且历史只记 `'/'`。
+   - 订阅状态变更广播时同时匹配 `event.scope === this.stateScope` 与 `event.evictedScopes?.includes(this.stateScope)`，SSH 作用域被 LRU 淘汰后已打开面板立即清空收藏条、历史与星标。
+   - 保留星标收藏按钮、紧凑收藏芯片条、收藏+最近快捷下拉、直接敲字模糊过滤（0 次远端请求，1,000 条目首键与后续键入均 `≤ 16 ms`）、`<mark>` 高亮、`↑/↓/Enter/Backspace/Esc` 纯键盘钻取（`Enter` 触发文件下载后同步清空过滤词并保持面板焦点）与路径栏单击编辑（含 IME 组字防护与尾随空格保留）。
+4. **偏差记录**：无影响验收标准、对外协议或架构职责的方案偏差。`docs/specs/file-panel-navigation.md` 已统一影响范围、交互协议总述、内部契约一/二与验收矩阵为「不改对外协议/MCP/`coport-adb:*`，新增应用内部 `coport-file-panel-state:*` IPC」，与实现 100% 一致。
 
 ## 独立审查与修复记录
 
@@ -73,22 +74,36 @@
 | 11 | P3 | 增高窗口后虚拟列表未重算可见范围导致底部留白 | `sftpPanel.component.ts` 在 `ngAfterViewInit` 对 `bodyContainer` 挂载 `ResizeObserver`（`ngOnDestroy` 断开），视口尺寸变化时在虚拟模式下重算可见范围并触发变更检测；L2 `/bulk` 验证增高视口后挂载行数由 `36` 增至 `70` | 通过（L2） |
 | 12 | P3 | UTF-16 变长小写路径丢失上下文小写规则（`İΟΣ` 无法匹配 `ος`） | `filePanelFilter.ts` 始终对完整原串 `name.toLowerCase()` 执行匹配，仅在长度变化时用前缀增量长度差构建 `lowerToOrig` 映射换算高亮区间；L0 增补 `'İΟΣ'` 匹配 `'ος'` 命中并高亮 `'ΟΣ'`，同时保留 `'İxa.txt'` 断言 | 通过（L0） |
 
+### 第 3 轮（Codex 独立复审，修复提交 `a0ee4ad5`）
+
+| 编号 | 级别 | 审查发现 | 修复措施 | 验证状态 |
+|---|---|---|---|---|
+| 1 | P0 | 定版方案协议口径与主进程 `coport-file-panel-state:*` IPC 新增说明未全面统一 | 统一 `docs/specs/file-panel-navigation.md` 影响范围、交互协议总述、内部契约一/二与验收矩阵为「不改对外协议/MCP/`coport-adb:*`，新增应用内部 `coport-file-panel-state:*` IPC」，与实现 100% 对齐并纳入提交 | 通过（静态核对 + 契约对齐） |
+| 2 | P1 | SSH 换账号后，旧面板上发起的删除/上传等异步操作可能误删或写入新账号的文件 | `sftpPanel.component.ts` 维护严格递增 `sessionEpoch`（切换 `session`/`stateScope` 及销毁时递增并关闭打开中弹窗）与 `isSessionActive(epoch, backend)`；`sftpContextMenu.ts`、`sftpDeleteModal.component.ts` 及面板全部上传/下载/建目录/链接解析在首个 `await` 前捕获 `backend` 与 `epoch` 并逐点校验、仅使用捕获后端；L2 `coport_shells.mjs` 为 `bob` 构造独立 `SFTPSession` 后端，验证切账号后确认旧 Delete 弹窗与完成旧上传选择器时 `bobOps={unlink:0,rmdir:0,upload:0,mkdir:0}` 且 `uploadTransferCancelled=true` | 通过（L2） |
+| 3 | P2 | 普通 SFTP 业务错误（如 `Status(Failure)`）后的 Retry 误关闭健康的共享通道 | `sftpPanel.component.ts` 仅在 `closed$` 或 `isSFTPChannelClosedError(error)` 为真时标记 `failedBackendForReopen`；普通 `Status(Failure)` 下 Retry 直接复用当前健康 `this.backend` 重试，绝不传给 `session.openSFTP(failed)` 关闭共享通道；L0 与 L2 均验证 `healthyCloseCalls=0`、兄弟面板持续可用，同时保留真实 `Channel closed` 后重建通道断言 | 通过（L0 + L2） |
+| 4 | P2 | SSH 含 `..` 路径在 `readdir` 前调用 `resolvePath` 会绕过服务端错误列出 `/` 并污染历史 | 取消 `readdir` 前的预解析，先将原始路径直接发往服务端 `readdir` 校验；仅在 `readdir` 成功后若含相对段再后置调用 `backend.resolvePath` 收敛为服务器真实规范目录并改写列表项 `fullPath`；L0 与 L2 真实 `sshd` 验证手动跳 `/<普通文件>/..` 报错保留原列表且不写历史，以及 `/to-root-child/../missing` 回退至 `/to-root-child/..` 成功后收敛为 `/`、`Go up` 消失且历史记 `'/'` | 通过（L0 + L2） |
+| 5 | P2 | SSH 作用域被 LRU 淘汰后，变更广播未携带被淘汰作用域导致已打开面板未同步刷新 | `filePanelState.ts` 的 `pruneSSHScopes`/`pruneMemorySSHScopes` 返回 `evictedScopes: string[]` 并随 `FilePanelStateOpResponse` 与 `coport-file-panel-state:changed` 全窗口广播；`sftpPanel.component.ts` 订阅同时响应 `event.evictedScopes?.includes(this.stateScope)` 立即刷新；L0 与 L2 `lruEvictionLiveRefresh` 验证写入 50 个新 SSH 作用域后已打开面板立即清空收藏条、历史与星标 | 通过（L0 + L2） |
+| 6 | P2 | 主进程 IPC 入口仍接受渲染端传入的 `now`，存在时间戳伪造破坏 LRU 顺序风险 | `executeFilePanelStateOp` 与 `IpcFilePanelStateClient` 移除并完全忽略渲染端 `now`，由主进程协调器内部时钟单调递增分配（`nowProvider` 仅作工厂构造参数供单测注入）；L0 直接调用生产协调器传入伪造倒退/重复 `now`（`5000`/`4000`/`4000` 及递减 `now`）验证 `updatedAt` 严格单调递增且 LRU 顺序正确 | 通过（L0） |
+| 7 | P2 | 主进程状态协调逻辑与 Electron 耦合导致 L0 未直接验证生产落盘失败与广播路径 | 抽出零 Electron 依赖纯模块 `app/lib/coport/filePanelStateCoordinator.ts`（导出 `createFilePanelStateCoordinator({ filePath, fsOps?, broadcast?, nowProvider? })`），`filePanelStateIpc.ts` 仅保留薄接线；`filePanelNavigation.test.ts` 直接导入生产模块并在 `fsOps` 注入 `writeFileSync`/`renameSync` 失败验证内存态保留、临时文件清理及广播 `scope`/`evictedScopes` | 通过（L0） |
+| 8 | P2 | 过滤态按 `Enter` 下载文件后未清空过滤词 | `sftpPanel.component.ts` 在 `activateSelectedItem()` 调用 `open(item, { clearFilterOnDownload: true })`，文件下载分支同步调用 `this.clearFilter(true)` 并保持面板焦点；L2 `filteredActions` 断言按 `Enter` 下载后 `filterText=""`、`showFilter=false`、`focusedAfterEnterDownload=true` | 通过（L2） |
+| 9 | P3 | 希腊语词尾 Sigma 大小写不敏感匹配不一致（`'İΟΣ'` 未命中 `'Σ'`/`'σ'`） | `filePanelFilter.ts` 对 `lowerName` 与 `lowerQuery` 统一将 `\u03C2`（`ς`）1:1 归一化为 `\u03C3`（`σ`），保持 `lowerToOrig` 索引映射精确；L0 验证 `'İΟΣ'` 分别搜索 `'ος'`、`'Σ'`、`'σ'`、`'ς'` 均命中并准确高亮 `'ΟΣ'`/`'Σ'` | 通过（L0） |
+
 ## L0–L2 自动验收矩阵证据
 
-被测实现与测试提交：`ae12c12f`（构建产物隔离于 `dist/coport-file-panel-nav/mac-arm64/Coport.app`，未触碰 `/Applications/Coport.app`）。
+被测实现与测试提交：`a0ee4ad5`（构建产物隔离于 `dist/coport-file-panel-nav/mac-arm64/Coport.app`，未触碰 `/Applications/Coport.app`）。
 
 | 验收项 | 级别 | 执行命令与环境 | 退出码 | 关键证据 |
 |---|---|---|---|---|
-| 代码规范静态检查 | L0 | `npm run lint` | 0 | ESLint 0 errors / 0 warnings（覆盖 `*/src` 与 `*/lib` 含新增 `app/lib/coport/filePanelStateIpc.ts`） |
-| 状态存储、主进程原子协调、写失败保留与容量上限（20/50/50） | L0 | `npm run test:ssh-term`（Node `--experimental-strip-types`） | 0 | `filePanelState` 10/10 用例通过（含已有记录下 `QuotaExceededError` 保留内存最新 `/new` 访问与收藏、双窗口单协调器冻结同毫秒严格递增时间戳/50 SSH LRU 裁剪/广播/磁盘只读 `EACCES` 保留内存态及原子 JSON 重载） |
-| 目录不可读回退、共享 SFTP 通道池与 POSIX `readlink` 路径解析 | L0 | `npm run test:ssh-term` | 0 | `filePanelFallback` 7/7 用例通过（含双面板依次 Retry 复用恢复通道且不关闭健康通道、普通 `Failure` 不失效不泄漏、`resolvePosixPathWithReadlink` `/link/..`→`/`、相对符号链接与循环保护、普通路径 0 次 `readlink`） |
-| 子串与模糊匹配、Unicode 上下文小写高亮与 1,000 条目性能 | L0 | `npm run test:ssh-term` | 0 | `filePanelFilter` 4/4 用例通过（含 `'İΟΣ'` 匹配 `'ος'` 高亮 `'ΟΣ'` 与 `'İxa.txt'` 映射）；1,000 条目实测 `p95=0.40ms, max=0.70ms`（远低于 `≤ 16 ms`）；`test:ssh-term` 总计 35/35 通过 |
+| 代码规范静态检查 | L0 | `npm run lint` | 0 | ESLint 0 errors / 0 warnings（覆盖 `*/src` 与 `*/lib` 含新增 `app/lib/coport/filePanelStateCoordinator.ts` 与 `filePanelStateIpc.ts`） |
+| 状态存储、生产协调器、落盘失败保留、单调时钟与容量上限（20/50/50） | L0 | `npm run test:ssh-term`（Node `--experimental-strip-types`） | 0 | `filePanelState` 10/10 用例通过：直接导入生产 `app/lib/coport/filePanelStateCoordinator.ts`，验证伪造倒退/重复 `now` 全部被忽略且 `updatedAt` 严格递增（`5000→5001→5002`）、`fsOps` 注入 `writeFileSync`/`renameSync` 失败时 `/new` 与收藏保留在内存不被旧磁盘 JSON 覆写且清理临时文件、51st SSH 淘汰广播携带 `evictedScopes` |
+| 目录不可读回退、普通 `Status(Failure)` 不关闭共享通道与后置 `resolvePath` | L0 | `npm run test:ssh-term` | 0 | `filePanelFallback` 7/7 用例通过（含普通 `Status(Failure)` 后 Retry 复用健康通道 `close()` 次数为 0、真实 `Channel closed` 后重建通道且兄弟面板复用、`/link/../missing` 先经 `readdir` 回退至 `/link/..` 再后置解析为 `/`、`/regular-file/..` 先经服务端拒绝且 0 次 `readlink`） |
+| 子串与模糊匹配、希腊语词尾 Sigma 高亮与 1,000 条目性能 | L0 | `npm run test:ssh-term` | 0 | `filePanelFilter` 4/4 用例通过（含 `'İΟΣ'` 命中 `'ος'`/`'Σ'`/`'σ'`/`'ς'` 准确高亮 `'ΟΣ'`/`'Σ'` 与 `'İxa.txt'` 映射）；1,000 条目实测 `p95=0.46ms, max=0.55ms`（远低于 `≤ 16 ms`）；`test:ssh-term` 总计 35/35 通过 |
 | 既有终端/Electron 单元测试回归 | L0 | `npm run test:unit` | 0 | 11/11 通过（`BaseSession.destroy()`、`BaseSession output before the terminal is shown`、`disposeWebglAddon`） |
-| 上游改动白名单校验 | L0 | `node scripts/coport/check-upstream-diff.mjs` | 0 | `Coport upstream diff passed against 54869e10 (125 registered paths)`，0 未登记路径 |
-| 模块构建与隔离 macOS 打包 | L0 | `npm run build`、`node scripts/prepackage-plugins.mjs`、`COPORT_BUILD_OUTPUT="$PWD/dist/coport-file-panel-nav" COPORT_ELECTRON_DIST="$PWD/dist/coport-m0/electron" node scripts/build-macos.mjs`（macOS arm64，隔离 yarn 1.22.22，ad-hoc 签名） | 0 | 14 个插件 typings、主进程 `tabby-main`（含 `filePanelStateIpc.ts`）与全部 webpack bundle、隔离 `dist/coport-file-panel-nav/mac-arm64/Coport.app` 构建与 ad-hoc 签名校验全部通过 |
+| 上游改动白名单校验 | L0 | `node scripts/coport/check-upstream-diff.mjs` | 0 | `Coport upstream diff passed against 54869e10 (126 registered paths)`，0 未登记路径 |
+| 模块构建与隔离 macOS 打包 | L0 | `npm run build`、`node scripts/prepackage-plugins.mjs`、`COPORT_BUILD_OUTPUT="$PWD/dist/coport-file-panel-nav" COPORT_ELECTRON_DIST="$PWD/dist/coport-m0/electron" node scripts/build-macos.mjs`（macOS arm64，隔离 yarn 1.22.22，ad-hoc 签名） | 0 | 14 个插件 typings、主进程 `tabby-main`（含 `filePanelStateCoordinator.ts` 与 `filePanelStateIpc.ts`）与全部 webpack bundle、隔离 `dist/coport-file-panel-nav/mac-arm64/Coport.app` 构建与 ad-hoc 签名校验全部通过 |
 | ADB 无 `/sdcard` 启动、主进程 JSON 持久化恢复、同窗同步、终端焦点保护与根目录重试 | L2 | `python3 -B scripts/coport/sim/coport_shells.py "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"`（隔离 `--user-data-dir` + 假 ADB + 本机 `sshd` + 私有 PTY） | 0 | `noSdcardBoot.path="/"`, `loadError=null`；`userData/coport-file-panel-state.json` 原子落盘并跨重启恢复 `/data/only-on-embedded/deep` 与收藏 `/etc`；`two` 自动回退 `/data` 并展示提示条；`sameWindowSync` 双 ADB 标签实时同步；慢速 ADB 加载期间切回终端后 `focusedTermBeforeLoad=true`, `focusedTermAfterLoad=true`；根目录离线重试恢复成功 |
-| SSH 按 `authUsername@host:port` 隔离、重开/重启历史优先于不同 CWD、保活面板重连换账号、`/link/..` 收敛 `/` 与共享通道依次 Retry | L2 | 同上 `coport_shells.py` | 0 | 首次有 CWD 打开 `cwd-dir`，重开面板与重启应用均在提供不同 CWD（`cwd-dir`）下恢复 `sub-a`/`sub-b`；`liveReconnectAccountSwitch` 保持原面板不关闭换账号（`samePanelReused=true`, `bobRetryTargetPath=".../sub-b"`, `bobLeakedAlicePath=false`）；`symlinkDotDotPath=".../real-parent"`, `convergedToRoot=true`, `goUpHiddenAtRoot=true`, `dotDotLeakedInRecent=false`；共享会话双面板依次 Retry `siblingReusedRecoveredChannel=true`；真实 `sshd` `NoSuchFile`/`PermissionDenied` 回退均通过 |
-| 直接敲字过滤、真实焦点钻取、过滤态操作、过期异步（慢速 `openSFTP`/双符号链接）、1,000 条目首键基准与虚拟列表 ResizeObserver | L2 | 同上 `coport_shells.py` | 0 | `filteredActions`（`rawIndex=5`, `row0Name="z-target.txt"`）点击/右键 Download/Enter/Delete 目标均准确；`staleOps` 慢速 `openSFTP`（`pathAfterSlowOpenSFTP="/etc"`, `recentUnchangedAfterSlowOpenSFTP=true`）、双符号链接双序（均落 `sym-dir-2`）、慢速 `stat`/`mkdir`/`uploadOne` 全通过；1,000 条目未展开过滤栏首键 `firstKeyMs=2.9ms`、后续全查询 `maxMs=2.9ms`（`≤ 16 ms`, `readdirCalls=0`）；视口增高后挂载行数由 `36` 增至 `70` |
+| SSH 隔离、独立 Bob 后端换账号删/传防误操作、普通错误 Retry 保通道、`/普通文件/..` 与 `/link/../missing` 后置解析及 LRU 淘汰热刷新 | L2 | 同上 `coport_shells.py` | 0 | `liveReconnectAccountSwitch` 构造独立 `bobBackend`（`distinctBobBackend=true`），切换账号后确认旧 Delete 弹窗与完成旧上传选择器时 `bobOps={unlink:0,rmdir:0,upload:0,mkdir:0}`, `uploadTransferCancelled=true`；`operationalFailureRetry` 普通 `Status(Failure)` 后 Retry `healthyCloseCalls=0`, `sameChannelKept=true`, `siblingOkAfterOpRetry=true`；真实 `Channel closed` 后重建通道且兄弟面板复用；`manualFileDotDot` 保持 `sub-a` 与原列表且不写历史；`sshSymlinkRootFallback` 最终 `path="/"`, `goUpHidden=true`, `recentFirst="/"`, `resolvedDotDotRecorded=false`；`lruEvictionLiveRefresh` 写入 50 个新 SSH 作用域后已打开面板立即清空 `favorites=[]`, `recent=[]`, `starred=false`, `favoritesBar=false` |
+| 直接敲字过滤、Enter 下载清过滤、过期异步、1,000 条目首键基准与虚拟列表 ResizeObserver | L2 | 同上 `coport_shells.py` | 0 | `filteredActions`（`rawIndex=5`, `row0Name="z-target.txt"`）点击/右键 Download/Enter/Delete 目标均准确，按 `Enter` 下载后 `filterTextAfterEnterDownload=""`, `showFilterAfterEnterDownload=false`, `focusedAfterEnterDownload=true`；`staleOps` 慢速 `openSFTP`/双符号链接双序/慢速 `stat`/`mkdir`/`uploadOne` 全通过；1,000 条目未展开过滤栏首键 `firstKeyMs=3.8ms`、后续全查询 `maxMs=3.8ms`（`≤ 16 ms`, `readdirCalls=0`）；视口增高后挂载行数由 `36` 增至 `70` |
 | 路径栏单击编辑、IME 防护、手动错误复焦与既有回归 | L2 | 同上 `coport_shells.py` 及 `python3 -B scripts/coport/sim/prepare_adb.py "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"` | 0 | 单击编辑、IME 组字 `Enter`/`Esc` 透传、`Esc` 取消复焦、手动错误保留列表复焦；ADB/SSH 既有上传/下载/目录上传/新建目录/删除/符号链接/拖拽/原子下载清理与 `prepare_adb.py`（10/10 项全 `true`）全部退出 0 |
 
 ## L4 真机人工验收清单（待独立复审通过后执行）
