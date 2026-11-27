@@ -41,7 +41,6 @@ sftp-panel.bg-dark(
     @panelSlide,
     [@.disabled]='!config.store.accessibility.animations',
     [path]='sftpPath',
-    (pathChange)='sftpPath = $event',
     [stateScope]='sftpStateScope',
     defaultPath='/',
     *ngIf='sftpPanelVisible && sshSession',

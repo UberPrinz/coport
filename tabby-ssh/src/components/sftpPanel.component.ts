@@ -1,5 +1,6 @@
 import * as C from 'constants'
 import { posix as path } from 'path'
+import { Subscription } from 'rxjs'
 import {
     ChangeDetectorRef,
     Component,
@@ -22,9 +23,10 @@ import { SFTPContextMenuItemProvider } from '../api'
 import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
 import { SFTPCreateDirectoryModalComponent } from './sftpCreateDirectoryModal.component'
 import {
-    FILE_PANEL_STATE_STORAGE_KEY,
     FilePanelStateStore,
+    getFilePanelScopeStorageKey,
     normalizeFilePanelPath,
+    subscribeFilePanelStateChanges,
 } from '../utils/filePanelState'
 import {
     FilteredFileEntry,
@@ -52,6 +54,18 @@ interface PanelErrorNotice {
     message: string
 }
 
+interface VisibleFileRow {
+    index: number
+    entry: FilteredFileEntry<SFTPFile>
+    icon: string
+    mode: string
+}
+
+const VIRTUAL_ROW_HEIGHT = 36
+const VIRTUAL_THRESHOLD = 80
+const VIRTUAL_OVERSCAN = 10
+const VIRTUAL_MIN_WINDOW = 36
+
 @Component({
     selector: 'sftp-panel',
     templateUrl: './sftpPanel.component.pug',
@@ -59,7 +73,7 @@ interface PanelErrorNotice {
 })
 export class SFTPPanelComponent implements OnInit, OnDestroy {
     @HostBinding('attr.tabindex') readonly tabIndex = 0
-    @Input() session: { openSFTP: () => Promise<FileBackend> } // coport: Used by SSH and ADB.
+    @Input() session: { openSFTP: (forceNew?: boolean) => Promise<FileBackend> } // coport: Used by SSH and ADB.
     @Output() closed = new EventEmitter<void>()
     @Output() pathChange = new EventEmitter<string>()
     @Input() cwdDetectionAvailable: boolean | null = false
@@ -69,11 +83,15 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
 
     @ViewChild('pathInput') pathInput?: ElementRef<HTMLInputElement>
     @ViewChild('filterInput') filterInput?: ElementRef<HTMLInputElement>
+    @ViewChild('bodyContainer') bodyContainer?: ElementRef<HTMLElement>
 
     sftp: FileBackend
     fileList: SFTPFile[] | null = null
     filteredFileList: SFTPFile[] = []
     filteredEntries: FilteredFileEntry<SFTPFile>[] = []
+    visibleEntries: VisibleFileRow[] = []
+    topSpacerHeight = 0
+    bottomSpacerHeight = 0
     pathSegments: PathSegment[] = []
     editingPath: string | null = null
     showFilter = false
@@ -88,9 +106,14 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
     loadError: PanelErrorNotice | null = null
 
     private backend: FileBackend | null = null
+    private backendClosedSub: Subscription | null = null
+    private unsubscribeStateChanges: (() => void) | null = null
     private initialPathInput: string | null = null
     private currentPath = '/'
     private unfilteredEntries: FilteredFileEntry<SFTPFile>[] = []
+    private rowMetaCache = new Map<string, { icon: string, mode: string }>()
+    private visibleStartIndex = 0
+    private visibleEndIndex = 0
     private navigation = 0
     private destroyed = false
     private persistentStore: FilePanelStateStore
@@ -99,9 +122,12 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
     readonly getDropTarget = (): string => this.path
 
     private readonly handleStorageEvent = (event: StorageEvent): void => {
-        if (event.key === null || event.key === FILE_PANEL_STATE_STORAGE_KEY) {
+        if (this.destroyed) {
+            return
+        }
+        if (event.key === null || (this.stateScope && event.key === getFilePanelScopeStorageKey(this.stateScope))) {
             this.syncStoredPlaces()
-            this.cdr.markForCheck()
+            this.cdr.detectChanges()
         }
     }
 
@@ -139,6 +165,17 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         if (typeof window !== 'undefined') {
             window.addEventListener('storage', this.handleStorageEvent)
         }
+        this.unsubscribeStateChanges = subscribeFilePanelStateChanges(event => {
+            if (this.destroyed || !this.stateScope || event.scope !== this.stateScope) {
+                return
+            }
+            this.syncStoredPlaces()
+            if (event.source !== this.persistentStore) {
+                this.cdr.detectChanges()
+            } else {
+                this.cdr.markForCheck()
+            }
+        })
         this.syncStoredPlaces()
         await this.initializeBackendAndNavigate()
     }
@@ -146,9 +183,22 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
     ngOnDestroy (): void {
         this.destroyed = true
         this.navigation++
+        this.detachBackend()
+        this.unsubscribeStateChanges?.()
+        this.unsubscribeStateChanges = null
         if (typeof window !== 'undefined') {
             window.removeEventListener('storage', this.handleStorageEvent)
         }
+    }
+
+    private detachBackend (): void {
+        this.backendClosedSub?.unsubscribe()
+        this.backendClosedSub = null
+        this.backend = null
+    }
+
+    private getActiveBackend (): FileBackend | null {
+        return this.backend
     }
 
     private get activeStore (): FilePanelStateStore {
@@ -159,79 +209,134 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         return this.stateScope ?? 'memory'
     }
 
+    private get shouldPreserveDotDot (): boolean {
+        if (this.backend) {
+            return !this.backend.normalizePath
+        }
+        return this.activeScope.startsWith('ssh:')
+    }
+
     private normalizePathValue (rawPath: string): string {
-        const backendNormalized = this.backend?.normalizePath?.(rawPath) ?? rawPath
-        return normalizeFilePanelPath(backendNormalized)
+        if (this.backend?.normalizePath) {
+            return normalizeFilePanelPath(this.backend.normalizePath(rawPath), false)
+        }
+        return normalizeFilePanelPath(rawPath, this.shouldPreserveDotDot)
+    }
+
+    private joinChildPath (basePath: string, childName: string): string {
+        if (this.backend?.normalizePath) {
+            return path.join(basePath, childName)
+        }
+        if (!basePath || basePath === '/') {
+            return `/${childName}`
+        }
+        return basePath.endsWith('/') ? `${basePath}${childName}` : `${basePath}/${childName}`
     }
 
     private isDirectoryUnavailableError (error: unknown): boolean {
         return this.backend?.isDirectoryUnavailable?.(error) ?? false
     }
 
-    private async initializeBackendAndNavigate (overrideStartPath?: string): Promise<void> {
-        const startPath = normalizeFilePanelPath(
-            overrideStartPath ?? this.initialPathInput ?? this.activeStore.getLastPath(this.activeScope) ?? this.defaultPath,
-        )
+    private resetFileLists (): void {
+        this.fileList = null
+        this.unfilteredEntries = []
+        this.filteredEntries = []
+        this.filteredFileList = []
+        this.visibleEntries = []
+        this.topSpacerHeight = 0
+        this.bottomSpacerHeight = 0
+        this.visibleStartIndex = 0
+        this.visibleEndIndex = 0
+        this.selectedIndex = -1
+    }
+
+    private async initializeBackendAndNavigate (overrideStartPath?: string, forceNewBackend = false): Promise<void> {
+        const savedLastPath = this.activeStore.getLastPath(this.activeScope)
+        const rawStartPath = overrideStartPath ?? savedLastPath ?? this.initialPathInput ?? this.defaultPath
         this.loadError = null
         this.errorNotice = null
         this.fallbackNotice = null
 
         if (!this.backend) {
             try {
-                const backend = await this.session.openSFTP()
+                const backend = await this.session.openSFTP(forceNewBackend)
                 if (this.destroyed) {
                     return
                 }
                 this.backend = backend
                 this.sftp = backend
+                this.backendClosedSub?.unsubscribe()
+                this.backendClosedSub = backend.closed$?.subscribe(() => {
+                    if (this.backend === backend) {
+                        this.detachBackend()
+                        if (!this.destroyed && !this.loadError) {
+                            this.resetFileLists()
+                            this.loadError = {
+                                path: this.currentPath,
+                                message: 'SFTP channel closed',
+                            }
+                            this.cdr.detectChanges()
+                        }
+                    }
+                }) ?? null
             } catch (error) {
                 if (this.destroyed) {
                     return
                 }
+                const startPath = this.normalizePathValue(rawStartPath)
                 const message = extractErrorMessage(error)
-                this.setCurrentPath(startPath)
+                this.setCurrentPath(startPath, false)
                 this.loadError = { path: startPath, message }
                 this.notifications.error(message)
                 return
             }
         }
 
-        await this.navigateWithFallback(this.normalizePathValue(startPath))
+        await this.navigateWithFallback(this.normalizePathValue(rawStartPath))
     }
 
-    private setCurrentPath (nextPath: string): void {
-        const normalized = normalizeFilePanelPath(nextPath)
+    private setCurrentPath (nextPath: string, emitChange = true): void {
+        const normalized = this.normalizePathValue(nextPath)
         this.currentPath = normalized
-        this.pathChange.next(normalized)
+        if (emitChange) {
+            this.pathChange.next(normalized)
+        }
         this.rebuildPathSegments(normalized)
         this.isCurrentPathFavorite = this.favorites.includes(normalized)
     }
 
     private rebuildPathSegments (targetPath: string): void {
-        let p = targetPath
         this.pathSegments = []
-        while (p !== '/' && p !== '.') {
-            this.pathSegments.unshift({
-                name: path.basename(p),
-                path: p,
+        if (targetPath === '/') {
+            return
+        }
+        const parts = targetPath.split('/').filter(Boolean)
+        let acc = ''
+        for (const part of parts) {
+            acc += `/${part}`
+            this.pathSegments.push({
+                name: part,
+                path: acc,
             })
-            const parent = path.dirname(p)
-            if (parent === p) {
-                break
-            }
-            p = parent
         }
     }
 
     private applyLoadedEntries (entries: SFTPFile[]): void {
         const sorted = sortFileEntries(entries)
         this.fileList = sorted
-        this.unfilteredEntries = sorted.map(item => ({
-            item,
-            tier: 0,
-            ranges: [],
-            segments: [{ text: item.name, highlighted: false }],
-        }))
+        this.rowMetaCache.clear()
+        this.unfilteredEntries = sorted.map(item => {
+            this.rowMetaCache.set(item.fullPath, {
+                icon: this.getIcon(item),
+                mode: this.getModeString(item),
+            })
+            return {
+                item,
+                tier: 0,
+                ranges: [],
+                segments: [{ text: item.name, highlighted: false }],
+            }
+        })
         this.updateFilteredList(true)
     }
 
@@ -254,13 +359,9 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         }
         const normalizedTarget = this.normalizePathValue(targetPath)
         const request = ++this.navigation
-        this.setCurrentPath(normalizedTarget)
+        this.setCurrentPath(normalizedTarget, false)
         this.clearFilter()
-        this.fileList = null
-        this.unfilteredEntries = []
-        this.filteredEntries = []
-        this.filteredFileList = []
-        this.selectedIndex = -1
+        this.resetFileLists()
         this.loadError = null
         this.errorNotice = null
         this.fallbackNotice = null
@@ -270,6 +371,7 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             dirPath => backend.readdir(dirPath),
             error => this.isDirectoryUnavailableError(error),
             () => this.destroyed || request !== this.navigation,
+            this.shouldPreserveDotDot,
         )
 
         if (result.cancelled || this.destroyed || request !== this.navigation) {
@@ -277,7 +379,7 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         }
 
         if (result.ok) {
-            this.setCurrentPath(result.path)
+            this.setCurrentPath(result.path, true)
             this.applyLoadedEntries(result.entries)
             this.loadError = null
             if (result.fellBackFrom) {
@@ -292,12 +394,11 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             return
         }
 
-        this.setCurrentPath(result.path)
-        this.fileList = null
-        this.unfilteredEntries = []
-        this.filteredEntries = []
-        this.filteredFileList = []
-        this.selectedIndex = -1
+        if (!result.isUnavailable) {
+            this.detachBackend()
+        }
+        this.setCurrentPath(result.path, false)
+        this.resetFileLists()
         this.loadError = {
             path: result.path,
             message: result.errorMessage,
@@ -307,6 +408,7 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
 
     async navigate (newPath: string, _fallbackOnError = false): Promise<void> {
         if (!this.backend) {
+            await this.initializeBackendAndNavigate(newPath)
             return
         }
         const normalizedPath = this.normalizePathValue(newPath)
@@ -323,7 +425,7 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             if (this.destroyed || request !== this.navigation) {
                 return
             }
-            this.setCurrentPath(normalizedPath)
+            this.setCurrentPath(normalizedPath, true)
             this.clearFilter()
             this.fallbackNotice = null
             this.errorNotice = null
@@ -336,14 +438,21 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
                 return
             }
             const message = extractErrorMessage(error)
+            const unavailable = this.isDirectoryUnavailableError(error)
             this.notifications.error(message)
-            if (hadValidList) {
+            if (hadValidList && unavailable) {
                 this.errorNotice = {
                     path: normalizedPath,
                     message,
                 }
+                this.cdr.detectChanges()
+                this.focusPanel()
             } else {
-                this.setCurrentPath(normalizedPath)
+                if (!unavailable) {
+                    this.detachBackend()
+                }
+                this.setCurrentPath(normalizedPath, false)
+                this.resetFileLists()
                 this.loadError = {
                     path: normalizedPath,
                     message,
@@ -354,7 +463,8 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
 
     async retryLoad (): Promise<void> {
         const retryPath = this.loadError?.path ?? this.currentPath
-        await this.initializeBackendAndNavigate(retryPath)
+        this.detachBackend()
+        await this.initializeBackendAndNavigate(retryPath, true)
     }
 
     refresh (): void {
@@ -430,10 +540,20 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         if (this.path === '/') {
             return
         }
-        void this.navigate(path.dirname(this.path))
+        if (this.backend?.normalizePath) {
+            void this.navigate(path.dirname(this.path))
+            return
+        }
+        const parts = this.path.split('/').filter(Boolean)
+        if (parts.includes('..')) {
+            void this.navigate(this.joinChildPath(this.path, '..'))
+            return
+        }
+        parts.pop()
+        void this.navigate(parts.length > 0 ? `/${parts.join('/')}` : '/')
     }
 
-    private async resolveLink (item: SFTPFile): Promise<SFTPFile | undefined> {
+    private async resolveLink (item: SFTPFile, request?: number): Promise<SFTPFile | undefined> {
         if (!item.isSymlink) {
             return item
         }
@@ -443,14 +563,17 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         try {
             return await this.backend.stat(item.fullPath)
         } catch (error) {
-            this.notifications.error(extractErrorMessage(error))
+            if (!this.destroyed && (request === undefined || request === this.navigation)) {
+                this.notifications.error(extractErrorMessage(error))
+            }
             return undefined
         }
     }
 
     async open (item: SFTPFile): Promise<void> {
-        const target = await this.resolveLink(item)
-        if (!target) {
+        const request = this.navigation
+        const target = await this.resolveLink(item, request)
+        if (!target || this.destroyed || request !== this.navigation) {
             return
         }
         if (target.isDirectory) {
@@ -471,8 +594,9 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
     }
 
     async downloadItem (item: SFTPFile): Promise<void> {
-        const target = await this.resolveLink(item)
-        if (!target) {
+        const request = this.navigation
+        const target = await this.resolveLink(item, request)
+        if (!target || this.destroyed || request !== this.navigation) {
             return
         }
         if (target.isDirectory) {
@@ -486,44 +610,55 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         if (!this.backend) {
             return
         }
+        const request = this.navigation
+        const basePath = this.path
         const modal = this.ngbModal.open(SFTPCreateDirectoryModalComponent)
         const directoryName = await modal.result.catch(() => null)
+        const activeBackend = this.getActiveBackend()
+        if (this.destroyed || request !== this.navigation || !activeBackend) {
+            return
+        }
         if (directoryName?.trim()) {
-            const targetPath = path.join(this.path, directoryName)
-            this.backend.mkdir(targetPath).then(() => {
+            const targetPath = this.joinChildPath(basePath, directoryName)
+            activeBackend.mkdir(targetPath).then(() => {
                 this.notifications.notice('The directory was created successfully')
-                void this.navigate(targetPath)
+                if (!this.destroyed && request === this.navigation) {
+                    void this.navigate(targetPath)
+                }
             }).catch(() => {
-                this.notifications.error('The directory could not be created')
+                if (!this.destroyed) {
+                    this.notifications.error('The directory could not be created')
+                }
             })
         }
     }
 
     async upload (): Promise<void> {
+        const request = this.navigation
         const target = this.path
         try {
             const transfers = await this.platform.startUpload({ multiple: true })
-            await Promise.all(transfers.map(t => this.uploadOne(t, target)))
+            await Promise.all(transfers.map(t => this.uploadOne(t, target, request)))
         } catch (error) {
             this.notifications.error(extractErrorMessage(error))
         }
     }
 
     async uploadFolder (): Promise<void> {
+        const request = this.navigation
         const target = this.path
         try {
             const transfer = await this.platform.startUploadDirectory()
-            await this.uploadOneFolder(transfer, target)
+            await this.uploadOneFolder(transfer, target, request)
         } catch (error) {
             this.notifications.error(extractErrorMessage(error))
         }
     }
 
-    async uploadOneFolder (transfer: DirectoryUpload, base = this.path): Promise<void> {
-        const request = this.navigation
+    async uploadOneFolder (transfer: DirectoryUpload, base = this.path, request = this.navigation): Promise<void> {
         try {
             await this.uploadDirectoryEntries(transfer, base)
-            if (request === this.navigation && base === this.path) {
+            if (!this.destroyed && request === this.navigation && base === this.path) {
                 await this.navigate(base)
             }
         } catch (error) {
@@ -536,7 +671,7 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             return
         }
         for (const child of transfer.getChildrens()) {
-            const target = path.join(directory, child.getName())
+            const target = this.joinChildPath(directory, child.getName())
             if (child instanceof DirectoryUpload) {
                 try {
                     await this.backend.mkdir(target)
@@ -550,12 +685,12 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         }
     }
 
-    async uploadOne (transfer: FileUpload, target = this.path): Promise<void> {
+    async uploadOne (transfer: FileUpload, target = this.path, request = this.navigation): Promise<void> {
         if (!this.backend) {
             return
         }
-        await this.backend.upload(path.join(target, transfer.getName()), transfer)
-        if (this.path === target) {
+        await this.backend.upload(this.joinChildPath(target, transfer.getName()), transfer)
+        if (!this.destroyed && request === this.navigation && this.path === target) {
             await this.navigate(target)
         }
     }
@@ -693,14 +828,29 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         }
     }
 
+    onPathInputKeyDown (event: KeyboardEvent): void {
+        if (event.isComposing || event.keyCode === 229) {
+            event.stopPropagation()
+            return
+        }
+        if (event.key === 'Enter') {
+            this.confirmPath(event)
+            return
+        }
+        if (event.key === 'Escape') {
+            this.cancelPathEdit(event)
+        }
+    }
+
     confirmPath (event?: Event): void {
         event?.preventDefault()
         event?.stopPropagation()
         if (this.editingPath === null) {
             return
         }
-        const target = this.editingPath.trim() || '/'
+        const raw = this.editingPath
         this.editingPath = null
+        const target = raw.trim() === '' ? '/' : raw
         void this.navigate(target)
     }
 
@@ -711,7 +861,10 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             return
         }
         this.editingPath = null
-        this.focusPanel()
+        if (event?.type !== 'blur') {
+            this.cdr.detectChanges()
+            this.focusPanel()
+        }
     }
 
     toggleCurrentFavorite (event?: Event): void {
@@ -785,8 +938,76 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         this.updateFilteredList(true)
     }
 
-    trackByEntry (_index: number, entry: FilteredFileEntry<SFTPFile>): string {
-        return entry.item.fullPath
+    trackByVisibleRow (_index: number, row: VisibleFileRow): string {
+        return row.entry.item.fullPath
+    }
+
+    trackBySegment (index: number): number {
+        return index
+    }
+
+    onBodyScroll (): void {
+        if (this.filteredEntries.length <= VIRTUAL_THRESHOLD) {
+            return
+        }
+        const { start, end } = this.computeVisibleRange(this.filteredEntries.length)
+        if (start !== this.visibleStartIndex || end !== this.visibleEndIndex) {
+            this.updateVisibleEntries(start, end)
+        }
+    }
+
+    private computeVisibleRange (total: number): { start: number, end: number } {
+        if (total <= VIRTUAL_THRESHOLD) {
+            return { start: 0, end: total }
+        }
+        const body = this.bodyContainer?.nativeElement
+        const scrollTop = body?.scrollTop ?? 0
+        const viewportHeight = body && body.clientHeight > 0 ? body.clientHeight : 480
+        const windowCount = Math.max(
+            VIRTUAL_MIN_WINDOW,
+            Math.ceil(viewportHeight / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2,
+        )
+        const start = Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN)
+        const end = Math.min(total, start + windowCount)
+        return { start, end }
+    }
+
+    private updateVisibleEntries (explicitStart?: number, explicitEnd?: number): void {
+        const total = this.filteredEntries.length
+        if (total === 0) {
+            this.visibleEntries = []
+            this.topSpacerHeight = 0
+            this.bottomSpacerHeight = 0
+            this.visibleStartIndex = 0
+            this.visibleEndIndex = 0
+            return
+        }
+        const range = explicitStart !== undefined && explicitEnd !== undefined
+            ? { start: explicitStart, end: explicitEnd }
+            : this.computeVisibleRange(total)
+        this.visibleStartIndex = range.start
+        this.visibleEndIndex = range.end
+        this.topSpacerHeight = range.start * VIRTUAL_ROW_HEIGHT
+        this.bottomSpacerHeight = (total - range.end) * VIRTUAL_ROW_HEIGHT
+        const rows: VisibleFileRow[] = new Array(range.end - range.start)
+        for (let i = range.start; i < range.end; i++) {
+            const entry = this.filteredEntries[i]
+            let meta = this.rowMetaCache.get(entry.item.fullPath)
+            if (!meta) {
+                meta = {
+                    icon: this.getIcon(entry.item),
+                    mode: this.getModeString(entry.item),
+                }
+                this.rowMetaCache.set(entry.item.fullPath, meta)
+            }
+            rows[i - range.start] = {
+                index: i,
+                entry,
+                icon: meta.icon,
+                mode: meta.mode,
+            }
+        }
+        this.visibleEntries = rows
     }
 
     focusPanel (): void {
@@ -800,6 +1021,11 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
         if (!this.fileList) {
             this.filteredEntries = []
             this.filteredFileList = []
+            this.visibleEntries = []
+            this.topSpacerHeight = 0
+            this.bottomSpacerHeight = 0
+            this.visibleStartIndex = 0
+            this.visibleEndIndex = 0
             this.selectedIndex = -1
             return
         }
@@ -816,7 +1042,11 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
             this.selectedIndex = -1
         } else if (resetSelection || this.selectedIndex < 0 || this.selectedIndex >= this.filteredEntries.length) {
             this.selectedIndex = 0
+            if (resetSelection && this.bodyContainer?.nativeElement) {
+                this.bodyContainer.nativeElement.scrollTop = 0
+            }
         }
+        this.updateVisibleEntries()
     }
 
     private moveSelection (delta: number): void {
@@ -837,6 +1067,19 @@ export class SFTPPanelComponent implements OnInit, OnDestroy {
     private scrollSelectedIntoView (): void {
         if (this.selectedIndex < 0) {
             return
+        }
+        if (this.filteredEntries.length > VIRTUAL_THRESHOLD && this.bodyContainer?.nativeElement) {
+            const body = this.bodyContainer.nativeElement
+            const viewportHeight = body.clientHeight > 0 ? body.clientHeight : 480
+            const rowTop = this.selectedIndex * VIRTUAL_ROW_HEIGHT
+            const rowBottom = rowTop + VIRTUAL_ROW_HEIGHT
+            if (rowTop < body.scrollTop) {
+                body.scrollTop = rowTop
+            } else if (rowBottom > body.scrollTop + viewportHeight) {
+                body.scrollTop = Math.max(0, rowBottom - viewportHeight)
+            }
+            this.updateVisibleEntries()
+            this.cdr.detectChanges()
         }
         const selectedEl = this.elementRef.nativeElement.querySelector<HTMLElement>(
             `.list-group-item[data-index="${this.selectedIndex}"]`,

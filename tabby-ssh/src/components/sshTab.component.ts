@@ -33,8 +33,10 @@ export class SSHTabComponent extends ConnectableTerminalTabComponent<SSHProfile>
     activeKIPrompt: KeyboardInteractivePrompt|null = null
 
     get sftpStateScope (): string {
+        const authUser = this.sshSession?.authUsername?.trim()
+        const username = authUser ? authUser : this.profile.options.user
         return createSSHFilePanelScope(
-            this.profile.options.user,
+            username,
             this.profile.options.host,
             this.profile.options.port,
         )

@@ -26,9 +26,9 @@ export interface DirectoryFallbackCancelled {
 }
 
 const TRANSIENT_ERROR_PATTERN = /\b(timeout|timed out|channel closed|disconnected|connection reset|connection refused|econnreset|epipe|broken pipe|not connected|session closed|offline|transport closed)\b/i
-const UNAVAILABLE_ERROR_PATTERN = /no such file|permission denied|not a directory|enoent|eacces|enotdir|ssh_fx_no_such_file|ssh_fx_permission_denied|status(?:\s+code)?\s*[:=]?\s*[23]\b/i
+const UNAVAILABLE_ERROR_PATTERN = /no\s*such\s*file|permission\s*denied|not\s*a\s*directory|enoent|eacces|enotdir|ssh_fx_no_such_file|ssh_fx_permission_denied|status(?:\s+code)?\s*[:=]?\s*[23]\b/i
 
-export function normalizeFallbackPath (rawPath: string): string {
+export function normalizeFallbackPath (rawPath: string, preserveDotDot = false): string {
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
         return '/'
     }
@@ -38,7 +38,7 @@ export function normalizeFallbackPath (rawPath: string): string {
         if (!segment || segment === '.') {
             continue
         }
-        if (segment === '..') {
+        if (segment === '..' && !preserveDotDot) {
             resolved.pop()
         } else {
             resolved.push(segment)
@@ -47,8 +47,8 @@ export function normalizeFallbackPath (rawPath: string): string {
     return resolved.length > 0 ? `/${resolved.join('/')}` : '/'
 }
 
-export function getParentDirectoryPath (dirPath: string): string | null {
-    const normalized = normalizeFallbackPath(dirPath)
+export function getParentDirectoryPath (dirPath: string, preserveDotDot = false): string | null {
+    const normalized = normalizeFallbackPath(dirPath, preserveDotDot)
     if (normalized === '/') {
         return null
     }
@@ -113,8 +113,9 @@ export async function resolveReadableDirectory<T> (
     readdir: (dirPath: string) => Promise<T[]>,
     isUnavailable: (error: unknown) => boolean,
     isStale?: () => boolean,
+    preserveDotDot = false,
 ): Promise<DirectoryFallbackSuccess<T> | DirectoryFallbackFailure | DirectoryFallbackCancelled> {
-    const requestedPath = normalizeFallbackPath(startPath)
+    const requestedPath = normalizeFallbackPath(startPath, preserveDotDot)
     let currentPath = requestedPath
     let initialFailureReason: string | undefined = undefined
 
@@ -181,7 +182,7 @@ export async function resolveReadableDirectory<T> (
                     isUnavailable: false,
                 }
             }
-            const parentPath = getParentDirectoryPath(currentPath)
+            const parentPath = getParentDirectoryPath(currentPath, preserveDotDot)
             if (parentPath === null) {
                 return {
                     ok: false,

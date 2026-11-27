@@ -4,9 +4,8 @@
         *ngIf='editingPath !== null',
         type='text',
         data-testid='path-input',
-        (keydown.enter)='confirmPath($event)',
-        (keydown.escape)='cancelPathEdit($event)',
-        (blur)='cancelPathEdit()',
+        (keydown)='onPathInputKeyDown($event)',
+        (blur)='cancelPathEdit($event)',
         (click)='$event.stopPropagation()',
         [(ngModel)]='editingPath'
     )
@@ -173,7 +172,7 @@
     )
         i.fas.fa-times
 
-.body(dropZone, [dropTarget]='getDropTarget', (transferAt)='uploadOneFolder($event.upload, $event.target)')
+.body(#bodyContainer, (scroll)='onBodyScroll()', dropZone, [dropTarget]='getDropTarget', (transferAt)='uploadOneFolder($event.upload, $event.target)')
     a.alert.alert-info.d-flex.align-items-center(
         *ngIf='shouldShowCWDTip && cwdDetectionAvailable === false',
         (click)='platform.openExternal("https://tabby.sh/go/cwd-detection")'
@@ -209,23 +208,25 @@
             )
                 i.fas.fa-fw.fa-level-up-alt
                 div(translate) Go up
-            .list-group-item.list-group-item-action.d-flex.align-items-center(
-                *ngFor='let entry of filteredEntries; let i = index; trackBy: trackByEntry',
-                [class.selected]='i === selectedIndex',
-                [attr.data-index]='i',
-                [attr.data-name]='entry.item.name',
-                (contextmenu)='onItemContextMenu(entry.item, i, $event)',
-                (click)='onItemClick(entry.item, i)'
+            .virtual-spacer(*ngIf='topSpacerHeight > 0', [style.height.px]='topSpacerHeight')
+            .list-group-item.list-group-item-action.d-flex.align-items-center.file-row(
+                *ngFor='let row of visibleEntries; trackBy: trackByVisibleRow',
+                [class.selected]='row.index === selectedIndex',
+                [attr.data-index]='row.index',
+                [attr.data-name]='row.entry.item.name',
+                (contextmenu)='onItemContextMenu(row.entry.item, row.index, $event)',
+                (click)='onItemClick(row.entry.item, row.index)'
             )
-                i.fa-fw([class]='getIcon(entry.item)')
+                i.fa-fw([class]='row.icon')
                 .file-name
-                    ng-container(*ngFor='let seg of entry.segments')
+                    ng-container(*ngFor='let seg of row.entry.segments; trackBy: trackBySegment')
                         mark.filter-match(*ngIf='seg.highlighted') {{seg.text}}
                         span(*ngIf='!seg.highlighted') {{seg.text}}
                 .me-auto
-                .size(*ngIf='!entry.item.isDirectory') {{entry.item.size|filesize}}
-                .date {{entry.item.modified|tabbyDate}}
-                .mode {{getModeString(entry.item)}}
+                .size(*ngIf='!row.entry.item.isDirectory') {{row.entry.item.size|filesize}}
+                .date {{row.entry.item.modified|tabbyDate}}
+                .mode {{row.mode}}
+            .virtual-spacer(*ngIf='bottomSpacerHeight > 0', [style.height.px]='bottomSpacerHeight')
         .alert.alert-info.text-center.mt-3(
             *ngIf='fileList !== null && filteredEntries.length === 0 && isFilterActive',
             data-testid='no-match-alert'

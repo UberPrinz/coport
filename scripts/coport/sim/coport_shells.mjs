@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createServer, createConnection } from 'node:net'
 import { userInfo } from 'node:os'
@@ -36,12 +36,17 @@ async function stop (process) {
 async function prepareNavigationFixtures () {
     const embeddedRoot = join(adbRoot, 'devices', 'embedded')
     await mkdir(join(embeddedRoot, 'data', 'app', 'g_comp', 'nested'), { recursive: true })
+    await mkdir(join(embeddedRoot, 'data', 'filter-actions', 'a-dir'), { recursive: true })
     await mkdir(join(embeddedRoot, 'data', 'only-on-embedded', 'deep'), { recursive: true })
     await mkdir(join(embeddedRoot, 'etc'), { recursive: true })
     await mkdir(join(embeddedRoot, 'bulk'), { recursive: true })
     await writeFile(join(embeddedRoot, 'data', 'app', 'g_comp', 'nested', 'leaf.txt'), 'nested leaf\n')
     await writeFile(join(embeddedRoot, 'data', 'app', 'good_config.txt'), 'good config\n')
     await writeFile(join(embeddedRoot, 'data', 'app', 'alpha.txt'), 'alpha\n')
+    await writeFile(join(embeddedRoot, 'data', 'filter-actions', 'a-first.txt'), 'first\n')
+    await writeFile(join(embeddedRoot, 'data', 'filter-actions', 'm-middle.txt'), 'middle\n')
+    await writeFile(join(embeddedRoot, 'data', 'filter-actions', 'z-target.txt'), 'z-target-content\n')
+    await symlink('../app', join(embeddedRoot, 'data', 'filter-actions', 'sym-dir'))
     await writeFile(join(embeddedRoot, 'data', 'only-on-embedded', 'deep', 'note.txt'), 'deep\n')
     await writeFile(join(embeddedRoot, 'etc', 'hosts'), '127.0.0.1 localhost\n')
     await Promise.all(Array.from({ length: 1000 }, (_, i) => {
@@ -60,9 +65,19 @@ async function prepareNavigationFixtures () {
     await mkdir(join(sshRoot, 'sub-a'), { recursive: true })
     await mkdir(join(sshRoot, 'sub-b'), { recursive: true })
     await mkdir(join(sshRoot, 'cwd-dir'), { recursive: true })
+    await mkdir(join(sshRoot, 'trail '), { recursive: true })
+    await mkdir(join(sshRoot, 'real-parent', 'real-child'), { recursive: true })
+    await mkdir(join(sshRoot, 'link-parent'), { recursive: true })
+    await mkdir(join(sshRoot, 'readable', 'no-perm'), { recursive: true })
     await writeFile(join(sshRoot, 'sub-a', 'a.txt'), 'sub-a\n')
     await writeFile(join(sshRoot, 'sub-b', 'b.txt'), 'sub-b\n')
     await writeFile(join(sshRoot, 'cwd-dir', 'cwd.txt'), 'cwd\n')
+    await writeFile(join(sshRoot, 'trail ', 'space-marker.txt'), 'trail\n')
+    await writeFile(join(sshRoot, 'real-parent', 'from-real-parent.txt'), 'real\n')
+    await writeFile(join(sshRoot, 'link-parent', 'from-link-parent.txt'), 'link\n')
+    await symlink(join(sshRoot, 'real-parent', 'real-child'), join(sshRoot, 'link-parent', 'to-real-child'))
+    await writeFile(join(sshRoot, 'readable', 'readable-marker.txt'), 'readable\n')
+    await chmod(join(sshRoot, 'readable', 'no-perm'), 0o000)
 }
 
 async function launchApp (env, childrenLogs) {
@@ -229,40 +244,56 @@ try {
         'embedded device must never attempt /sdcard on initial open',
     )
 
-    // Type-to-filter without clicking Filter, highlights, keyboard drill-down, zero remote calls, Backspace/Esc, no-match Go up
+    // Type-to-filter via real panel focus -> real focused <input>, highlights, keyboard drill-down, zero remote calls, Backspace/Esc, no-match Go up
     const filterAndKeyboard = await evalJs(`(async () => {
         const tabEl = cpAdbTabEl('embedded')
         const panelEl = tabEl.querySelector('sftp-panel')
         const panel = cpPanelForEl(tabEl)
         await panel.navigate('/data/app')
+        panel.cdr.detectChanges()
         let readdirCalls = 0
         const origReaddir = panel.sftp.readdir.bind(panel.sftp)
         panel.sftp.readdir = async (...args) => {
             readdirCalls++
             return origReaddir(...args)
         }
+        const typeSequence = text => {
+            for (let idx = 0; idx < text.length; idx++) {
+                const ch = text[idx]
+                const active = document.activeElement || panelEl
+                const ev = new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true })
+                active.dispatchEvent(ev)
+                if (active.tagName === 'INPUT' && !ev.defaultPrevented) {
+                    active.value += ch
+                    active.dispatchEvent(new Event('input', { bubbles: true }))
+                }
+                panel.cdr.detectChanges()
+            }
+        }
         try {
             const filterVisibleBefore = Boolean(panelEl.querySelector('[data-testid="filter-bar"]'))
             panelEl.focus()
-            for (const ch of ['g', '_', 'c']) {
-                panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }))
-            }
+            // First key on panel must open filter and focus <input data-testid="filter-input">
+            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', bubbles: true, cancelable: true }))
+            panel.cdr.detectChanges()
+            const filterInput = panelEl.querySelector('[data-testid="filter-input"]')
+            const activeIsFilterInputAfterFirstKey = Boolean(filterInput && document.activeElement === filterInput)
+            // Subsequent chars go through the actually focused <input>
+            typeSequence('_c')
             const callsAfterType = readdirCalls
             const filterVisibleAfter = Boolean(panelEl.querySelector('[data-testid="filter-bar"]'))
             const filterTextAfterType = panel.filterText
-            const filteredNames = panel.filteredFileList.map(e => e.name)
+            const domFilteredNames = [...panelEl.querySelectorAll('.list-group-item.file-row')].map(el => el.getAttribute('data-name'))
             const marks = [...panelEl.querySelectorAll('mark.filter-match')].map(el => el.textContent)
-            // Verify filtered-state action targets actual filtered item (row 1 is good_config.txt, not fileList[1])
-            const filteredCtx = (await panel.buildContextMenu(panel.filteredFileList[1])).map(i => i.label).filter(Boolean)
 
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
             const indexAfterDown = panel.selectedIndex
             const selectedDownClass = panelEl.querySelector('.list-group-item[data-index="1"]')?.classList.contains('selected') ?? false
 
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }))
             const indexAfterUp = panel.selectedIndex
 
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
             const deadline1 = Date.now() + 5000
             while (panel.path !== '/data/app/g_comp' && Date.now() < deadline1) {
                 await new Promise(r => setTimeout(r, 30))
@@ -272,10 +303,9 @@ try {
             const focusedAfterEnter = document.activeElement === panelEl || panelEl.contains(document.activeElement)
 
             // Continuous keyboard drill-down without clicking
-            for (const ch of ['n', 'e', 's']) {
-                panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }))
-            }
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+            typeSequence('nes')
+            const activeDuringSecondFilter = document.activeElement === panelEl.querySelector('[data-testid="filter-input"]')
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
             const deadline2 = Date.now() + 5000
             while (panel.path !== '/data/app/g_comp/nested' && Date.now() < deadline2) {
                 await new Promise(r => setTimeout(r, 30))
@@ -283,12 +313,12 @@ try {
             const drillPath = panel.path
 
             // Repeated Backspace with empty filter must NOT go up
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', repeat: true, bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', repeat: true, bubbles: true, cancelable: true }))
             await new Promise(r => setTimeout(r, 120))
             const pathAfterRepeatBackspace = panel.path
 
             // Single non-repeat Backspace goes up
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', repeat: false, bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', repeat: false, bubbles: true, cancelable: true }))
             const deadline3 = Date.now() + 5000
             while (panel.path !== '/data/app/g_comp' && Date.now() < deadline3) {
                 await new Promise(r => setTimeout(r, 30))
@@ -296,14 +326,11 @@ try {
             const pathAfterBackspace = panel.path
 
             // No-match state retains Go up, Escape clears filter without closing panel
-            for (const ch of ['z', 'z', 'z']) {
-                panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }))
-            }
-            panel.cdr.detectChanges()
+            typeSequence('zzz')
             const noMatchShown = Boolean(panelEl.querySelector('[data-testid="no-match-alert"]'))
             const goUpKeptOnNoMatch = Boolean(panelEl.querySelector('[data-testid="go-up-item"]'))
 
-            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
             panel.cdr.detectChanges()
             const afterEscFilterHidden = !panel.showFilter && panel.filterText === ''
             const panelStillOpenAfterEsc = Boolean(tabEl.querySelector('sftp-panel'))
@@ -311,11 +338,12 @@ try {
             return {
                 filterVisibleBefore,
                 filterVisibleAfter,
+                activeIsFilterInputAfterFirstKey,
+                activeDuringSecondFilter,
                 callsAfterType,
                 filterTextAfterType,
-                filteredNames,
+                domFilteredNames,
                 marks,
-                filteredCtx,
                 indexAfterDown,
                 selectedDownClass,
                 indexAfterUp,
@@ -337,11 +365,12 @@ try {
 
     assert.equal(filterAndKeyboard.filterVisibleBefore, false)
     assert.equal(filterAndKeyboard.filterVisibleAfter, true)
+    assert.equal(filterAndKeyboard.activeIsFilterInputAfterFirstKey, true)
+    assert.equal(filterAndKeyboard.activeDuringSecondFilter, true)
     assert.equal(filterAndKeyboard.callsAfterType, 0)
     assert.equal(filterAndKeyboard.filterTextAfterType, 'g_c')
-    assert.deepEqual(filterAndKeyboard.filteredNames, ['g_comp', 'good_config.txt'])
+    assert.deepEqual(filterAndKeyboard.domFilteredNames, ['g_comp', 'good_config.txt'])
     assert.ok(filterAndKeyboard.marks.includes('g_c') && filterAndKeyboard.marks.includes('_c'), filterAndKeyboard.marks)
-    assert.ok(filterAndKeyboard.filteredCtx.includes('Download'), filterAndKeyboard.filteredCtx)
     assert.equal(filterAndKeyboard.indexAfterDown, 1)
     assert.equal(filterAndKeyboard.selectedDownClass, true)
     assert.equal(filterAndKeyboard.indexAfterUp, 0)
@@ -356,11 +385,205 @@ try {
     assert.equal(filterAndKeyboard.afterEscFilterHidden, true)
     assert.equal(filterAndKeyboard.panelStillOpenAfterEsc, true)
 
-    // 1,000-entry directory UI filtering benchmark <= 16 ms with 0 remote readdir calls
-    const bulkBench = await evalJs(`(async () => {
+    // Filtered-state real DOM click, real contextmenu, and keyboard Enter download targeting actual filtered item
+    const filteredActions = await evalJs(`(async () => {
+        const tabEl = cpAdbTabEl('embedded')
+        const panelEl = tabEl.querySelector('sftp-panel')
+        const panel = cpPanelForEl(tabEl)
+        await panel.navigate('/data/filter-actions')
+        panel.cdr.detectChanges()
+        const rawIndex = panel.fileList.findIndex(e => e.name === 'z-target.txt')
+
+        const downloads = []
+        const origStartDownload = panel.platform.startDownload
+        const origPopup = panel.platform.popupContextMenu
+        const origBackendDownload = panel.sftp.download.bind(panel.sftp)
+        let capturedMenu = null
+        panel.platform.startDownload = async (name) => {
+            const chunks = []
+            return {
+                name,
+                chunks,
+                isCancelled: () => false,
+                setStatus () {},
+                cancel () {},
+                close () {},
+                write: async bytes => { chunks.push(Buffer.from(bytes)) },
+                completeDownload: async () => {},
+            }
+        }
+        panel.sftp.download = async (remotePath, transfer) => {
+            await origBackendDownload(remotePath, transfer)
+            downloads.push({
+                remotePath,
+                content: Buffer.concat(transfer.chunks).toString('utf8'),
+            })
+        }
+        panel.platform.popupContextMenu = (items) => {
+            capturedMenu = items
+        }
+
+        try {
+            panelEl.focus()
+            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', bubbles: true, cancelable: true }))
+            panel.cdr.detectChanges()
+            const filterInput = panelEl.querySelector('[data-testid="filter-input"]')
+            filterInput.value = 'z-tar'
+            filterInput.dispatchEvent(new Event('input', { bubbles: true }))
+            panel.cdr.detectChanges()
+
+            const row0 = panelEl.querySelector('.list-group-item.file-row[data-index="0"]')
+            const row0Name = row0?.getAttribute('data-name')
+
+            // 1. Click row 0
+            row0.click()
+            const d1 = Date.now() + 5000
+            while (downloads.length < 1 && Date.now() < d1) await new Promise(r => setTimeout(r, 30))
+
+            // 2. Real contextmenu event on row 0 -> invoke Download item
+            row0.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+            const d2 = Date.now() + 5000
+            while (!capturedMenu && Date.now() < d2) await new Promise(r => setTimeout(r, 30))
+            const downloadItem = capturedMenu.find(item => item.label === 'Download')
+            await downloadItem.click()
+            const d3 = Date.now() + 5000
+            while (downloads.length < 2 && Date.now() < d3) await new Promise(r => setTimeout(r, 30))
+
+            // 3. Keyboard Enter on focused filter input
+            filterInput.focus()
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+            const d4 = Date.now() + 5000
+            while (downloads.length < 3 && Date.now() < d4) await new Promise(r => setTimeout(r, 30))
+
+            // 4. Real contextmenu event on filtered row 0 -> invoke Delete item and verify actual target deleted
+            const origShowMessageBox = panel.platform.showMessageBox
+            panel.platform.showMessageBox = async () => ({ response: 0 })
+            let remainingAfterDelete = []
+            try {
+                capturedMenu = null
+                row0.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+                const d5 = Date.now() + 5000
+                while (!capturedMenu && Date.now() < d5) await new Promise(r => setTimeout(r, 30))
+                const deleteItem = capturedMenu.find(item => item.label === 'Delete')
+                await deleteItem.click()
+                const d6 = Date.now() + 5000
+                while (panel.fileList.some(e => e.name === 'z-target.txt') && Date.now() < d6) {
+                    await new Promise(r => setTimeout(r, 30))
+                }
+                remainingAfterDelete = panel.fileList.map(e => e.name)
+            } finally {
+                panel.platform.showMessageBox = origShowMessageBox
+            }
+
+            panel.clearFilter(true)
+            return { rawIndex, row0Name, downloads, remainingAfterDelete }
+        } finally {
+            panel.platform.startDownload = origStartDownload
+            panel.platform.popupContextMenu = origPopup
+            panel.sftp.download = origBackendDownload
+        }
+    })()`, 15000)
+    assert.equal(filteredActions.rawIndex, 4)
+    assert.equal(filteredActions.row0Name, 'z-target.txt')
+    assert.deepEqual(filteredActions.downloads, [
+        { remotePath: '/data/filter-actions/z-target.txt', content: 'z-target-content\n' },
+        { remotePath: '/data/filter-actions/z-target.txt', content: 'z-target-content\n' },
+        { remotePath: '/data/filter-actions/z-target.txt', content: 'z-target-content\n' },
+    ])
+    assert.equal(filteredActions.remainingAfterDelete.includes('z-target.txt'), false)
+    assert.equal(filteredActions.remainingAfterDelete.includes('a-first.txt'), true)
+    assert.equal(filteredActions.remainingAfterDelete.includes('m-middle.txt'), true)
+
+    // Stale async operations: slow symlink stat(), slow openCreateDirectoryModal()/mkdir(), and slow uploadOne() must not overwrite newer navigation
+    const staleOps = await evalJs(`(async () => {
         const tabEl = cpAdbTabEl('embedded')
         const panel = cpPanelForEl(tabEl)
+        await panel.navigate('/data/filter-actions')
+        const symItem = panel.fileList.find(e => e.name === 'sym-dir')
+        const origStat = panel.sftp.stat.bind(panel.sftp)
+        const origMkdir = panel.sftp.mkdir.bind(panel.sftp)
+        const origUpload = panel.sftp.upload.bind(panel.sftp)
+        const origReaddir = panel.sftp.readdir.bind(panel.sftp)
+        const origModalOpen = panel.ngbModal.open.bind(panel.ngbModal)
+        let releaseStat
+        let releaseMkdir
+        let releaseUpload
+        panel.sftp.stat = async (p) => {
+            await new Promise(resolve => { releaseStat = resolve })
+            return origStat(p)
+        }
+        try {
+            const slowOpen = panel.open(symItem)
+            while (!releaseStat) await new Promise(r => setTimeout(r, 10))
+            await panel.navigate('/etc')
+            const recentAfterNav = [...panel.recentPaths]
+            releaseStat()
+            await slowOpen
+            const pathAfterSlowStat = panel.path
+            const recentAfterSlowStat = [...panel.recentPaths]
+
+            // Slow openCreateDirectoryModal() -> mkdir completes AFTER user navigated elsewhere -> must NOT jump to created dir
+            await panel.navigate('/data/filter-actions')
+            panel.ngbModal.open = () => ({ result: Promise.resolve('stale-created-dir') })
+            panel.sftp.mkdir = async (p) => {
+                await new Promise(resolve => { releaseMkdir = resolve })
+                return origMkdir(p)
+            }
+            await panel.openCreateDirectoryModal()
+            while (!releaseMkdir) await new Promise(r => setTimeout(r, 10))
+            await panel.navigate('/etc')
+            releaseMkdir()
+            await new Promise(r => setTimeout(r, 80))
+            const pathAfterSlowMkdir = panel.path
+
+            // Slow uploadOne(): navigate away and back so this.path === target while request !== navigation
+            await panel.navigate('/data/app')
+            panel.sftp.upload = async () => {
+                await new Promise(resolve => { releaseUpload = resolve })
+            }
+            let readdirCallsAfterUploadResolve = 0
+            panel.sftp.readdir = async (...args) => {
+                readdirCallsAfterUploadResolve++
+                return origReaddir(...args)
+            }
+            const dummyUpload = { getName: () => 'late.txt' }
+            const slowUpload = panel.uploadOne(dummyUpload, '/data/app')
+            while (!releaseUpload) await new Promise(r => setTimeout(r, 10))
+            await panel.navigate('/etc')
+            await panel.navigate('/data/app')
+            readdirCallsAfterUploadResolve = 0
+            releaseUpload()
+            await slowUpload
+            return {
+                pathAfterSlowStat,
+                recentUnchangedAfterStat: JSON.stringify(recentAfterNav) === JSON.stringify(recentAfterSlowStat),
+                pathAfterSlowMkdir,
+                readdirCallsAfterUploadResolve,
+                finalPath: panel.path,
+            }
+        } finally {
+            panel.sftp.stat = origStat
+            panel.sftp.mkdir = origMkdir
+            panel.sftp.upload = origUpload
+            panel.sftp.readdir = origReaddir
+            panel.ngbModal.open = origModalOpen
+        }
+    })()`, 15000)
+    assert.deepEqual(staleOps, {
+        pathAfterSlowStat: '/etc',
+        recentUnchangedAfterStat: true,
+        pathAfterSlowMkdir: '/etc',
+        readdirCallsAfterUploadResolve: 0,
+        finalPath: '/data/app',
+    })
+
+    // 1,000-entry directory real DOM filtering benchmark <= 16 ms with 0 remote readdir calls
+    const bulkBench = await evalJs(`(async () => {
+        const tabEl = cpAdbTabEl('embedded')
+        const panelEl = tabEl.querySelector('sftp-panel')
+        const panel = cpPanelForEl(tabEl)
         await panel.navigate('/bulk')
+        panel.cdr.detectChanges()
         const total = panel.fileList.length
         let readdirCalls = 0
         const origReaddir = panel.sftp.readdir.bind(panel.sftp)
@@ -369,31 +592,57 @@ try {
             return origReaddir(...args)
         }
         try {
-            panel.showFilter = true
-            panel.onFilterTextChange('g_c') // warm up
-            const queries = ['g_c', 'item_05', 'e', 'g_comp_item_0995', 'no_match_xyz']
+            panelEl.focus()
+            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', bubbles: true, cancelable: true }))
+            panel.cdr.detectChanges()
+            const filterInput = panelEl.querySelector('[data-testid="filter-input"]')
+            // Warm up JIT + DOM update path once
+            filterInput.value = 'g_c'
+            filterInput.dispatchEvent(new Event('input', { bubbles: true }))
+            panel.cdr.detectChanges()
+
+            const queries = ['g_c', 'item_050', 'e', 'g_comp_item_0995', 'no_match_xyz']
             const times = []
+            const domSnapshots = {}
             for (const q of queries) {
                 const start = performance.now()
-                panel.onFilterTextChange(q)
-                times.push(performance.now() - start)
+                filterInput.value = q
+                filterInput.dispatchEvent(new Event('input', { bubbles: true }))
+                panel.cdr.detectChanges()
+                const elapsed = performance.now() - start
+                times.push(elapsed)
+                const rows = [...panelEl.querySelectorAll('.list-group-item.file-row')]
+                domSnapshots[q] = {
+                    countText: panelEl.querySelector('[data-testid="filter-count"]')?.textContent?.trim(),
+                    domRowCount: rows.length,
+                    firstRowName: rows[0]?.getAttribute('data-name') ?? null,
+                }
             }
-            const gCompCount = (() => {
-                panel.onFilterTextChange('g_c')
-                return panel.filteredFileList.length
-            })()
             panel.clearFilter(true)
-            return { total, readdirCalls, maxMs: Math.max(...times), times, gCompCount }
+            panel.cdr.detectChanges()
+            return { total, readdirCalls, maxMs: Math.max(...times), times, domSnapshots }
         } finally {
             panel.sftp.readdir = origReaddir
         }
     })()`, 15000)
     assert.equal(bulkBench.total, 1000)
     assert.equal(bulkBench.readdirCalls, 0)
-    assert.equal(bulkBench.gCompCount, 200)
-    assert.ok(bulkBench.maxMs <= 16, `Expected 1000-entry UI filter <= 16ms, got ${bulkBench.maxMs.toFixed(2)}ms`)
+    assert.equal(bulkBench.domSnapshots['g_c'].countText, '200 / 1000')
+    assert.equal(bulkBench.domSnapshots['g_c'].firstRowName, 'g_comp_item_0000.txt')
+    assert.ok(bulkBench.domSnapshots['g_c'].domRowCount > 0 && bulkBench.domSnapshots['g_c'].domRowCount <= 200)
+    assert.equal(bulkBench.domSnapshots['item_050'].countText, '28 / 1000')
+    assert.equal(bulkBench.domSnapshots['item_050'].domRowCount, 28)
+    assert.equal(bulkBench.domSnapshots['item_050'].firstRowName, 'entry_item_0501.log')
+    assert.equal(bulkBench.domSnapshots['e'].countText, '1000 / 1000')
+    assert.ok(bulkBench.domSnapshots['e'].domRowCount > 0)
+    assert.equal(bulkBench.domSnapshots['g_comp_item_0995'].countText, '1 / 1000')
+    assert.equal(bulkBench.domSnapshots['g_comp_item_0995'].domRowCount, 1)
+    assert.equal(bulkBench.domSnapshots['g_comp_item_0995'].firstRowName, 'g_comp_item_0995.txt')
+    assert.equal(bulkBench.domSnapshots['no_match_xyz'].countText, '0 / 1000')
+    assert.equal(bulkBench.domSnapshots['no_match_xyz'].domRowCount, 0)
+    assert.ok(bulkBench.maxMs <= 16, `Expected 1000-entry real DOM filter <= 16ms, got ${bulkBench.maxMs.toFixed(2)}ms`)
 
-    // Path bar single-click edit, Esc cancel, Enter jump, and manual invalid-dir error keeping current valid list
+    // Path bar single-click edit, IME composing pass-through, Esc cancel, Enter jump, and manual invalid-dir error preserving list + returning panel focus
     const pathBarAndManualError = await evalJs(`(async () => {
         const tabEl = cpAdbTabEl('embedded')
         const panelEl = tabEl.querySelector('sftp-panel')
@@ -407,10 +656,17 @@ try {
         const pathInput1 = panelEl.querySelector('[data-testid="path-input"]')
         pathInput1.value = '/etc'
         pathInput1.dispatchEvent(new Event('input', { bubbles: true }))
+        // IME composing Enter & Escape must NOT submit or cancel
+        pathInput1.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true }))
+        pathInput1.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', isComposing: true, bubbles: true, cancelable: true }))
+        panel.cdr.detectChanges()
+        const stayedOpenDuringIme = Boolean(panelEl.querySelector('[data-testid="path-input"]')) && panel.path === '/data/app'
+
         pathInput1.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
         panel.cdr.detectChanges()
         const pathAfterEsc = panel.path
         const inputClosedAfterEsc = !panelEl.querySelector('[data-testid="path-input"]')
+        const focusedPanelAfterEsc = document.activeElement === panelEl
 
         panelEl.querySelector('[data-testid="edit-path-btn"]').click()
         panel.cdr.detectChanges()
@@ -424,28 +680,54 @@ try {
         }
         const pathAfterEnter = panel.path
 
-        await panel.navigate('/does-not-exist-manual')
+        // Submit non-existent path through real <input>, verify list preserved, panel regains focus, and direct typing filters immediately
+        panelEl.querySelector('[data-testid="edit-path-btn"]').click()
         panel.cdr.detectChanges()
+        const pathInput3 = panelEl.querySelector('[data-testid="path-input"]')
+        pathInput3.value = '/does-not-exist-manual'
+        pathInput3.dispatchEvent(new Event('input', { bubbles: true }))
+        pathInput3.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+        const errDeadline = Date.now() + 5000
+        while (!panelEl.querySelector('[data-testid="error-banner"]') && Date.now() < errDeadline) {
+            await new Promise(r => setTimeout(r, 30))
+        }
+        panel.cdr.detectChanges()
+        const focusedAfterInvalidManual = document.activeElement === panelEl
+        // Type directly to activeElement without calling focus()
+        document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'h', bubbles: true, cancelable: true }))
+        panel.cdr.detectChanges()
+        const typedFilterAfterError = panel.showFilter && panel.filterText === 'h' &&
+            [...panelEl.querySelectorAll('.list-group-item.file-row')].some(el => el.getAttribute('data-name') === 'hosts')
+        panel.clearFilter(true)
+
         return {
             inputAfterSingleClick,
+            stayedOpenDuringIme,
             pathAfterEsc,
             inputClosedAfterEsc,
+            focusedPanelAfterEsc,
             pathAfterEnter,
             pathAfterInvalidManual: panel.path,
             keptHostsFile: panel.fileList.some(e => e.name === 'hosts'),
             errorBannerVisible: Boolean(panelEl.querySelector('[data-testid="error-banner"]')),
             invalidInRecent: panel.recentPaths.includes('/does-not-exist-manual'),
+            focusedAfterInvalidManual,
+            typedFilterAfterError,
         }
     })()`, 15000)
     assert.deepEqual(pathBarAndManualError, {
         inputAfterSingleClick: true,
+        stayedOpenDuringIme: true,
         pathAfterEsc: '/data/app',
         inputClosedAfterEsc: true,
+        focusedPanelAfterEsc: true,
         pathAfterEnter: '/etc',
         pathAfterInvalidManual: '/etc',
         keptHostsFile: true,
         errorBannerVisible: true,
         invalidInRecent: false,
+        focusedAfterInvalidManual: true,
+        typedFilterAfterError: true,
     })
 
     // Favorites star, compact bar, Places dropdown (Favorites above Recent), jump & remove
@@ -525,26 +807,51 @@ try {
         finalFavorites: ['/etc'],
     })
 
-    // SSH host isolation, independent favorites, CWD priority, non-bubbling clicks
+    // SSH host/user isolation, first-open CWD vs savedLastPath priority, trailing spaces, symlink/.., SFTP channel close Retry, real sshd fallback
     await open(title.ssh)
     await waitFor(() => evalJs("cpComponentEl(cpSshTabEl('127.0.0.1'))?.session?.open"))
     await open(title.ssh2)
     await waitFor(() => evalJs("cpComponentEl(cpSshTabEl('localhost'))?.session?.open"))
 
     const sshIsolationPhase1 = await evalJs(`(async () => {
+        const closeSftpFor = async host => {
+            const tabEl = cpSshTabEl(host)
+            const closeBtn = tabEl.querySelector('sftp-panel .header > button:last-child')
+            if (closeBtn) {
+                closeBtn.click()
+            } else {
+                const tab = cpComponentEl(tabEl)
+                tab.sftpPanelVisible = false
+            }
+            const deadline = Date.now() + 5000
+            while (tabEl.querySelector('sftp-panel') && Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 30))
+            }
+        }
         const openSftpFor = async host => {
             const tabEl = cpSshTabEl(host)
             const tab = cpComponentEl(tabEl)
-            await tab.openSFTP()
+            const sftpBtn = [...tabEl.querySelectorAll('terminal-toolbar button')]
+                .find(item => item.textContent.trim() === 'SFTP')
+            if (!sftpBtn) {
+                throw new Error('Missing SFTP toolbar button for ' + host)
+            }
+            sftpBtn.click()
             const deadline = Date.now() + 5000
             while (!Array.isArray(cpPanelForEl(tabEl)?.fileList) && Date.now() < deadline) {
                 await new Promise(r => setTimeout(r, 30))
             }
             return { tabEl, tab, panel: cpPanelForEl(tabEl) }
         }
+
+        // 1. First open with NO history and detected CWD -> opens CWD
+        const tab1 = cpComponentEl(cpSshTabEl('127.0.0.1'))
+        tab1.session.reportedCWD = ${JSON.stringify(join(sshRoot, 'cwd-dir'))}
         const s1 = await openSftpFor('127.0.0.1')
-        const ssh1InitialPath = s1.panel.path
+        const ssh1InitialCwdPath = s1.panel.path
         const ssh1InitialFavorites = [...s1.panel.favorites]
+
+        // Switch to sub-a and favorite it, verify clicks don't close panel
         await s1.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
         s1.panel.cdr.detectChanges()
         s1.tabEl.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
@@ -553,6 +860,147 @@ try {
         const ssh1StillVisibleAfterClicks = Boolean(s1.tabEl.querySelector('sftp-panel'))
         s1.tabEl.querySelector('sftp-panel [data-testid="places-toggle"]').click()
 
+        // Close and reopen even while reportedCWD is still cwd-dir -> MUST restore savedLastPath (sub-a)
+        await closeSftpFor('127.0.0.1')
+        tab1.session.reportedCWD = ${JSON.stringify(join(sshRoot, 'cwd-dir'))}
+        const s1Reopened = await openSftpFor('127.0.0.1')
+        const ssh1ReopenedPathOverCwd = s1Reopened.panel.path
+        tab1.session.reportedCWD = null
+
+        // 2. SSH path edit: trailing space directory ('trail ') and cross-parent symlink/..
+        const editAndSubmit = async (panelEl, panel, targetPath, expectedFile) => {
+            panelEl.querySelector('[data-testid="edit-path-btn"]').click()
+            panel.cdr.detectChanges()
+            const input = panelEl.querySelector('[data-testid="path-input"]')
+            input.value = targetPath
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+            const deadline = Date.now() + 5000
+            while ((!Array.isArray(panel.fileList) || !panel.fileList.some(e => e.name === expectedFile)) && Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 30))
+            }
+            panel.cdr.detectChanges()
+            return {
+                path: panel.path,
+                names: (panel.fileList || []).map(e => e.name),
+            }
+        }
+        const s1PanelEl = s1Reopened.tabEl.querySelector('sftp-panel')
+        const trailingSpaceResult = await editAndSubmit(
+            s1PanelEl, s1Reopened.panel, ${JSON.stringify(join(sshRoot, 'trail '))}, 'space-marker.txt',
+        )
+        const symlinkDotDotResult = await editAndSubmit(
+            s1PanelEl, s1Reopened.panel, ${JSON.stringify(join(sshRoot, 'link-parent', 'to-real-child') + '/..')}, 'from-real-parent.txt',
+        )
+        await s1Reopened.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+
+        // 3. Real SFTP channel close -> error + Retry rebuilds channel and lists directory
+        const oldSftp = s1Reopened.tab.sshSession.sftp
+        const oldBackend = s1Reopened.panel.sftp
+        await oldSftp.close()
+        // Wait briefly for closed$ if server notifies proactively; otherwise trigger Refresh on closed channel
+        await new Promise(r => setTimeout(r, 150))
+        if (!s1Reopened.tabEl.querySelector('[data-testid="retry-button"]')) {
+            const refreshBtn = [...s1Reopened.tabEl.querySelectorAll('sftp-panel .header button')]
+                .find(btn => btn.textContent.trim() === 'Refresh')
+            refreshBtn.click()
+        }
+        const retryWaitDeadline = Date.now() + 5000
+        while (!s1Reopened.tabEl.querySelector('[data-testid="retry-button"]') && Date.now() < retryWaitDeadline) {
+            await new Promise(r => setTimeout(r, 30))
+        }
+        s1Reopened.panel.cdr.detectChanges()
+        const channelClearedOnClose = s1Reopened.tab.sshSession.sftp === null
+        const retryShownAfterClose = Boolean(s1Reopened.tabEl.querySelector('[data-testid="retry-button"]'))
+        s1Reopened.tabEl.querySelector('[data-testid="retry-button"]').click()
+        const recoverDeadline = Date.now() + 5000
+        while ((!Array.isArray(s1Reopened.panel.fileList) || s1Reopened.panel.loadError) && Date.now() < recoverDeadline) {
+            await new Promise(r => setTimeout(r, 30))
+        }
+        const retryRecovered = Boolean(
+            s1Reopened.tab.sshSession.sftp &&
+            s1Reopened.tab.sshSession.sftp !== oldSftp &&
+            s1Reopened.panel.sftp !== oldBackend &&
+            s1Reopened.panel.fileList.some(e => e.name === 'a.txt'),
+        )
+
+        // 4. Real sshd fallback: saved missing deep path & saved chmod 000 no-perm dir
+        const ssh1ScopeKey = 'coport.filePanelState.v1:' + tab1.sftpStateScope
+        await closeSftpFor('127.0.0.1')
+        window.localStorage.setItem(ssh1ScopeKey, JSON.stringify({
+            version: 1,
+            recent: [${JSON.stringify(join(sshRoot, 'readable', 'missing-a', 'missing-b'))}],
+            favorites: [${JSON.stringify(join(sshRoot, 'sub-a'))}],
+            updatedAt: Date.now(),
+        }))
+        const s1MissingFallback = await openSftpFor('127.0.0.1')
+        s1MissingFallback.panel.cdr.detectChanges()
+        const sshMissingFallback = {
+            path: s1MissingFallback.panel.path,
+            hasMarker: s1MissingFallback.panel.fileList.some(e => e.name === 'readable-marker.txt'),
+            bannerText: s1MissingFallback.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent ?? '',
+        }
+
+        await closeSftpFor('127.0.0.1')
+        window.localStorage.setItem(ssh1ScopeKey, JSON.stringify({
+            version: 1,
+            recent: [${JSON.stringify(join(sshRoot, 'readable', 'no-perm'))}],
+            favorites: [${JSON.stringify(join(sshRoot, 'sub-a'))}],
+            updatedAt: Date.now() + 1,
+        }))
+        const s1NoPermFallback = await openSftpFor('127.0.0.1')
+        s1NoPermFallback.panel.cdr.detectChanges()
+        const sshNoPermFallback = {
+            path: s1NoPermFallback.panel.path,
+            hasMarker: s1NoPermFallback.panel.fileList.some(e => e.name === 'readable-marker.txt'),
+            bannerText: s1NoPermFallback.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent ?? '',
+        }
+
+        // Restore sub-a for restart check
+        await s1NoPermFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+
+        // 5. Same host+port with empty profile.options.user but different interactive authUsername ('alice' vs 'bob')
+        await closeSftpFor('127.0.0.1')
+        const origProfileUser = tab1.profile.options.user
+        const origAuthUsername = tab1.sshSession.authUsername
+        let authUserIsolation = null
+        try {
+            tab1.profile.options.user = ''
+            tab1.sshSession.authUsername = 'alice'
+            const aliceScope = tab1.sftpStateScope
+            const aliceOpen = await openSftpFor('127.0.0.1')
+            await aliceOpen.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+            aliceOpen.panel.cdr.detectChanges()
+            aliceOpen.tabEl.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+            await closeSftpFor('127.0.0.1')
+
+            tab1.sshSession.authUsername = 'bob'
+            const bobScope = tab1.sftpStateScope
+            const bobOpen = await openSftpFor('127.0.0.1')
+            const bobInitialPath = bobOpen.panel.path
+            const bobInitialFavorites = [...bobOpen.panel.favorites]
+            await bobOpen.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-b'))})
+            bobOpen.panel.cdr.detectChanges()
+            bobOpen.tabEl.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+            await closeSftpFor('127.0.0.1')
+
+            tab1.sshSession.authUsername = 'alice'
+            const aliceReopen = await openSftpFor('127.0.0.1')
+            authUserIsolation = {
+                aliceScope,
+                bobScope,
+                bobInitialPath,
+                bobInitialFavorites,
+                aliceRestoredPath: aliceReopen.panel.path,
+                aliceRestoredFavorites: [...aliceReopen.panel.favorites],
+            }
+            await closeSftpFor('127.0.0.1')
+        } finally {
+            tab1.profile.options.user = origProfileUser
+            tab1.sshSession.authUsername = origAuthUsername
+        }
+
+        // 6. Second SSH host ('localhost') independent scope
         const s2 = await openSftpFor('localhost')
         const ssh2InitialPath = s2.panel.path
         const ssh2InitialFavorites = [...s2.panel.favorites]
@@ -560,41 +1008,61 @@ try {
         s2.panel.cdr.detectChanges()
         s2.tabEl.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
 
-        // Test CWD priority on ssh1
-        s1.tab.sftpPanelVisible = false
-        s1.panel.cdr.detectChanges()
-        const closeDeadline = Date.now() + 5000
-        while (s1.tabEl.querySelector('sftp-panel') && Date.now() < closeDeadline) {
-            await new Promise(r => setTimeout(r, 30))
-        }
-        s1.tab.session.reportedCWD = ${JSON.stringify(join(sshRoot, 'cwd-dir'))}
-        const s1Cwd = await openSftpFor('127.0.0.1')
-        const ssh1CwdPath = s1Cwd.panel.path
-        // Restore sub-a as last visited so restart verifies ssh1 persistence
-        s1Cwd.tab.session.reportedCWD = null
-        await s1Cwd.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
-
         return {
-            ssh1InitialPath,
+            ssh1InitialCwdPath,
             ssh1InitialFavorites,
             ssh1StillVisibleAfterClicks,
+            ssh1ReopenedPathOverCwd,
+            trailingSpaceResult,
+            symlinkDotDotHasReal: symlinkDotDotResult.names.includes('from-real-parent.txt'),
+            symlinkDotDotHasLinkParent: symlinkDotDotResult.names.includes('from-link-parent.txt'),
+            channelClearedOnClose,
+            retryShownAfterClose,
+            retryRecovered,
+            sshMissingFallback,
+            sshNoPermFallback,
+            authUserIsolation,
             ssh2InitialPath,
             ssh2InitialFavorites,
-            ssh1CwdPath,
-            ssh1FinalPath: s1Cwd.panel.path,
             ssh2FinalPath: s2.panel.path,
         }
-    })()`, 15000)
-    assert.deepEqual(sshIsolationPhase1, {
-        ssh1InitialPath: '/',
-        ssh1InitialFavorites: [],
-        ssh1StillVisibleAfterClicks: true,
-        ssh2InitialPath: '/',
-        ssh2InitialFavorites: [],
-        ssh1CwdPath: join(sshRoot, 'cwd-dir'),
-        ssh1FinalPath: join(sshRoot, 'sub-a'),
-        ssh2FinalPath: join(sshRoot, 'sub-b'),
+    })()`, 25000)
+    assert.equal(sshIsolationPhase1.ssh1InitialCwdPath, join(sshRoot, 'cwd-dir'))
+    assert.deepEqual(sshIsolationPhase1.ssh1InitialFavorites, [])
+    assert.equal(sshIsolationPhase1.ssh1StillVisibleAfterClicks, true)
+    assert.equal(sshIsolationPhase1.ssh1ReopenedPathOverCwd, join(sshRoot, 'sub-a'))
+    assert.equal(sshIsolationPhase1.trailingSpaceResult.path, join(sshRoot, 'trail '))
+    assert.ok(sshIsolationPhase1.trailingSpaceResult.names.includes('space-marker.txt'))
+    assert.equal(sshIsolationPhase1.symlinkDotDotHasReal, true)
+    assert.equal(sshIsolationPhase1.symlinkDotDotHasLinkParent, false)
+    assert.equal(sshIsolationPhase1.channelClearedOnClose, true)
+    assert.equal(sshIsolationPhase1.retryShownAfterClose, true)
+    assert.equal(sshIsolationPhase1.retryRecovered, true)
+    assert.equal(sshIsolationPhase1.sshMissingFallback.path, join(sshRoot, 'readable'))
+    assert.equal(sshIsolationPhase1.sshMissingFallback.hasMarker, true)
+    assert.ok(
+        sshIsolationPhase1.sshMissingFallback.bannerText.includes('missing-a/missing-b') &&
+        sshIsolationPhase1.sshMissingFallback.bannerText.includes(join(sshRoot, 'readable')),
+        sshIsolationPhase1.sshMissingFallback.bannerText,
+    )
+    assert.equal(sshIsolationPhase1.sshNoPermFallback.path, join(sshRoot, 'readable'))
+    assert.equal(sshIsolationPhase1.sshNoPermFallback.hasMarker, true)
+    assert.ok(
+        sshIsolationPhase1.sshNoPermFallback.bannerText.includes('no-perm') &&
+        sshIsolationPhase1.sshNoPermFallback.bannerText.includes(join(sshRoot, 'readable')),
+        sshIsolationPhase1.sshNoPermFallback.bannerText,
+    )
+    assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
+        aliceScope: `ssh:alice@127.0.0.1:${port}`,
+        bobScope: `ssh:bob@127.0.0.1:${port}`,
+        bobInitialPath: '/',
+        bobInitialFavorites: [],
+        aliceRestoredPath: join(sshRoot, 'sub-a'),
+        aliceRestoredFavorites: [join(sshRoot, 'sub-a')],
     })
+    assert.equal(sshIsolationPhase1.ssh2InitialPath, '/')
+    assert.deepEqual(sshIsolationPhase1.ssh2InitialFavorites, [])
+    assert.equal(sshIsolationPhase1.ssh2FinalPath, join(sshRoot, 'sub-b'))
 
     // Phase 2: Restart isolated Electron app with the SAME --user-data-dir to verify persistence, cross-device ADB sharing, fallback banner, root failure Retry, plus all M3 regressions
     await stop(app)
@@ -665,6 +1133,44 @@ try {
     })()`)
     await waitFor(() => evalJs("cpPanelForEl(cpAdbTabEl('embedded'))?.path === '/etc' && Array.isArray(cpPanelForEl(cpAdbTabEl('embedded'))?.fileList)"))
 
+    // Verify same-window two open ADB panels immediately sync favorites & chips
+    const sameWindowSync = await evalJs(`(() => {
+        const tab1El = cpAdbTabEl('embedded')
+        const tab2El = cpAdbTabEl('two')
+        const p1 = cpPanelForEl(tab1El)
+        const p2 = cpPanelForEl(tab2El)
+        // Both are at /etc and /etc is currently starred; unstar on tab1 first
+        tab1El.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+        const p2FavAfterUnstar = p2.isCurrentPathFavorite
+        const p2ChipAfterUnstar = Boolean(tab2El.querySelector('sftp-panel [data-testid="favorite-chip"][data-path="/etc"]'))
+        // Star on tab1 -> tab2 must immediately sync
+        tab1El.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+        const p2FavAfterStar = p2.isCurrentPathFavorite
+        const p2ChipAfterStar = Boolean(tab2El.querySelector('sftp-panel [data-testid="favorite-chip"][data-path="/etc"]'))
+        // Click star on tab2 -> must toggle cleanly in sync with displayed state
+        tab2El.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+        const p2FavAfterOwnToggle = p2.isCurrentPathFavorite
+        const p1FavAfterTab2Toggle = p1.isCurrentPathFavorite
+        // Restore /etc favorite
+        tab1El.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
+        return {
+            p2FavAfterUnstar,
+            p2ChipAfterUnstar,
+            p2FavAfterStar,
+            p2ChipAfterStar,
+            p2FavAfterOwnToggle,
+            p1FavAfterTab2Toggle,
+        }
+    })()`)
+    assert.deepEqual(sameWindowSync, {
+        p2FavAfterUnstar: false,
+        p2ChipAfterUnstar: false,
+        p2FavAfterStar: true,
+        p2ChipAfterStar: true,
+        p2FavAfterOwnToggle: false,
+        p1FavAfterTab2Toggle: false,
+    })
+
     // Verify root '/' disconnect failure shows error + Retry button and recovers after reconnect
     await evalJs(`(async () => {
         await cpPanelForEl(cpAdbTabEl('embedded')).navigate('/')
@@ -716,8 +1222,12 @@ try {
     const sshAfterRestart = await evalJs(`(async () => {
         const openAndRead = async host => {
             const tabEl = cpSshTabEl(host)
-            const tab = cpComponentEl(tabEl)
-            await tab.openSFTP()
+            const sftpBtn = [...tabEl.querySelectorAll('terminal-toolbar button')]
+                .find(item => item.textContent.trim() === 'SFTP')
+            if (!sftpBtn) {
+                throw new Error('Missing SFTP toolbar button for ' + host)
+            }
+            sftpBtn.click()
             const deadline = Date.now() + 5000
             while (!Array.isArray(cpPanelForEl(tabEl)?.fileList) && Date.now() < deadline) {
                 await new Promise(r => setTimeout(r, 30))
@@ -742,7 +1252,11 @@ try {
         }
         const ssh1 = cpComponentEl(cpSshTabEl('127.0.0.1'))
         if (ssh1) ssh1.sftpPanelVisible = false
-        window.localStorage.removeItem('coport.filePanelState.v1')
+        for (const key of Object.keys(window.localStorage)) {
+            if (key === 'coport.filePanelState.v1' || key.startsWith('coport.filePanelState.v1:')) {
+                window.localStorage.removeItem(key)
+            }
+        }
         return true
     })()`)
     await waitFor(() => evalJs("document.querySelectorAll('coport-adb-tab').length === 0 && document.querySelectorAll('ssh-tab').length === 1"))
@@ -1032,20 +1546,24 @@ try {
         noSdcardBoot,
         filterAndKeyboard: {
             callsAfterType: filterAndKeyboard.callsAfterType,
-            filteredNames: filterAndKeyboard.filteredNames,
+            domFilteredNames: filterAndKeyboard.domFilteredNames,
+            activeIsFilterInputAfterFirstKey: filterAndKeyboard.activeIsFilterInputAfterFirstKey,
             drillPath: filterAndKeyboard.drillPath,
             pathAfterBackspace: filterAndKeyboard.pathAfterBackspace,
             goUpKeptOnNoMatch: filterAndKeyboard.goUpKeptOnNoMatch,
             panelStillOpenAfterEsc: filterAndKeyboard.panelStillOpenAfterEsc,
         },
+        filteredActions,
+        staleOps,
         bulkBench: {
             total: bulkBench.total,
             readdirCalls: bulkBench.readdirCalls,
             maxMs: Number(bulkBench.maxMs.toFixed(2)),
-            gCompCount: bulkBench.gCompCount,
+            domSnapshots: bulkBench.domSnapshots,
         },
         pathBarAndManualError,
         favoritesFlow,
+        sameWindowSync,
         sshIsolationPhase1,
         adbAfterRestart,
         adbFallback: { path: adbFallback.path, favorites: adbFallback.favorites, bannerText: adbFallback.bannerText },
@@ -1077,5 +1595,6 @@ try {
     await mcp?.close().catch(() => null)
     await stop(app)
     await stop(sshd)
+    await chmod(join(sshRoot, 'readable', 'no-perm'), 0o700).catch(() => null)
     await rm(run, { recursive: true, force: true })
 }

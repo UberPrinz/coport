@@ -1,8 +1,10 @@
+import type { Observable } from 'rxjs'
 import type { FileDownload, FileUpload } from 'tabby-core'
 import type { SFTPFile } from '../session/sftp'
 
 export interface FileBackend {
     atomicDownloads?: boolean
+    closed$?: Observable<void>
     normalizePath?: (path: string) => string
     isDirectoryUnavailable?: (error: unknown) => boolean
     readdir: (path: string) => Promise<SFTPFile[]>

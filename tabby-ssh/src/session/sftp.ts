@@ -49,9 +49,14 @@ export class SFTPSession implements FileBackend {
     private closed = new Subject<void>()
     private logger: Logger
 
-    constructor (private sftp: russh.SFTP, injector: Injector) {
+    constructor (
+        private sftp: russh.SFTP,
+        injector: Injector,
+        private onInvalidate?: () => void,
+    ) {
         this.logger = injector.get(LogService).create('sftp')
         sftp.closed$.subscribe(() => {
+            this.onInvalidate?.()
             this.closed.next()
             this.closed.complete()
         })
@@ -63,10 +68,20 @@ export class SFTPSession implements FileBackend {
 
     async readdir (p: string): Promise<SFTPFile[]> {
         this.logger.debug('readdir', p)
-        const entries = await this.sftp.readDirectory(p)
-        return entries.map(entry => this._makeFile(
-            posixPath.join(p, entry.name), entry,
-        ))
+        try {
+            const entries = await this.sftp.readDirectory(p)
+            return entries.map(entry => {
+                const fullPath = !p || p === '/'
+                    ? `/${entry.name}`
+                    : p.endsWith('/') ? `${p}${entry.name}` : `${p}/${entry.name}`
+                return this._makeFile(fullPath, entry)
+            })
+        } catch (error) {
+            if (!this.isDirectoryUnavailable(error)) {
+                this.onInvalidate?.()
+            }
+            throw error
+        }
     }
 
     readlink (p: string): Promise<string> {
@@ -163,7 +178,7 @@ export class SFTPSession implements FileBackend {
     private _makeFile (p: string, entry: russh.SFTPDirectoryEntry): SFTPFile {
         return {
             fullPath: p,
-            name: posixPath.basename(p),
+            name: entry.name,
             isDirectory: entry.metadata.type === russh.SFTPFileType.Directory,
             isSymlink: entry.metadata.type === russh.SFTPFileType.Symlink,
             mode: entry.metadata.permissions ?? 0,

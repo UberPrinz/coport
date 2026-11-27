@@ -9,8 +9,10 @@ import {
     MAX_RECENT_PATHS,
     MAX_SSH_SCOPES,
     createSSHFilePanelScope,
+    getFilePanelScopeStorageKey,
     normalizeFilePanelPath,
-    parseFilePanelState,
+    parseFilePanelScopeRecord,
+    subscribeFilePanelStateChanges,
 } from '../src/utils/filePanelState.ts'
 import type { FilePanelStorageLike } from '../src/utils/filePanelState.ts'
 import {
@@ -28,16 +30,23 @@ import {
 function createMemoryStorage (): { storage: FilePanelStorageLike, map: Map<string, string> } {
     const map = new Map<string, string>()
     const storage: FilePanelStorageLike = {
+        get length () {
+            return map.size
+        },
+        key: index => [...map.keys()][index] ?? null,
         getItem: key => map.get(key) ?? null,
         setItem: (key, value) => {
             map.set(key, value)
+        },
+        removeItem: key => {
+            map.delete(key)
         },
     }
     return { storage, map }
 }
 
 describe('filePanelState', () => {
-    it('normalizes POSIX paths and preserves case sensitivity', () => {
+    it('normalizes POSIX paths, preserves case sensitivity, trailing spaces, and optional .. segments', () => {
         assert.equal(normalizeFilePanelPath(''), '/')
         assert.equal(normalizeFilePanelPath('   '), '/')
         assert.equal(normalizeFilePanelPath('///'), '/')
@@ -46,10 +55,14 @@ describe('filePanelState', () => {
         assert.equal(normalizeFilePanelPath('/a/../../b/c/'), '/b/c')
         assert.equal(normalizeFilePanelPath('data/local/tmp'), '/data/local/tmp')
         assert.notEqual(normalizeFilePanelPath('/Data/App'), normalizeFilePanelPath('/data/app'))
+        assert.equal(normalizeFilePanelPath('/tmp/trail '), '/tmp/trail ')
+        assert.equal(normalizeFilePanelPath('/tmp/trail /'), '/tmp/trail ')
+        assert.equal(normalizeFilePanelPath('/tmp/link/..', true), '/tmp/link/..')
+        assert.equal(normalizeFilePanelPath('/tmp//link/./../', true), '/tmp/link/..')
     })
 
-    it('isolates ADB global scope from SSH user@host:port scopes', () => {
-        const { storage } = createMemoryStorage()
+    it('isolates ADB global scope from SSH authUsername@host:port scopes using per-scope keys', () => {
+        const { storage, map } = createMemoryStorage()
         const store = new FilePanelStateStore(storage)
         const sshA = createSSHFilePanelScope('alice', '10.0.0.1', 22)
         const sshB = createSSHFilePanelScope('bob', '10.0.0.1', 22)
@@ -63,14 +76,18 @@ describe('filePanelState', () => {
         store.recordVisit(sshA, '/var/log')
         store.addFavorite(sshA, '/etc/nginx')
         store.recordVisit(sshB, '/home/bob')
+        store.addFavorite(sshB, '/srv/bob')
         store.recordVisit(sshPort, '/opt/app')
 
+        assert.ok(map.has(getFilePanelScopeStorageKey(ADB_FILE_PANEL_SCOPE)))
+        assert.ok(map.has(getFilePanelScopeStorageKey(sshA)))
+        assert.ok(map.has(getFilePanelScopeStorageKey(sshB)))
         assert.equal(store.getLastPath(ADB_FILE_PANEL_SCOPE), '/data/local/tmp')
         assert.deepEqual(store.getFavorites(ADB_FILE_PANEL_SCOPE), ['/vendor/etc'])
         assert.equal(store.getLastPath(sshA), '/var/log')
         assert.deepEqual(store.getFavorites(sshA), ['/etc/nginx'])
         assert.equal(store.getLastPath(sshB), '/home/bob')
-        assert.deepEqual(store.getFavorites(sshB), [])
+        assert.deepEqual(store.getFavorites(sshB), ['/srv/bob'])
         assert.equal(store.getLastPath(sshPort), '/opt/app')
         assert.equal(store.getLastPath(null), null)
     })
@@ -134,38 +151,129 @@ describe('filePanelState', () => {
         assert.equal(store.getLastPath(createSSHFilePanelScope('u', 'host-1', 22)), null)
     })
 
-    it('reloads and merges multi-window writes without clobbering sibling scopes', () => {
+    it('never evicts the newly written 51st SSH host when two stores share the same Date.now() millisecond', () => {
         const { storage } = createMemoryStorage()
-        const windowA = new FilePanelStateStore(storage)
-        const windowB = new FilePanelStateStore(storage)
+        const store1 = new FilePanelStateStore(storage)
+        const store2 = new FilePanelStateStore(storage)
+        const originalNow = Date.now
+        Date.now = () => 1700000000000
+        try {
+            store1.recordVisit(ADB_FILE_PANEL_SCOPE, '/etc')
+            for (let i = 1; i <= MAX_SSH_SCOPES; i++) {
+                store1.recordVisit(createSSHFilePanelScope('dev', `host-${String(i).padStart(2, '0')}`, 22), `/srv/${i}`)
+            }
+            const host51 = createSSHFilePanelScope('dev', 'host-51', 22)
+            store2.recordVisit(host51, '/srv/51')
 
-        windowA.recordVisit(ADB_FILE_PANEL_SCOPE, '/data')
-        windowB.recordVisit('ssh:dev@host-b:22', '/srv')
-        windowA.addFavorite(ADB_FILE_PANEL_SCOPE, '/etc')
+            const snapshot = store2.getSnapshot()
+            const sshScopes = Object.keys(snapshot.scopes).filter(key => key.startsWith('ssh:'))
+            assert.equal(sshScopes.length, MAX_SSH_SCOPES)
+            assert.equal(store2.getLastPath(host51), '/srv/51')
+            assert.equal(store1.getLastPath(host51), '/srv/51')
+            assert.equal(store2.getLastPath(createSSHFilePanelScope('dev', 'host-01', 22)), null)
+            assert.equal(store2.getLastPath(createSSHFilePanelScope('dev', 'host-02', 22)), '/srv/2')
+            assert.equal(store2.getLastPath(ADB_FILE_PANEL_SCOPE), '/etc')
+        } finally {
+            Date.now = originalNow
+        }
+    })
 
-        assert.equal(windowB.getLastPath(ADB_FILE_PANEL_SCOPE), '/data')
-        assert.deepEqual(windowB.getFavorites(ADB_FILE_PANEL_SCOPE), ['/etc'])
-        assert.equal(windowA.getLastPath('ssh:dev@host-b:22'), '/srv')
+    it('preserves interleaved multi-window writes to different scopes without lost updates', () => {
+        const map = new Map<string, string>()
+        let interleaved = false
+        let windowBRef: FilePanelStateStore | null = null
+
+        const baseStorage: FilePanelStorageLike = {
+            get length () {
+                return map.size
+            },
+            key: index => [...map.keys()][index] ?? null,
+            getItem: key => map.get(key) ?? null,
+            setItem: (key, value) => {
+                map.set(key, value)
+            },
+            removeItem: key => {
+                map.delete(key)
+            },
+        }
+
+        // Simulate Window B interleaving a full read-modify-write on ssh:host-b
+        // right between Window A's read and write of adb:shared.
+        const windowAStorage: FilePanelStorageLike = {
+            get length () {
+                return baseStorage.length
+            },
+            key: index => baseStorage.key(index),
+            getItem: key => {
+                const value = baseStorage.getItem(key)
+                if (!interleaved && key === getFilePanelScopeStorageKey(ADB_FILE_PANEL_SCOPE) && windowBRef) {
+                    interleaved = true
+                    windowBRef.recordVisit('ssh:dev@host-b:22', '/srv/b')
+                    windowBRef.addFavorite('ssh:dev@host-b:22', '/etc/b')
+                }
+                return value
+            },
+            setItem: (key, value) => baseStorage.setItem(key, value),
+            removeItem: key => baseStorage.removeItem(key),
+        }
+
+        const windowA = new FilePanelStateStore(windowAStorage)
+        const windowB = new FilePanelStateStore(baseStorage)
+        windowBRef = windowB
+
+        windowA.recordVisit(ADB_FILE_PANEL_SCOPE, '/data/a')
+        windowA.addFavorite(ADB_FILE_PANEL_SCOPE, '/etc/a')
+
+        assert.equal(interleaved, true)
+        assert.equal(windowB.getLastPath(ADB_FILE_PANEL_SCOPE), '/data/a')
+        assert.deepEqual(windowB.getFavorites(ADB_FILE_PANEL_SCOPE), ['/etc/a'])
+        assert.equal(windowA.getLastPath('ssh:dev@host-b:22'), '/srv/b')
+        assert.deepEqual(windowA.getFavorites('ssh:dev@host-b:22'), ['/etc/b'])
+    })
+
+    it('notifies same-window subscribers upon successful storage writes', () => {
+        const { storage } = createMemoryStorage()
+        const store = new FilePanelStateStore(storage)
+        const events: string[] = []
+        const unsubscribe = subscribeFilePanelStateChanges(event => {
+            events.push(`${event.scope}:${event.storageKey}`)
+        })
+        try {
+            store.addFavorite(ADB_FILE_PANEL_SCOPE, '/etc')
+            assert.deepEqual(events, [`${ADB_FILE_PANEL_SCOPE}:${getFilePanelScopeStorageKey(ADB_FILE_PANEL_SCOPE)}`])
+        } finally {
+            unsubscribe()
+        }
+        store.removeFavorite(ADB_FILE_PANEL_SCOPE, '/etc')
+        assert.equal(events.length, 1)
     })
 
     it('tolerates corrupted JSON, unsupported versions, and QuotaExceededError writes', () => {
-        assert.deepEqual(parseFilePanelState('{broken json'), { version: 1, scopes: {} })
-        assert.deepEqual(parseFilePanelState(JSON.stringify({ version: 2, scopes: {} })), { version: 1, scopes: {} })
-        assert.deepEqual(parseFilePanelState(JSON.stringify({
+        assert.deepEqual(parseFilePanelScopeRecord('{broken json'), { recent: [], favorites: [], updatedAt: 0 })
+        assert.deepEqual(parseFilePanelScopeRecord(JSON.stringify({ version: 2, recent: ['/x'], favorites: [], updatedAt: 1 })), {
+            recent: [],
+            favorites: [],
+            updatedAt: 0,
+        })
+        assert.deepEqual(parseFilePanelScopeRecord(JSON.stringify({
             version: 1,
-            scopes: { '__proto__': { recent: ['/evil'], favorites: [], updatedAt: 1 }, 'adb:shared': { recent: ['/ok//'], favorites: ['/fav'], updatedAt: 5 } },
+            recent: ['/ok//', '/ok'],
+            favorites: ['/fav/'],
+            updatedAt: 5,
         })), {
-            version: 1,
-            scopes: {
-                'adb:shared': { recent: ['/ok'], favorites: ['/fav'], updatedAt: 5 },
-            },
+            recent: ['/ok'],
+            favorites: ['/fav'],
+            updatedAt: 5,
         })
 
         const quotaStorage: FilePanelStorageLike = {
+            length: 0,
+            key: () => null,
             getItem: () => null,
             setItem: () => {
                 throw new Error('QuotaExceededError')
             },
+            removeItem: () => undefined,
         }
         const store = new FilePanelStateStore(quotaStorage, FILE_PANEL_STATE_STORAGE_KEY)
         assert.doesNotThrow(() => {
@@ -252,7 +360,9 @@ describe('filePanelFallback', () => {
         assert.equal(isAdbDirectoryUnavailableError(new Error('device offline')), false)
 
         assert.equal(isSFTPDirectoryUnavailableError(new Error('No such file')), true)
+        assert.equal(isSFTPDirectoryUnavailableError(new Error('NoSuchFile')), true)
         assert.equal(isSFTPDirectoryUnavailableError(new Error('Permission denied')), true)
+        assert.equal(isSFTPDirectoryUnavailableError(new Error('PermissionDenied')), true)
         assert.equal(isSFTPDirectoryUnavailableError(new Error('Not a directory')), true)
         assert.equal(isSFTPDirectoryUnavailableError(Object.assign(new Error('failed'), { code: 'ENOENT' })), true)
         assert.equal(isSFTPDirectoryUnavailableError(Object.assign(new Error('failed'), { code: 2 })), true)
@@ -319,6 +429,32 @@ describe('filePanelFilter', () => {
             { text: 'test', highlighted: true },
             { text: '</b>', highlighted: false },
         ])
+    })
+
+    it('maps highlight ranges accurately when toLowerCase() expands UTF-16 length (e.g. İxa.txt)', () => {
+        const matchX = matchFileName('İxa.txt', 'x')
+        assert.ok(matchX)
+        assert.equal(matchX.tier, 2)
+        assert.deepEqual(matchX.ranges, [[1, 2]])
+        assert.deepEqual(splitTextByHighlights('İxa.txt', matchX.ranges), [
+            { text: 'İ', highlighted: false },
+            { text: 'x', highlighted: true },
+            { text: 'a.txt', highlighted: false },
+        ])
+
+        const matchPrefix = matchFileName('İxa.txt', 'İx')
+        assert.ok(matchPrefix)
+        assert.equal(matchPrefix.tier, 1)
+        assert.deepEqual(matchPrefix.ranges, [[0, 2]])
+        assert.deepEqual(splitTextByHighlights('İxa.txt', matchPrefix.ranges), [
+            { text: 'İx', highlighted: true },
+            { text: 'a.txt', highlighted: false },
+        ])
+
+        const matchSubseq = matchFileName('İxa.txt', 'xtt')
+        assert.ok(matchSubseq)
+        assert.equal(matchSubseq.tier, 3)
+        assert.deepEqual(matchSubseq.ranges, [[1, 2], [4, 5], [6, 7]])
     })
 
     it('preserves directory-first lexicographical order when query is empty', () => {

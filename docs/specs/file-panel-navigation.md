@@ -27,7 +27,7 @@
 | Total Commander Quick Filter（跨行业交互借鉴） | 面板内直接输入即增量隐藏不匹配项，`Esc` 立即还原完整列表，适合高频目录钻取 | 已有充分证据：Total Commander 长期稳定特性 | [Total Commander Quick Search / Quick Filter](https://www.ghisler.ch/wiki/index.php/Quick_search)（2026-11-27 查证） | 采用其「直接输入默认过滤而非仅跳转光标」与 `Esc` 还原语义 |
 | 仓库既有 `fuzzy-search`（评估复用） | `tabby-core` 的 `SelectorModalComponent` 已依赖 `fuzzy-search`，可做基础模糊筛选 | 有条件可用：仅返回匹配对象数组，不提供命中字符索引区间，且 `tabby-ssh/package.json` 未声明该依赖 | 仓库源码 `tabby-core/src/components/selectorModal.component.ts:4`（2026-11-27 核实） | 排除。无法在不二次扫描/自研的前提下提供命中字符高亮与可控的分级排序，且不希望为上游 `tabby-ssh` 新增第三方依赖 |
 | 轻量自研顺序子序列 + 子串分级匹配器（必要自研） | ~80 行零依赖纯 TypeScript 函数，一次遍历完成精确/前缀/子串/子序列分级打分并返回合并后的 `[start, end)` 高亮区间，1,000 条目耗时 < 2 ms | 已有充分证据：无外部依赖，纯算法可直接在 L0 `node --test` 验证性能与边界 | 本文设计 `tabby-ssh/src/utils/filePanelFilter.ts` | 采用。零新增依赖、满足 ≤ 16 ms 性能指标、支持安全模板分段渲染（无 `innerHTML`） |
-| Tabby `window.localStorage`（直接复用） | Tabby 既有 UI 状态（`recentProfiles`、`tabsRecovery`、`profileTreeWidth`、`sshCWDTipDismissed`）均存放在 `window.localStorage`，自动随 Electron `--user-data-dir` 隔离，支持跨窗口 `storage` 事件 | 已有充分证据：Tabby 1.0.238 生产代码及 `sftpPanel.component.ts:380` 现已使用 | 仓库源码 `tabby-core/src/services/profiles.service.ts:205`、`tabby-ssh/src/components/sftpPanel.component.ts:380`（2026-11-27 核实） | 采用。新键 `coport.filePanelState.v1` 零迁移成本、天然兼容现有 `coport_shells.mjs` 隔离数据目录重启验证；读写前重新加载合并避免多窗口覆盖 |
+| Tabby `window.localStorage`（直接复用） | Tabby 既有 UI 状态（`recentProfiles`、`tabsRecovery`、`profileTreeWidth`、`sshCWDTipDismissed`）均存放在 `window.localStorage`，自动随 Electron `--user-data-dir` 隔离，支持跨窗口 `storage` 事件 | 已有充分证据：Tabby 1.0.238 生产代码及 `sftpPanel.component.ts:380` 现已使用 | 仓库源码 `tabby-core/src/services/profiles.service.ts:205`、`tabby-ssh/src/components/sftpPanel.component.ts:380`（2026-11-27 核实） | 采用。按作用域独立键 `coport.filePanelState.v1:<scope>` 存储，零迁移成本、消除跨作用域多窗口写入互相覆盖，且天然兼容现有 `coport_shells.mjs` 隔离数据目录重启验证 |
 | Tabby `ConfigService` / `config.yaml`（评估复用） | 适合用户显式编辑的配置项，但高频目录切换会频繁触发全量 YAML 序列化落盘，且目录路径属于运行态导航历史而非静态配置 | 已有充分证据：Tabby 自身亦将 `recentProfiles` 等高频导航状态放入 `localStorage` 而非 `config.yaml` | 仓库源码 `tabby-core/src/services/config.service.ts`（2026-11-27 核实） | 排除。避免高频 `cd` 导致 `config.yaml` 反复写盘和与用户手动编辑配置冲突 |
 
 无阻塞技术假设，无需前置预研。所有依赖（Angular 15 宿主事件与模板渲染、`window.localStorage`、`FileBackend`、Node 22 `node --test`、`coport_shells.mjs` Electron+ADB+sshd 仿真套件）均已在当前仓库运行并验证。
@@ -55,7 +55,7 @@ flowchart TB
             ADBFB["tabby-adb / AdbFileBackend<br/>透传 IPC error.reason"]
             SFTPS["tabby-ssh / SFTPSession<br/>russh SFTP 错误分类"]
         end
-        STORE[("window.localStorage<br/>coport.filePanelState.v1")]
+        STORE[("window.localStorage<br/>coport.filePanelState.v1:&lt;scope&gt;")]
 
         ADBTAB -->|"绑定 session/stateScope/defaultPath"| PANEL
         SSHTAB -->|"绑定 session/stateScope/initialPath"| PANEL
@@ -89,7 +89,7 @@ flowchart TB
 1. **将纯状态、过滤、回退拆为 `tabby-ssh/src/utils/` 零 Angular 依赖模块**：最小改动可直接堆进 `sftpPanel.component.ts`，但拆出纯模块后既减少对上游大文件的行级冲突，又让 L0 `node --test` 能无头直接覆盖全部边界与 1,000 条目性能阈值。
 2. **模糊匹配排序策略**：输入非空过滤词时，按「匹配档位（精确 > 前缀 > 连续子串 > 顺序子序列）→ 目录优先于文件 → 名称字典序」排序，保证最优命中排在第 0 行，配合 `Enter` 实现一步直达；过滤词为空时保持既有「目录优先 → 名称字典序」。
 3. **过滤态下的 `Backspace` 防误触**：仅当过滤输入框未处于有内容编辑态且事件非长按连发（`!event.repeat`）且过滤词为空时，`Backspace` 触发 `goUp()`，避免用户按住 `Backspace` 清空过滤词时意外退回上级目录。
-4. **单窗口/多窗口 `localStorage` 一致性**：`FilePanelStateStore` 每次写入前重新从 `localStorage` 解析最新快照并合并当前作用域变更，面板监听 `window` `storage` 事件同步收藏与历史展示，防止多窗口互相覆盖。
+4. **单窗口/多窗口 `localStorage` 一致性**：`FilePanelStateStore` 按作用域分键存储（`coport.filePanelState.v1:<scope>`），两个窗口并发写入不同作用域不会互相覆盖；每次写入生成严格大于当前快照最大时间戳的 `updatedAt` 且保护当前写入作用域不被裁剪；同窗口内通过状态变更订阅同步多标签星标与历史，跨窗口通过 `window` `storage` 事件同步。
 5. **面板布局与遮挡控制**：
    - 顶栏（`.header`）：路径面包屑（单击空白区或铅笔按钮进入编辑态，保留原双击） + 星标收藏按钮 + 收藏/历史下拉触发按钮 + Refresh / Filter / Create directory / Upload files / Upload folder / Close。
    - 收藏快捷条（`.favorites-bar`，有收藏时显示）：单行可横向滚动的紧凑标签芯片，点击直达，悬浮/尾部小 `×` 移除。
@@ -116,7 +116,7 @@ sequenceDiagram
     TAB->>P: 挂载组件(session, stateScope, initialPath?, defaultPath='/')
     P->>BE: session.openSFTP()
     P->>ST: getLastPath(stateScope)
-    Note over P: startPath = initialPath ?? savedLastPath ?? '/'
+    Note over P: startPath = savedLastPath ?? initialPath ?? '/'
     P->>FB: resolveReadableDirectory(startPath, readdir, isUnavailable, isStale)
     loop 目录不可读且未到达 '/'
         FB->>BE: readdir(currentPath)
@@ -187,15 +187,16 @@ sequenceDiagram
 | ADB 适配 | `adbFileBackend.ts` 在 `adbRequest` 抛出的 `Error` 上保留 `reason: string` 属性；`isDirectoryUnavailable` 仅在 `error.reason === 'unreadable_directory'` 时返回 `true` |
 | SFTP 适配 | `SFTPSession.isDirectoryUnavailable` 当错误包含 SFTP 缺失/权限语义（`No such file`、`Permission denied`、`Not a directory`、`ENOENT`、`EACCES`、`ENOTDIR` 或对应状态码 `2`/`3`）时返回 `true`；连接断开、超时、channel closed 返回 `false` |
 
-### 内部契约二：`localStorage` 持久化数据结构（`coport.filePanelState.v1`）
+### 内部契约二：`localStorage` 持久化数据结构（按作用域分键 `coport.filePanelState.v1:<scope>`）
+
+每个作用域独占一条键 `coport.filePanelState.v1:<scope>`，其中 `<scope>` 为 `'adb:shared'` 或 `'ssh:<authUsername>@<host>:<port>'`（SSH 优先取已认证的 `authUsername`，缺失时回退配置 `user`）。
 
 | 字段路径 | 类型 | 必填 | 含义 | 约束 |
 |---|---|---|---|---|
 | `version` | `number` | 是 | 结构版本 | 固定为 `1`；非 `1` 或非法 JSON 时按空状态降级 |
-| `scopes` | `Record<string, ScopeRecord>` | 是 | 按作用域分组的导航状态 | 键为 `'adb:shared'` 或 `'ssh:<user>@<host>:<port>'`；`ssh:*` 键总数上限 **50**（按 `updatedAt` 淘汰最久未更新项，永不淘汰 `'adb:shared'`） |
-| `scopes[key].recent` | `string[]` | 是 | 最近成功打开的目录列表 | 规范化 POSIX 绝对路径（以 `/` 开头、不含冗余 `/` 或 `.`/`..`），区分大小写去重，最近访问排首位（`recent[0]` 即上次目录），上限 **20** |
-| `scopes[key].favorites` | `string[]` | 是 | 收藏目录列表 | 规范化 POSIX 绝对路径，区分大小写去重，上限 **50**（新增超出上限时保留最新 50 条） |
-| `scopes[key].updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 用于 SSH 作用域 LRU 淘汰 |
+| `recent` | `string[]` | 是 | 最近成功打开的目录列表 | 规范化绝对路径（保留合法目录名尾随空格、区分大小写去重），最近访问排首位（`recent[0]` 即上次目录），上限 **20** |
+| `favorites` | `string[]` | 是 | 收藏目录列表 | 绝对路径，区分大小写去重，上限 **50**（新增超出上限时保留最新 50 条） |
+| `updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 严格递增（高于已有全部 SSH 作用域最大值）；`ssh:*` 键总数上限 **50**，超限时按 `updatedAt` 淘汰最久未更新项，永不淘汰当前写入作用域与 `'adb:shared'` |
 
 场景处理规则：
 
@@ -210,9 +211,9 @@ sequenceDiagram
 
 | 输入属性 | 类型 | 默认值 | 含义与调用方绑定 |
 |---|---|---|---|
-| `stateScope` | `string \| null` | `null` | 状态作用域键；`AdbTabComponent` 传 `'adb:shared'`，`SSHTabComponent` 传 `'ssh:${user}@${host}:${port}'`；为 `null` 时仅内存工作不读写存储 |
+| `stateScope` | `string \| null` | `null` | 状态作用域键；`AdbTabComponent` 传 `'adb:shared'`，`SSHTabComponent` 传 `'ssh:${authUsername || user}@${host}:${port}'`；为 `null` 时仅内存工作不读写存储 |
 | `defaultPath` | `string` | `'/'` | 无历史且无初始路径时的默认目录；`AdbTabComponent` 不再硬编码 `/sdcard`，改用 `'/'` |
-| `path` | `string \| null` | `null` | 可选初始路径（如 SSH 检测到 CWD 时传入；否则传 `null` 让面板从 `stateScope` 恢复） |
+| `path` | `string \| null` | `null` | 可选初始路径（如 SSH 检测到 CWD 时传入；仅在该作用域尚无 `savedLastPath` 时生效，已有上次目录时始终优先恢复 `savedLastPath`） |
 
 ## 验收矩阵
 
@@ -224,7 +225,7 @@ sequenceDiagram
 | 目录不可读逐级回退与瞬时错误不误回退 | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | 缺失/无权限路径逐级回退至最近可读父级并返回原目标与原因；断线/超时错误立即终止回退；并发过期请求结果被丢弃。证据：测试退出码 0 及用例名输出 |
 | 子串与模糊匹配、排序、高亮区间及 1,000 条目性能阈值 | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | 大小写不敏感子串与顺序模糊（如 `g_c`→`g_comp`）命中准确，高亮区间合并正确；1,000 条目单次过滤耗时 ≤ 16 ms（取多次实测最大值或 P95 均达标）。证据：测试退出码 0 及实测耗时日志 |
 | ADB 无 `/sdcard` 首次启动、保值恢复、跨设备共享与异常重试 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有场景，设计提议） | 伪 ADB 设备不含 `/sdcard` 时，首次打开 Files 默认成功进入 `/`（不卡 `Loading`）；切换目录后重启隔离 Electron 实例仍恢复该目录，换第二台伪 ADB 设备共享恢复；若保存目录在新设备缺失则自动回退到可读父目录并显示回退提示条；根目录断线失败显示错误与重试按钮，恢复后点击重试列出目录。证据：脚本退出码 0 及断言日志 |
-| SSH SFTP 按主机隔离保值、CWD 优先与独立收藏 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有本机 sshd 场景，设计提议） | SSH SFTP 面板独立保存上次目录与收藏，不与 ADB 及另一 SSH 主机串数据；重启后恢复正确；提供 CWD 时首次打开优先使用 CWD。证据：脚本退出码 0 及断言日志 |
+| SSH SFTP 按主机/账号隔离保值、首次 CWD 优先、逐级回退与通道恢复 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有本机 sshd 场景，设计提议） | SSH SFTP 面板按 `authUsername@host:port` 独立保存上次目录与收藏，不与 ADB、其他主机或同主机其他账号串数据；无历史且提供 CWD 时首次打开使用 CWD，已有历史后重开/重启优先恢复上次目录；真实 sshd 下缺失/无权限目录触发逐级回退并提示；SFTP 通道关闭后点击 Retry 可重建通道恢复浏览。证据：脚本退出码 0 及断言日志 |
 | 收藏星标、快捷条与历史下拉跳转和移除 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有场景，设计提议） | 星标切换收藏并持久保存；快捷条与下拉菜单中收藏排在最近目录之前；点击一键跳转、移除收藏后星标同步取消且最近目录仍保留。证据：脚本退出码 0 及断言日志 |
 | 直接敲字即过滤、键盘逐层钻取、零远端请求与 1,000 条目实时响应 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有场景，设计提议） | 未点击 Filter 按钮时向面板派发字符键即自动展开过滤并筛选列表，过滤期间 `readdir` 计数增加 0；`↑/↓` 移动选中行、`Enter` 进入子目录后自动清空过滤并保持面板焦点可继续键入；过滤为空时 `Backspace` 返回上级；`Esc` 清空过滤且面板保持打开；无匹配时显示提示并保留 `Go up`；1,000 条目目录下界面过滤耗时 ≤ 16 ms。证据：脚本退出码 0 及耗时/计数断言日志 |
 | 路径栏单击编辑与既有上传/下载/删除/拖拽/右键回归 | L2 | `node scripts/coport/sim/coport_shells.mjs`（既有 + 扩展场景） | 单击路径空白区编辑路径并回车跳转、`Esc` 取消恢复；过滤状态下点击/Enter/右键作用于实际选中项；既有 ADB 与 SSH 上传、下载、目录上传、新建目录、删除、符号链接回归全部通过。证据：脚本退出码 0 |

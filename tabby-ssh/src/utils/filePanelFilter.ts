@@ -90,12 +90,48 @@ export function splitTextByHighlights (text: string, ranges: readonly (readonly 
     return segments
 }
 
+function buildLowerToOrigMap (name: string): { lower: string, map: number[] } {
+    let lower = ''
+    const map: number[] = []
+    for (let i = 0; i < name.length; ) {
+        const code = name.charCodeAt(i)
+        const step = code >= 0xD800 && code <= 0xDBFF && i + 1 < name.length ? 2 : 1
+        const chunk = name.slice(i, i + step)
+        const low = chunk.toLowerCase()
+        lower += low
+        for (let j = 0; j < low.length; j++) {
+            map.push(i + Math.min(j, step - 1))
+        }
+        i += step
+    }
+    return { lower, map }
+}
+
+function mapLowerSpanToRanges (
+    start: number,
+    end: number,
+    map: readonly number[] | null,
+    nameLength: number,
+): (readonly [number, number])[] {
+    if (!map) {
+        return [[start, Math.min(end, nameLength)]]
+    }
+    const indices: number[] = []
+    for (let i = start; i < end && i < map.length; i++) {
+        indices.push(map[i])
+    }
+    return mergeHighlightRanges(indices)
+}
+
 export function matchFileName (name: string, query: string): FileMatchResult | null {
     const lowerQuery = query.toLowerCase()
     if (!lowerQuery) {
         return { tier: 0, ranges: [] }
     }
-    const lowerName = name.toLowerCase()
+    const fastLower = name.toLowerCase()
+    const mapped = fastLower.length === name.length ? null : buildLowerToOrigMap(name)
+    const lowerName = mapped ? mapped.lower : fastLower
+    const lowerToOrig = mapped ? mapped.map : null
     const queryLen = lowerQuery.length
     const nameLen = lowerName.length
 
@@ -113,7 +149,7 @@ export function matchFileName (name: string, query: string): FileMatchResult | n
     if (lowerName.startsWith(lowerQuery)) {
         return {
             tier: 1,
-            ranges: [[0, Math.min(queryLen, name.length)]],
+            ranges: mapLowerSpanToRanges(0, queryLen, lowerToOrig, name.length),
         }
     }
 
@@ -121,7 +157,7 @@ export function matchFileName (name: string, query: string): FileMatchResult | n
     if (substringIndex !== -1) {
         return {
             tier: 2,
-            ranges: [[substringIndex, Math.min(substringIndex + queryLen, name.length)]],
+            ranges: mapLowerSpanToRanges(substringIndex, substringIndex + queryLen, lowerToOrig, name.length),
         }
     }
 
@@ -129,7 +165,7 @@ export function matchFileName (name: string, query: string): FileMatchResult | n
     let queryPos = 0
     for (let namePos = 0; namePos < nameLen && queryPos < queryLen; namePos++) {
         if (lowerName.charCodeAt(namePos) === lowerQuery.charCodeAt(queryPos)) {
-            matchedIndices.push(namePos)
+            matchedIndices.push(lowerToOrig ? lowerToOrig[namePos] : namePos)
             queryPos++
         }
     }

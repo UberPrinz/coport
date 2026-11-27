@@ -1,4 +1,5 @@
 export const FILE_PANEL_STATE_STORAGE_KEY = 'coport.filePanelState.v1'
+export const FILE_PANEL_STATE_KEY_PREFIX = `${FILE_PANEL_STATE_STORAGE_KEY}:`
 export const FILE_PANEL_STATE_VERSION = 1
 export const ADB_FILE_PANEL_SCOPE = 'adb:shared'
 export const MAX_RECENT_PATHS = 20
@@ -13,24 +14,67 @@ export interface FilePanelScopeRecord {
     updatedAt: number
 }
 
+export interface StoredFilePanelScopeRecord extends FilePanelScopeRecord {
+    version: 1
+}
+
 export interface FilePanelStateSnapshot {
     version: 1
     scopes: Record<string, FilePanelScopeRecord>
 }
 
 export interface FilePanelStorageLike {
+    readonly length: number
+    key: (index: number) => string | null
     getItem: (key: string) => string | null
     setItem: (key: string, value: string) => void
+    removeItem: (key: string) => void
 }
 
-export function createSSHFilePanelScope (user: string, host: string, port?: number | null): string {
-    const normalizedUser = user.trim()
-    const normalizedHost = host.trim()
+export interface FilePanelStateChangeEvent {
+    scope: string
+    storageKey: string
+    source: FilePanelStateStore
+}
+
+export type FilePanelStateChangeListener = (event: FilePanelStateChangeEvent) => void
+
+const stateChangeListeners = new Set<FilePanelStateChangeListener>()
+
+export function subscribeFilePanelStateChanges (listener: FilePanelStateChangeListener): () => void {
+    stateChangeListeners.add(listener)
+    return () => {
+        stateChangeListeners.delete(listener)
+    }
+}
+
+function notifyFilePanelStateChanges (event: FilePanelStateChangeEvent): void {
+    for (const listener of [...stateChangeListeners]) {
+        try {
+            listener(event)
+        } catch {
+            // Keep sibling listeners isolated.
+        }
+    }
+}
+
+export function createSSHFilePanelScope (
+    user: string | null | undefined,
+    host: string | null | undefined,
+    port?: number | null,
+): string {
+    const normalizedUser = (user ?? '').trim()
+    const normalizedHost = (host ?? '').trim()
     const normalizedPort = typeof port === 'number' && Number.isFinite(port) && port > 0 ? Math.trunc(port) : 22
     return `ssh:${normalizedUser}@${normalizedHost}:${normalizedPort}`
 }
 
-export function normalizeFilePanelPath (rawPath: string): string {
+export function getFilePanelScopeStorageKey (scope: string, keyPrefix = FILE_PANEL_STATE_KEY_PREFIX): string {
+    const normalizedPrefix = keyPrefix.endsWith(':') ? keyPrefix : `${keyPrefix}:`
+    return `${normalizedPrefix}${scope}`
+}
+
+export function normalizeFilePanelPath (rawPath: string, preserveDotDot = false): string {
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
         return '/'
     }
@@ -40,7 +84,7 @@ export function normalizeFilePanelPath (rawPath: string): string {
         if (!segment || segment === '.') {
             continue
         }
-        if (segment === '..') {
+        if (segment === '..' && !preserveDotDot) {
             resolved.pop()
         } else {
             resolved.push(segment)
@@ -49,14 +93,18 @@ export function normalizeFilePanelPath (rawPath: string): string {
     return resolved.length > 0 ? `/${resolved.join('/')}` : '/'
 }
 
-function dedupeAndCapPaths (paths: readonly unknown[], limit: number): string[] {
+function shouldPreserveDotDot (scope: string): boolean {
+    return scope.startsWith('ssh:')
+}
+
+function dedupeAndCapPaths (paths: readonly unknown[], limit: number, preserveDotDot = false): string[] {
     const result: string[] = []
     const seen = new Set<string>()
     for (const entry of paths) {
         if (typeof entry !== 'string') {
             continue
         }
-        const normalized = normalizeFilePanelPath(entry)
+        const normalized = normalizeFilePanelPath(entry, preserveDotDot)
         if (seen.has(normalized)) {
             continue
         }
@@ -69,10 +117,11 @@ function dedupeAndCapPaths (paths: readonly unknown[], limit: number): string[] 
     return result
 }
 
-function createEmptySnapshot (): FilePanelStateSnapshot {
+function createEmptyRecord (): FilePanelScopeRecord {
     return {
-        version: FILE_PANEL_STATE_VERSION,
-        scopes: {},
+        recent: [],
+        favorites: [],
+        updatedAt: 0,
     }
 }
 
@@ -80,70 +129,43 @@ function isPlainRecord (value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function pruneSSHScopes (scopes: Record<string, FilePanelScopeRecord>): void {
-    const sshKeys = Object.keys(scopes).filter(key => key.startsWith('ssh:'))
-    if (sshKeys.length <= MAX_SSH_SCOPES) {
-        return
-    }
-    sshKeys.sort((a, b) => {
-        const diff = scopes[a].updatedAt - scopes[b].updatedAt
-        if (diff !== 0) {
-            return diff
-        }
-        return a < b ? -1 : a > b ? 1 : 0
-    })
-    const excess = sshKeys.length - MAX_SSH_SCOPES
-    for (let i = 0; i < excess; i++) {
-        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-        delete scopes[sshKeys[i]]
-    }
-}
-
-export function parseFilePanelState (raw: string | null | undefined): FilePanelStateSnapshot {
+export function parseFilePanelScopeRecord (
+    raw: string | null | undefined,
+    preserveDotDot = false,
+): FilePanelScopeRecord {
     if (!raw || typeof raw !== 'string') {
-        return createEmptySnapshot()
+        return createEmptyRecord()
     }
     let parsed: unknown = null
     try {
         parsed = JSON.parse(raw)
     } catch {
-        return createEmptySnapshot()
+        return createEmptyRecord()
     }
-    if (!isPlainRecord(parsed) || parsed.version !== FILE_PANEL_STATE_VERSION || !isPlainRecord(parsed.scopes)) {
-        return createEmptySnapshot()
-    }
-
-    const scopes: Record<string, FilePanelScopeRecord> = {}
-    for (const [scopeKey, rawScope] of Object.entries(parsed.scopes)) {
-        if (!scopeKey || FORBIDDEN_KEYS.has(scopeKey) || !isPlainRecord(rawScope)) {
-            continue
-        }
-        const recent = Array.isArray(rawScope.recent)
-            ? dedupeAndCapPaths(rawScope.recent, MAX_RECENT_PATHS)
-            : []
-        const favorites = Array.isArray(rawScope.favorites)
-            ? dedupeAndCapPaths(rawScope.favorites, MAX_FAVORITE_PATHS)
-            : []
-        const updatedAt = typeof rawScope.updatedAt === 'number' && Number.isFinite(rawScope.updatedAt)
-            ? rawScope.updatedAt
-            : 0
-        scopes[scopeKey] = {
-            recent,
-            favorites,
-            updatedAt,
-        }
+    if (!isPlainRecord(parsed) || parsed.version !== FILE_PANEL_STATE_VERSION) {
+        return createEmptyRecord()
     }
 
-    pruneSSHScopes(scopes)
+    const recent = Array.isArray(parsed.recent)
+        ? dedupeAndCapPaths(parsed.recent, MAX_RECENT_PATHS, preserveDotDot)
+        : []
+    const favorites = Array.isArray(parsed.favorites)
+        ? dedupeAndCapPaths(parsed.favorites, MAX_FAVORITE_PATHS, preserveDotDot)
+        : []
+    const updatedAt = typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt)
+        ? parsed.updatedAt
+        : 0
+
     return {
-        version: FILE_PANEL_STATE_VERSION,
-        scopes,
+        recent,
+        favorites,
+        updatedAt,
     }
 }
 
 export function cloneFilePanelScopeRecord (record: FilePanelScopeRecord | undefined): FilePanelScopeRecord {
     if (!record) {
-        return { recent: [], favorites: [], updatedAt: 0 }
+        return createEmptyRecord()
     }
     return {
         recent: [...record.recent],
@@ -154,67 +176,190 @@ export function cloneFilePanelScopeRecord (record: FilePanelScopeRecord | undefi
 
 export class FilePanelStateStore {
     private storage: FilePanelStorageLike | null
-    private storageKey: string
-    private memoryState: FilePanelStateSnapshot = createEmptySnapshot()
-    private lastStorageRaw: string | null = null
-    private hasLoadedFromStorage = false
-    private writeFailed = false
+    private keyPrefix: string
+    private sshKeyPrefix: string
+    private memoryScopes = new Map<string, FilePanelScopeRecord>()
+    private writeFailedScopes = new Set<string>()
     private lastTimestamp = 0
 
     constructor (
         storage?: FilePanelStorageLike | null,
-        storageKey = FILE_PANEL_STATE_STORAGE_KEY,
+        storageKeyPrefix = FILE_PANEL_STATE_STORAGE_KEY,
     ) {
         this.storage = storage ?? null
-        this.storageKey = storageKey
+        this.keyPrefix = storageKeyPrefix.endsWith(':') ? storageKeyPrefix : `${storageKeyPrefix}:`
+        this.sshKeyPrefix = `${this.keyPrefix}ssh:`
+    }
+
+    getScopeStorageKey (scope: string): string {
+        return `${this.keyPrefix}${scope}`
+    }
+
+    private listMatchingStorageEntries (prefix: string): { key: string, scope: string, raw: string | null }[] {
+        if (!this.storage) {
+            return []
+        }
+        const entries: { key: string, scope: string, raw: string | null }[] = []
+        try {
+            const count = this.storage.length
+            const keys: string[] = []
+            for (let i = 0; i < count; i++) {
+                const key = this.storage.key(i)
+                if (key && key.startsWith(prefix)) {
+                    keys.push(key)
+                }
+            }
+            for (const key of keys) {
+                const scope = key.slice(this.keyPrefix.length)
+                if (!scope || FORBIDDEN_KEYS.has(scope)) {
+                    continue
+                }
+                entries.push({
+                    key,
+                    scope,
+                    raw: this.storage.getItem(key),
+                })
+            }
+        } catch {
+            return []
+        }
+        return entries
+    }
+
+    private getMaxExistingSSHUpdatedAt (): number {
+        let maxUpdatedAt = 0
+        if (this.storage) {
+            for (const entry of this.listMatchingStorageEntries(this.sshKeyPrefix)) {
+                const parsed = parseFilePanelScopeRecord(entry.raw, true)
+                if (parsed.updatedAt > maxUpdatedAt) {
+                    maxUpdatedAt = parsed.updatedAt
+                }
+            }
+        }
+        for (const [scope, record] of this.memoryScopes.entries()) {
+            if (scope.startsWith('ssh:') && record.updatedAt > maxUpdatedAt) {
+                maxUpdatedAt = record.updatedAt
+            }
+        }
+        return maxUpdatedAt
     }
 
     private nextTimestamp (explicitNow?: number): number {
+        const maxExisting = this.getMaxExistingSSHUpdatedAt()
         if (typeof explicitNow === 'number' && Number.isFinite(explicitNow)) {
             this.lastTimestamp = Math.max(this.lastTimestamp, explicitNow)
             return explicitNow
         }
-        const now = Math.max(Date.now(), this.lastTimestamp + 1)
+        const now = Math.max(Date.now(), this.lastTimestamp + 1, maxExisting + 1)
         this.lastTimestamp = now
         return now
     }
 
-    private readSnapshot (): FilePanelStateSnapshot {
+    private readScopeRecord (scope: string): FilePanelScopeRecord {
         if (!this.storage) {
-            return this.memoryState
+            return cloneFilePanelScopeRecord(this.memoryScopes.get(scope))
         }
+        const storageKey = this.getScopeStorageKey(scope)
         let raw: string | null = null
         try {
-            raw = this.storage.getItem(this.storageKey)
+            raw = this.storage.getItem(storageKey)
         } catch {
-            return this.memoryState
+            return cloneFilePanelScopeRecord(this.memoryScopes.get(scope))
         }
-        if (!this.hasLoadedFromStorage || raw !== this.lastStorageRaw) {
-            if (raw === null && this.writeFailed) {
-                return this.memoryState
+        if (raw === null) {
+            if (this.writeFailedScopes.has(scope)) {
+                return cloneFilePanelScopeRecord(this.memoryScopes.get(scope))
             }
-            this.memoryState = parseFilePanelState(raw)
-            this.lastStorageRaw = raw
-            this.hasLoadedFromStorage = true
-            this.writeFailed = false
+            this.memoryScopes.delete(scope)
+            return createEmptyRecord()
         }
-        return this.memoryState
+        const parsed = parseFilePanelScopeRecord(raw, shouldPreserveDotDot(scope))
+        this.memoryScopes.set(scope, cloneFilePanelScopeRecord(parsed))
+        this.writeFailedScopes.delete(scope)
+        return parsed
     }
 
-    private writeSnapshot (snapshot: FilePanelStateSnapshot): void {
-        pruneSSHScopes(snapshot.scopes)
-        this.memoryState = snapshot
-        if (!this.storage) {
+    private pruneSSHScopes (protectedScope?: string): void {
+        if (this.storage) {
+            const sshEntries = this.listMatchingStorageEntries(this.sshKeyPrefix).map(entry => ({
+                ...entry,
+                updatedAt: parseFilePanelScopeRecord(entry.raw, true).updatedAt,
+            }))
+            if (sshEntries.length <= MAX_SSH_SCOPES) {
+                return
+            }
+            const evictable = sshEntries
+                .filter(entry => entry.scope !== protectedScope && entry.scope !== ADB_FILE_PANEL_SCOPE)
+                .sort((a, b) => {
+                    const diff = a.updatedAt - b.updatedAt
+                    if (diff !== 0) {
+                        return diff
+                    }
+                    return a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0
+                })
+            const excess = sshEntries.length - MAX_SSH_SCOPES
+            for (let i = 0; i < excess && i < evictable.length; i++) {
+                const victim = evictable[i]
+                try {
+                    this.storage.removeItem(victim.key)
+                } catch {
+                    // Best-effort LRU eviction.
+                }
+                this.memoryScopes.delete(victim.scope)
+                this.writeFailedScopes.delete(victim.scope)
+            }
             return
         }
-        const serialized = JSON.stringify(snapshot)
+
+        const sshScopes = [...this.memoryScopes.entries()]
+            .filter(([scope]) => scope.startsWith('ssh:'))
+        if (sshScopes.length <= MAX_SSH_SCOPES) {
+            return
+        }
+        const evictable = sshScopes
+            .filter(([scope]) => scope !== protectedScope && scope !== ADB_FILE_PANEL_SCOPE)
+            .sort(([aScope, aRec], [bScope, bRec]) => {
+                const diff = aRec.updatedAt - bRec.updatedAt
+                if (diff !== 0) {
+                    return diff
+                }
+                return aScope < bScope ? -1 : aScope > bScope ? 1 : 0
+            })
+        const excess = sshScopes.length - MAX_SSH_SCOPES
+        for (let i = 0; i < excess && i < evictable.length; i++) {
+            this.memoryScopes.delete(evictable[i][0])
+        }
+    }
+
+    private writeScopeRecord (scope: string, record: FilePanelScopeRecord): void {
+        this.memoryScopes.set(scope, cloneFilePanelScopeRecord(record))
+        if (!this.storage) {
+            if (scope.startsWith('ssh:')) {
+                this.pruneSSHScopes(scope)
+            }
+            return
+        }
+        const storageKey = this.getScopeStorageKey(scope)
+        const payload: StoredFilePanelScopeRecord = {
+            version: FILE_PANEL_STATE_VERSION,
+            recent: [...record.recent],
+            favorites: [...record.favorites],
+            updatedAt: record.updatedAt,
+        }
+        const serialized = JSON.stringify(payload)
         try {
-            this.storage.setItem(this.storageKey, serialized)
-            this.lastStorageRaw = serialized
-            this.hasLoadedFromStorage = true
-            this.writeFailed = false
+            this.storage.setItem(storageKey, serialized)
+            this.writeFailedScopes.delete(scope)
+            if (scope.startsWith('ssh:')) {
+                this.pruneSSHScopes(scope)
+            }
+            notifyFilePanelStateChanges({
+                scope,
+                storageKey,
+                source: this,
+            })
         } catch {
-            this.writeFailed = true
+            this.writeFailedScopes.add(scope)
         }
     }
 
@@ -226,23 +371,31 @@ export class FilePanelStateStore {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return null
         }
-        const snapshot = this.readSnapshot()
-        const existing = Object.prototype.hasOwnProperty.call(snapshot.scopes, scope)
-            ? snapshot.scopes[scope]
-            : undefined
-        const record = cloneFilePanelScopeRecord(existing)
+        const record = this.readScopeRecord(scope)
         mutator(record)
         record.updatedAt = this.nextTimestamp(now)
-        snapshot.scopes[scope] = record
-        this.writeSnapshot(snapshot)
+        this.writeScopeRecord(scope, record)
         return cloneFilePanelScopeRecord(record)
     }
 
     getSnapshot (): FilePanelStateSnapshot {
-        const snapshot = this.readSnapshot()
         const scopes: Record<string, FilePanelScopeRecord> = {}
-        for (const [key, value] of Object.entries(snapshot.scopes)) {
-            scopes[key] = cloneFilePanelScopeRecord(value)
+        if (this.storage) {
+            for (const entry of this.listMatchingStorageEntries(this.keyPrefix)) {
+                scopes[entry.scope] = parseFilePanelScopeRecord(entry.raw, shouldPreserveDotDot(entry.scope))
+            }
+            for (const failedScope of this.writeFailedScopes) {
+                if (!Object.prototype.hasOwnProperty.call(scopes, failedScope)) {
+                    const cached = this.memoryScopes.get(failedScope)
+                    if (cached) {
+                        scopes[failedScope] = cloneFilePanelScopeRecord(cached)
+                    }
+                }
+            }
+        } else {
+            for (const [scope, record] of this.memoryScopes.entries()) {
+                scopes[scope] = cloneFilePanelScopeRecord(record)
+            }
         }
         return {
             version: FILE_PANEL_STATE_VERSION,
@@ -252,13 +405,9 @@ export class FilePanelStateStore {
 
     getScopeState (scope: string | null | undefined): FilePanelScopeRecord {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
-            return { recent: [], favorites: [], updatedAt: 0 }
+            return createEmptyRecord()
         }
-        const snapshot = this.readSnapshot()
-        const existing = Object.prototype.hasOwnProperty.call(snapshot.scopes, scope)
-            ? snapshot.scopes[scope]
-            : undefined
-        return cloneFilePanelScopeRecord(existing)
+        return this.readScopeRecord(scope)
     }
 
     getLastPath (scope: string | null | undefined): string | null {
@@ -275,29 +424,38 @@ export class FilePanelStateStore {
     }
 
     isFavorite (scope: string | null | undefined, rawPath: string): boolean {
-        if (!scope) {
+        if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return false
         }
-        const normalized = normalizeFilePanelPath(rawPath)
+        const normalized = normalizeFilePanelPath(rawPath, shouldPreserveDotDot(scope))
         return this.getScopeState(scope).favorites.includes(normalized)
     }
 
     recordVisit (scope: string | null | undefined, rawPath: string, now?: number): FilePanelScopeRecord | null {
-        const normalized = normalizeFilePanelPath(rawPath)
+        if (!scope || FORBIDDEN_KEYS.has(scope)) {
+            return null
+        }
+        const normalized = normalizeFilePanelPath(rawPath, shouldPreserveDotDot(scope))
         return this.mutateScope(scope, now, record => {
             record.recent = [normalized, ...record.recent.filter(item => item !== normalized)].slice(0, MAX_RECENT_PATHS)
         })
     }
 
     addFavorite (scope: string | null | undefined, rawPath: string, now?: number): FilePanelScopeRecord | null {
-        const normalized = normalizeFilePanelPath(rawPath)
+        if (!scope || FORBIDDEN_KEYS.has(scope)) {
+            return null
+        }
+        const normalized = normalizeFilePanelPath(rawPath, shouldPreserveDotDot(scope))
         return this.mutateScope(scope, now, record => {
             record.favorites = [normalized, ...record.favorites.filter(item => item !== normalized)].slice(0, MAX_FAVORITE_PATHS)
         })
     }
 
     removeFavorite (scope: string | null | undefined, rawPath: string, now?: number): FilePanelScopeRecord | null {
-        const normalized = normalizeFilePanelPath(rawPath)
+        if (!scope || FORBIDDEN_KEYS.has(scope)) {
+            return null
+        }
+        const normalized = normalizeFilePanelPath(rawPath, shouldPreserveDotDot(scope))
         return this.mutateScope(scope, now, record => {
             record.favorites = record.favorites.filter(item => item !== normalized)
         })
@@ -307,7 +465,7 @@ export class FilePanelStateStore {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return false
         }
-        const normalized = normalizeFilePanelPath(rawPath)
+        const normalized = normalizeFilePanelPath(rawPath, shouldPreserveDotDot(scope))
         let added = false
         this.mutateScope(scope, now, record => {
             if (record.favorites.includes(normalized)) {

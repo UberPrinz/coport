@@ -194,6 +194,15 @@
         font-weight: 600;
     }
 
+    .file-row {
+        height: 36px;
+        box-sizing: border-box;
+    }
+
+    .virtual-spacer {
+        pointer-events: none;
+    }
+
     .list-group-item-action {
         &:hover {
             background: rgba(white, .05);

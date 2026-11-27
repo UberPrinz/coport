@@ -99,7 +99,7 @@ export class KeyboardInteractivePrompt {
 export class SSHSession {
     shell?: russh.Channel
     ssh: russh.SSHClient|russh.AuthenticatedSSHClient
-    sftp?: russh.SFTP
+    sftp?: russh.SFTP | null
     forwardedPorts: ForwardedPort[] = []
     jumpChannel: russh.NewChannel|null = null
     savedPassword?: string
@@ -364,14 +364,30 @@ export class SSHSession {
         return null
     }
 
-    async openSFTP (): Promise<SFTPSession> {
+    async openSFTP (forceNew = false): Promise<SFTPSession> {
         if (!(this.ssh instanceof russh.AuthenticatedSSHClient)) {
             throw new Error('Cannot open SFTP session before auth')
         }
-        if (!this.sftp) {
-            this.sftp = await this.ssh.activateSFTP(await this.ssh.openSessionChannel())
+        if (forceNew && this.sftp) {
+            const stale = this.sftp
+            this.sftp = null
+            void stale.close().catch(() => null)
         }
-        return new SFTPSession(this.sftp, this.injector)
+        if (!this.sftp) {
+            const sftp = await this.ssh.activateSFTP(await this.ssh.openSessionChannel())
+            this.sftp = sftp
+            sftp.closed$.subscribe(() => {
+                if (this.sftp === sftp) {
+                    this.sftp = null
+                }
+            })
+        }
+        const activeSftp = this.sftp
+        return new SFTPSession(activeSftp, this.injector, () => {
+            if (this.sftp === activeSftp) {
+                this.sftp = null
+            }
+        })
     }
 
     async start (): Promise<void> {

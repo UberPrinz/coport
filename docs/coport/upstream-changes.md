@@ -21,11 +21,11 @@
 | `tabby-serial/src/api.ts`、`tabby-serial/src/components/serialTab.component.ts`、`tabby-serial/src/components/serialTab.component.pug`、`tabby-serial/src/index.ts` | 串口标签经主进程 IPC 打开、写入、挂回和断开，重复打开聚焦原视图，等候挂接时可从工具栏断开。显示非标准波特率确认并取消该类标签的恢复 |
 | `tabby-serial/src/services/serial.service.ts`、`tabby-serial/src/services/serialPorts.ts`、`tabby-serial/src/profiles.ts` | WCH 串口排在前面，同一适配器的苹果节点加提示 |
 | `tabby-terminal/src/frontends/frontend.ts`、`tabby-terminal/src/frontends/xtermFrontend.ts` | 仅对共享串口丢弃自动上报，渲染器在 xterm 完成写入后确认输出，按主进程输出顺序应用尺寸 |
-| `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts`、`tabby-ssh/src/components/sshTab.component.pug` | 允许可连接的标签选择不保存恢复令牌，保留 SSH 恢复行为；向文件面板透传按 `user@host:port` 隔离的状态作用域并保留 CWD 优先 |
+| `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts`、`tabby-ssh/src/components/sshTab.component.pug` | 允许可连接的标签选择不保存恢复令牌，保留 SSH 恢复行为；向文件面板透传按 `authUsername@host:port` 隔离的状态作用域并在无历史时透传检测到的 CWD |
 | `scripts/vars.mjs` | 注册内置 `tabby-adb` 包，沿用上游插件构建、依赖安装和打包入口 |
 | `tabby-core/src/api/profileProvider.ts`、`tabby-core/src/api/platform.ts` | 设备选择取消时返回空标签参数。ADB 分阶段上传在远端提交前保持处理中 |
-| `tabby-ssh/src/components/sftpPanel.component.ts`、`tabby-ssh/src/components/sftpPanel.component.pug`、`tabby-ssh/src/components/sftpPanel.component.scss`、`tabby-ssh/src/components/sftpDeleteModal.component.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-ssh/src/sftpContextMenu.ts`、`tabby-ssh/src/api/fileBackend.ts` | 文件面板、目录处理与删除复用 `FileBackend`，保留原 SSH/SFTP 会话和标签入口；增强状态保值、逐级回退与重试、收藏/历史、直接敲字模糊过滤与键盘钻取 |
-| `tabby-ssh/src/utils/*`、`tabby-ssh/test/filePanelNavigation.test.ts` | 文件面板状态保值、模糊过滤与逐级回退的零 DOM 纯逻辑模块与 L0 单测 |
+| `tabby-ssh/src/components/sftpPanel.component.ts`、`tabby-ssh/src/components/sftpPanel.component.pug`、`tabby-ssh/src/components/sftpPanel.component.scss`、`tabby-ssh/src/components/sftpDeleteModal.component.ts`、`tabby-ssh/src/session/ssh.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-ssh/src/sftpContextMenu.ts`、`tabby-ssh/src/api/fileBackend.ts` | 文件面板、目录处理与删除复用 `FileBackend`，保留原 SSH/SFTP 会话和标签入口；监听 SFTP 通道关闭失效缓存并支持重试重建；增强状态保值、逐级回退与重试、收藏/历史、直接敲字模糊过滤与键盘钻取 |
+| `tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts` | 文件面板状态保值、模糊过滤与逐级回退的零 DOM 纯逻辑模块与 L0 单测 |
 | `tabby-electron/src/sftpContextMenu.ts` | 将依赖 SSH chmod 和断开事件的本地编辑限制在 SFTP 后端 |
 | `tabby-electron/src/services/platform.service.ts` | ADB 下载经同目录暂存后原子替换本地文件。保留既有 SFTP 下载路径 |
 | `tabby-core/src/directives/dropZone.directive.ts` | 在 Finder 文件扫描前记录目标目录，保留既有 transfer 事件 |
