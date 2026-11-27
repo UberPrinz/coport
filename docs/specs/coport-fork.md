@@ -400,6 +400,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），根构建在 macOS 编译 Node-API 模块和 Swift shim |
 | `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
 | `scripts/build-macos.mjs` | 创建归档前 ad-hoc 签名并校验 |
+| `.github/workflows/build.yml`、`.github/workflows/docs.yml`、`.github/workflows/release.yml` | 收敛为 Lint 与 macOS arm64 ad-hoc 签名构建及 tag Release 发布，停用上游自动文档部署和旧发布流程 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
 
 实现已定稿设计所需的依赖锁文件、构建或打包注册项、模板、样式及 i18n 条目，可以在实现时同步列入本表，并登记到上游改动记录。可注释的改动标注 `coport:`，生成锁文件和 JSON 在上游改动记录中说明。涉及范围、验收标准、对外协议或关键设计的变化需要先裁决。

@@ -11,7 +11,8 @@
 | `app/yarn.lock` | Yarn 生成的 headless、serialize、MCP SDK 及其传递依赖锁项 |
 | `app/webpack.config.main.mjs` | 从 app 包解析 serialport 和 MCP SDK，外部加载 FIONREAD、getpeereid 与 socket EOF 探测共用的 Node-API 模块 |
 | `build/mac/icon.icns`、`electron-builder.yml` | 更换为 Coport 图标、产品名、bundle ID 与 macOS 产物名称。将 Node-API 模块从 asar 解包，将 Swift shim 放在 Contents/MacOS。ad-hoc 模式关闭 hardened runtime，移除 ElectronTeamID |
-| `package.json` | 在 macOS 构建时编译 Coport 的原生组件 |
+| `package.json` | 在 macOS 构建时编译 Coport 的原生组件，并提供 `coport:install` 本机安装入口 |
+| `.github/workflows/build.yml`、`.github/workflows/docs.yml`、`.github/workflows/release.yml` | 将 CI 收敛为 Lint 与 macOS arm64 ad-hoc 签名构建，接入白名单与 Coport 单测，在 `v*` tag 时发布 GitHub Release；停用上游自动文档部署与旧版空草稿发布 |
 | `tabby-core/src/api/hostWindow.ts`、`tabby-core/src/services/app.service.ts`、`tabby-electron/src/services/hostWindow.service.ts` | 窗口拒绝关闭时通知主进程取消退出请求，保留活动串口 |
 | `tabby-core/src/api/selector.ts`、`tabby-core/src/services/profiles.service.ts`、`tabby-core/src/components/selectorModal.component.ts` | 在快速连接及过滤结果中保留同一适配器的驱动顺序 |
 | `tabby-core/src/configDefaults.yaml` | 关闭默认统计与自动更新 |
