@@ -1,7 +1,8 @@
 import { Injectable } from '@angular/core'
 import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
 import { MenuItemOptions, PlatformService, TranslateService, HostAppService, Platform } from 'tabby-core'
-import { SFTPSession, SFTPFile } from './session/sftp'
+import { SFTPFile } from './session/sftp'
+import { FileBackend } from './api/fileBackend'
 import { SFTPContextMenuItemProvider } from './api'
 import { SFTPDeleteModalComponent } from './components/sftpDeleteModal.component'
 import { SFTPPanelComponent } from './components/sftpPanel.component'
@@ -68,7 +69,7 @@ export class CommonSFTPContextMenu extends SFTPContextMenuItemProvider {
         return items
     }
 
-    async deleteItem (item: SFTPFile, session: SFTPSession): Promise<void> {
+    async deleteItem (item: SFTPFile, session: FileBackend): Promise<void> {
         const modal = this.ngbModal.open(SFTPDeleteModalComponent)
         modal.componentInstance.item = item
         modal.componentInstance.sftp = session

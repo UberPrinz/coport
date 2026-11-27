@@ -2,7 +2,7 @@ import { firstBy } from 'thenby'
 import { Component, Input, HostListener, ViewChildren, QueryList, ElementRef } from '@angular/core' // eslint-disable-line @typescript-eslint/no-unused-vars
 import { NgbActiveModal } from '@ng-bootstrap/ng-bootstrap'
 import FuzzySearch from 'fuzzy-search'
-import { SelectorOption } from '../api/selector'
+import { orderMatchedSiblings, SelectorOption } from '../api/selector'
 
 /** @hidden */
 @Component({
@@ -95,6 +95,7 @@ export class SelectorModalComponent<T> {
                 }
             })
         }
+        orderMatchedSiblings(this.filteredOptions) // coport: Preserve hardware driver preference, including recents.
         this.selectedIndex = Math.max(0, this.selectedIndex)
         this.selectedIndex = Math.min(this.filteredOptions.length - 1, this.selectedIndex)
     }

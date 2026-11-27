@@ -1,9 +1,10 @@
 import stripAnsi from 'strip-ansi'
-import { SerialPortStream } from '@serialport/stream'
+import { ipcRenderer } from 'electron'
+import { getCurrentWindow } from '@electron/remote'
 import { LogService, NotificationsService } from 'tabby-core'
 import { Subject, Observable } from 'rxjs'
 import { Injector, NgZone } from '@angular/core'
-import { BaseSession, ConnectableTerminalProfile, InputProcessingOptions, InputProcessor, LoginScriptsOptions, SessionMiddleware, StreamProcessingOptions, TerminalStreamProcessor, UTF8SplitterMiddleware } from 'tabby-terminal'
+import { BaseSession, ConnectableTerminalProfile, InputProcessingOptions, InputProcessor, LoginScriptsOptions, SessionMiddleware, StreamProcessingOptions, TerminalStreamProcessor, UTF8SplitterMiddleware, XTermFrontend } from 'tabby-terminal'
 import { SerialService } from './services/serial.service'
 
 export interface SerialProfile extends ConnectableTerminalProfile {
@@ -42,7 +43,17 @@ class SlowFeedMiddleware extends SessionMiddleware {
 }
 
 export class SerialSession extends BaseSession {
-    serial: SerialPortStream|null
+    // coport: Only the main process opens or closes a physical device.
+    focusedExisting = false
+    get canDisconnect (): boolean { return Boolean(this.generation) && !this.disposed }
+    private generation?: string
+    private disposed = false
+    private ready = false
+    private replayingStartupInput = false
+    private viewOutput: Promise<void> = Promise.resolve()
+    private pending: { generation: string, seq: number, bytes: Uint8Array }[] = []
+    private seq = -1
+    private desiredSize?: XTermFrontend['terminalSize']
 
     get serviceMessage$ (): Observable<string> { return this.serviceMessage }
     private serviceMessage = new Subject<string>()
@@ -51,7 +62,12 @@ export class SerialSession extends BaseSession {
     private notifications: NotificationsService
     private serialService: SerialService
 
-    constructor (injector: Injector, public profile: SerialProfile) {
+    constructor (
+        injector: Injector,
+        public profile: SerialProfile,
+        private view: { focus: () => void, replay: (snapshot: string) => Promise<void>, flush: () => Promise<void> },
+        private frontend: XTermFrontend,
+    ) {
         super(injector.get(LogService).create(`serial-${profile.options.port}`))
         this.serialService = injector.get(SerialService)
 
@@ -67,81 +83,231 @@ export class SerialSession extends BaseSession {
 
         this.middleware.push(new UTF8SplitterMiddleware())
         this.middleware.push(new InputProcessor(profile.options.input))
-
-        this.setLoginScriptsOptions(profile.options)
     }
 
     async start (): Promise<void> {
-        if (!this.profile.options.port) {
-            this.profile.options.port = (await this.serialService.listPorts())[0].name
+        const { port: configuredPort, baudrate, databits, stopbits, parity, rtscts, xon, xoff, xany } = this.profile.options
+        const config = { port: configuredPort, baudrate: Number(baudrate), databits, stopbits, parity, rtscts, xon, xoff, xany }
+        if (!config.port) {
+            const port = (await this.serialService.listPorts()).at(0)
+            if (!port) {
+                throw new Error('No serial ports found')
+            }
+            this.profile.options.port = config.port = port.name
         }
 
-        const serial = this.serial = new SerialPortStream({
-            binding: this.serialService.detectBinding(),
-            path: this.profile.options.port,
-            autoOpen: false,
-            baudRate: parseInt(this.profile.options.baudrate as any),
-            dataBits: this.profile.options.databits,
-            stopBits: this.profile.options.stopbits,
-            parity: this.profile.options.parity,
-            rtscts: this.profile.options.rtscts,
-            xon: this.profile.options.xon,
-            xoff: this.profile.options.xoff,
-            xany: this.profile.options.xany,
+        const ensure = this.profile.options.outputMode === 'hex' ? 'ensure-hex-view' : 'ensure'
+        const result = await this.invoke<{ generation: string, reused: boolean, focus?: object, activeBaudrate?: number }>(ensure, {
+            config, reveal: true, windowId: getCurrentWindow().id, profileId: this.profile.id, ...this.frontend.terminalSize,
         })
-        let connected = false
-        await new Promise(async (resolve, reject) => {
-            serial.on('open', () => {
-                connected = true
-                this.zone.run(resolve)
-            })
-            serial.on('error', error => {
-                this.zone.run(() => {
-                    if (connected) {
-                        this.notifications.error(error.message)
-                    } else {
-                        reject(error)
-                    }
-                    this.destroy()
-                })
-            })
-            serial.on('close', () => {
-                this.emitServiceMessage('Port closed')
-                this.destroy()
-            })
+        if (result.focus) {
+            this.focusedExisting = true
+            return
+        }
+        this.generation = result.generation
+        if (this.disposed) {
+            await this.invoke('detach', { generation: result.generation })
+            return
+        }
+        if (result.activeBaudrate) {
+            this.profile.options.baudrate = result.activeBaudrate
+        }
 
+        ipcRenderer.on('coport-serial:focus', this.onFocus)
+        ipcRenderer.on('coport-serial:output', this.onOutput)
+        ipcRenderer.on('coport-serial:resized', this.onResized)
+        ipcRenderer.on('coport-serial:ended', this.onEnd)
+        ipcRenderer.on('coport-serial:view-detached', this.onEnd)
+        try {
+            const size = this.frontend.terminalSize
+            this.desiredSize = size
+            this.frontend.requestResize = this.requestResize
+            const options: Partial<SerialProfileOptions> = this.profile.options
+            const newLogin = !result.reused && Boolean(options.scripts?.length)
+            const replayDeviceOutput = newLogin || Boolean(options.outputMode) || Boolean(options.outputNewlines)
+            const { snapshot, seq, displayFrames } = await this.invoke<{
+                snapshot: string, seq: number, displayFrames?: Uint8Array[],
+            }>(replayDeviceOutput ? 'attach-display' : 'attach', { generation: this.generation, ...size })
+            if (this.isDisposed()) {
+                return
+            }
+            await this.view.replay(snapshot)
+            if (this.isDisposed()) {
+                return
+            }
+            // Only a new generation runs login scripts. A prompt that arrived
+            // before attach is still part of that generation's startup.
+            if (newLogin) {
+                this.setLoginScriptsOptions(this.profile.options)
+                this.replayingStartupInput = true
+                this.loginScriptProcessor?.executeUnconditionalScripts()
+            }
             try {
-                serial.open()
-            } catch (e) {
-                this.notifications.error(e.message)
-                reject(e)
+                for (const bytes of displayFrames ?? []) {
+                    this.emitOutput(Buffer.from(bytes))
+                }
+            } finally {
+                this.replayingStartupInput = false
+            }
+            this.releaseInitialDataBuffer()
+            await this.view.flush()
+            if (this.isDisposed()) {
+                return
+            }
+            this.seq = seq
+            this.ready = true
+            this.open = true
+            for (const event of this.pending.splice(0)) {
+                this.onOutput(undefined, event)
+            }
+            if (this.desiredSize !== size) {
+                this.sendResize(this.desiredSize)
+            }
+            setTimeout(() => this.streamProcessor.start())
+        } catch (error) {
+            const ended = this.isDisposed()
+            await this.destroy()
+            if (!ended) {
+                throw error
+            }
+        }
+    }
+
+    private isDisposed (): boolean {
+        return this.disposed
+    }
+
+    private async invoke<T = void> (action: string, args: object): Promise<T> {
+        const response = await ipcRenderer.invoke(`coport-serial:${action}`, args)
+        if (response.ok) {
+            return response.result
+        }
+        const { code, message, active } = response.error
+        throw new Error(active ? `${code}: ${message} (${JSON.stringify(active)})` : `${code}: ${message}`)
+    }
+
+    private onFocus = (_, { generation }) => {
+        if (generation === this.generation) {
+            this.zone.run(() => this.view.focus())
+        }
+    }
+
+    private onOutput = (_, event: { generation: string, seq: number, bytes: Uint8Array }) => {
+        if (event.generation !== this.generation || this.disposed) {
+            return
+        }
+        if (!this.ready) {
+            this.pending.push(event)
+            return
+        }
+        if (event.seq <= this.seq) {
+            return
+        }
+        this.seq = event.seq
+        this.viewOutput = this.viewOutput.then(async () => {
+            if (this.disposed) {
+                return
+            }
+            this.zone.run(() => this.emitOutput(Buffer.from(event.bytes)))
+            await this.view.flush()
+            if (!this.isDisposed()) {
+                ipcRenderer.send('coport-serial:ack', { generation: event.generation, seq: event.seq })
+            }
+        }).catch(error => {
+            this.zone.run(() => this.notifications.error(error.message))
+            void this.destroy()
+        })
+    }
+
+    private requestResize = (cols: number, rows: number): void => {
+        if (this.desiredSize?.cols === cols && this.desiredSize.rows === rows) {
+            return
+        }
+        this.desiredSize = { cols, rows }
+        if (this.ready) {
+            this.sendResize(this.desiredSize)
+        }
+    }
+
+    private sendResize (size: XTermFrontend['terminalSize']): void {
+        void this.invoke('resize', { generation: this.generation, ...size }).catch(error => {
+            if (!this.disposed) {
+                this.zone.run(() => this.notifications.error(error.message))
+                void this.destroy()
             }
         })
+    }
 
-        this.open = true
-        setTimeout(() => this.streamProcessor.start())
-
-        serial.on('readable', () => {
-            this.emitOutput(serial.read())
-        })
-
-        serial.on('end', () => {
-            this.logger.info('Shell session ended')
-            if (this.open) {
-                this.destroy()
+    private onResized = (_, { generation, cols, rows }) => {
+        if (generation !== this.generation || this.disposed) {
+            return
+        }
+        this.viewOutput = this.viewOutput.then(() => {
+            if (!this.disposed) {
+                this.frontend.applyTerminalSize(cols, rows)
             }
+        }).catch(error => {
+            this.zone.run(() => this.notifications.error(error.message))
+            void this.destroy()
         })
+    }
 
-        this.loginScriptProcessor?.executeUnconditionalScripts()
+    private onEnd = (_, { generation, reason }) => {
+        if (generation === this.generation) {
+            this.zone.run(() => void this.destroy(reason === 'device_lost'))
+        }
     }
 
     write (data: Buffer): void {
-        this.serial?.write(data)
+        if ((!this.open && !this.replayingStartupInput) || !this.generation || !data.length) {
+            return
+        }
+        void this.invoke('input', { generation: this.generation, bytes: Uint8Array.from(data) })
+            .catch(error => this.zone.run(() => this.notifications.error(error.message)))
     }
 
-    async destroy (): Promise<void> {
+    async changeBaudRate (baudrate: number): Promise<void> {
+        if (this.open && this.generation) {
+            await this.invoke('update-baudrate', { generation: this.generation, baudrate })
+            this.profile.options.baudrate = baudrate
+        }
+    }
+
+    async disconnect (): Promise<void> {
+        if (this.canDisconnect) {
+            try {
+                await this.invoke('disconnect', { generation: this.generation })
+            } finally {
+                await this.destroy()
+            }
+        }
+    }
+
+    async destroy (deviceLost = false): Promise<void> {
+        if (this.disposed) {
+            return
+        }
+        this.disposed = true
+        this.pending.length = 0
+        if (this.frontend.requestResize === this.requestResize) {
+            this.frontend.requestResize = undefined
+        }
+        ipcRenderer.off('coport-serial:focus', this.onFocus)
+        ipcRenderer.off('coport-serial:output', this.onOutput)
+        ipcRenderer.off('coport-serial:resized', this.onResized)
+        ipcRenderer.off('coport-serial:ended', this.onEnd)
+        ipcRenderer.off('coport-serial:view-detached', this.onEnd)
         this.serviceMessage.complete()
+        if (deviceLost && !this.open) {
+            // BaseSession emits these only after open. A reserved generation
+            // can lose its device while waiting for a snapshot.
+            this.closed.next()
+            this.destroyed.next()
+        }
         await super.destroy()
+        if (this.generation) {
+            await this.invoke('detach', { generation: this.generation }).catch(() => undefined)
+        }
     }
 
     // eslint-disable-next-line @typescript-eslint/no-empty-function, @typescript-eslint/explicit-module-boundary-types, @typescript-eslint/no-empty-function
@@ -150,7 +316,7 @@ export class SerialSession extends BaseSession {
     }
 
     kill (_?: string): void {
-        this.serial?.close()
+        void this.disconnect().catch(error => this.notifications.error(error.message))
     }
 
     emitServiceMessage (msg: string): void {
@@ -163,7 +329,7 @@ export class SerialSession extends BaseSession {
     }
 
     async gracefullyKillProcess (): Promise<void> {
-        this.kill('TERM')
+        // Destroying a tab detaches the view. Disconnect is explicit.
     }
 
     supportsWorkingDirectory (): boolean {

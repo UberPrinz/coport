@@ -48,6 +48,7 @@ import { SFTPCreateDirectoryModalComponent } from './components/sftpCreateDirect
         { provide: ProfileProvider, useExisting: SSHProfilesService, multi: true },
         { provide: SFTPContextMenuItemProvider, useClass: CommonSFTPContextMenu, multi: true },
     ],
+    exports: [SFTPPanelComponent], // coport: Reuse the SSH file panel for ADB.
     declarations: [
         SSHProfileSettingsComponent,
         SFTPDeleteModalComponent,
@@ -65,6 +66,7 @@ import { SFTPCreateDirectoryModalComponent } from './components/sftpCreateDirect
 export default class SSHModule { }
 
 export * from './api'
+export { FileBackend } from './api/fileBackend'
 export { SFTPFile, SFTPSession } from './session/sftp'
 export { SFTPPanelComponent, SSHTabComponent }
 export { PasswordStorageService } from './services/passwordStorage.service'

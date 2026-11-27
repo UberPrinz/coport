@@ -67,7 +67,7 @@ export abstract class ProfileProvider<P extends Profile> {
 
     abstract getBuiltinProfiles (): Promise<PartialProfile<P>[]>
 
-    abstract getNewTabParameters (profile: P): Promise<NewTabParameters<BaseTabComponent>>
+    abstract getNewTabParameters (profile: P): Promise<NewTabParameters<BaseTabComponent> | null> // coport: Device selection can be cancelled.
 
     getSuggestedName (profile: PartialProfile<P>): string|null {
         return null

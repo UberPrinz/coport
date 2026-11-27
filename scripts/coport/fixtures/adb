@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Synthetic adb. No device or adb server access. State lives beside this executable."""
+import json, os, shlex, shutil, signal, subprocess, sys, time
+from pathlib import Path
+root = Path(__file__).resolve().parent
+args = sys.argv[1:]
+server_flags = []
+while args[:1] in (['-H'], ['-P'], ['-L']):
+    server_flags.extend(args[:2])
+    args = args[2:]
+with (root/"calls.jsonl").open("a") as log: log.write(json.dumps(args)+"\n")
+serial = 'one'
+if args[:1] == ['-s']:
+    serial, args = args[1], args[2:]
+if not args: sys.exit(1)
+with (root/'adb-server.jsonl').open('a') as log:
+    log.write(json.dumps([serial, args[0], server_flags, os.environ.get('ADB_SERVER_SOCKET')]) + '\n')
+def state():
+    try: return json.loads((root/'state.json').read_text())
+    except (FileNotFoundError, ValueError): return {'devices': [['one','device']]}
+if args[0] == 'devices':
+    settings = state()
+    time.sleep(settings.get('devices_delay', 0))
+    if settings.get('fail_devices'):
+        sys.exit('synthetic adb server unavailable')
+    print('List of devices attached')
+    for device, status in state().get('devices', []):
+        print(f'{device}\t{status}')
+    sys.exit(0)
+if args[0] == 'track-devices':
+    previous = None
+    parent = os.getppid()
+    while os.getppid() == parent:
+        current = state().get('devices', [])
+        if current != previous:
+            body = ''.join(s+'\t'+v+'\n' for s,v in current).encode()
+            sys.stdout.buffer.write(('%04x'%len(body)).encode()+body); sys.stdout.buffer.flush(); previous = current
+        time.sleep(.03)
+if serial == 'offline':
+    print('error: device offline',file=sys.stderr); sys.exit(1)
+def remote(path):
+    candidate = root/'device'/path.lstrip('/')
+    if not candidate.resolve().is_relative_to((root/'device').resolve()):
+        sys.exit('fixture path escaped its synthetic device')
+    return candidate
+
+if args[0] == 'exec-out':
+    command = shlex.split(args[1])
+    assert command[:2] == ['cat', '--'] and command[3:6] == ['&&', 'printf', '%s']
+    source = remote(command[2])
+    if source.name == 'slow-download.bin':
+        time.sleep(15)
+    if source.name.startswith('fallback'):
+        sys.stdout.buffer.write(b'incomplete content to discard')
+        sys.exit(0)  # exec-out can still report success when remote cat fails.
+    with source.open('rb') as file:
+        shutil.copyfileobj(file, sys.stdout.buffer)
+    sys.stdout.buffer.write(command[6].encode())
+elif args[0] == 'push':
+    shutil.copyfile(args[1], remote(args[2]))
+elif args[0] == 'ls':
+    # Real adb: a missing or unreadable directory prints nothing and exits 0; an existing one
+    # always lists '.' and '..' first (verified on a BusyBox device, 2026-11-18).
+    settings = state()
+    remote = args[1]
+    time.sleep(settings.get('list_delays', {}).get(serial, {}).get(remote, 0))
+    directory = root/'device'/remote.lstrip('/')
+    if remote == '/denied' or remote in settings.get('unreadable', {}).get(serial, []) or not directory.is_dir(): sys.exit(0)
+    if remote in settings.get('no_search', {}).get(serial, []):
+        for name in ('.', '..', 'unstatable.log'): print('00000000 00000000 00000000 ' + name)
+        sys.exit(0)
+    print('%08x %08x %08x .' % (0o040755,4096,0)); print('%08x %08x %08x ..' % (0o040755,4096,0))
+    for child in sorted(directory.iterdir()):
+        info = child.lstat()
+        print('%08x %08x %08x %s' % (info.st_mode, info.st_size, int(info.st_mtime), child.name))
+elif args[0] == 'pull':
+    source, dest = root/'device'/args[1].lstrip('/'), Path(args[2])
+    if not source.is_file(): print('No such file',file=sys.stderr); sys.exit(1)
+    try:
+        with source.open('rb') as inp, dest.open('wb') as out:
+            while chunk := inp.read(4096):
+                out.write(chunk); out.flush()
+                if source.name.startswith('slow'): time.sleep(.1)
+    except OSError as e: print(str(e),file=sys.stderr); sys.exit(1)
+elif args[0] == 'shell':
+    if len(args) == 1:
+        if not os.isatty(0) or not os.isatty(1):
+            sys.exit('interactive adb fixture requires a PTY')
+        os.execve('/bin/sh', ['sh', '-i'], dict(os.environ, ENV='/dev/null', HISTFILE='/dev/null', PS1='ADB% '))
+    command = shlex.split(args[1])
+    marker = None
+    if command[-4:-1] == ['&&', 'printf', r'\n%s']:
+        marker = command[-1]
+        command = command[:-4]
+
+    def finish(output=''):
+        assert marker and marker.startswith('COPORT_ADB_')
+        sys.stdout.write(output + '\n' + marker)
+        sys.exit(0)
+
+    if command[:4] == ['stat', '-L', '-c', '%f %s %Y']:
+        info = remote(command[-1]).stat()
+        finish(f'{info.st_mode:x} {info.st_size} {int(info.st_mtime)}\n')
+    if command[:2] == ['readlink', '--']:
+        finish(os.readlink(remote(command[-1])) + '\n')
+    if command[0] == 'mkdir':
+        if command[-1].endswith('legacy-denied'):
+            print('permission denied by legacy shell')
+            sys.exit(0)
+        remote(command[-1]).mkdir()
+        finish()
+    if command[0] == 'rmdir':
+        remote(command[-1]).rmdir()
+        finish()
+    if command[:3] == ['rm', '-f', '--']:
+        if command[-1] in state().get('reject_unlink', []):
+            print('remote delete denied by legacy shell')
+            sys.exit(0)
+        remote(command[-1]).unlink(missing_ok=True)
+        finish()
+    if command[:3] == ['test', '!', '-d']:
+        destination = remote(command[-1])
+        if destination.name.endswith('legacy-move-denied'):
+            print('remote rename denied by legacy shell')
+            sys.exit(0)
+        if destination.is_dir():
+            sys.exit(1)
+        remote(command[-2]).replace(destination)
+        finish()
+    (root/'last-shell-pid').write_text(str(os.getpid()))
+    if 'coport-ignore-term' in args[1]:
+        signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(100); sys.exit(0)
+    if 'coport-missing-marker' in args[1]: print('partial',end=''); sys.exit(0)
+    child = subprocess.Popen(['/bin/sh','-c',args[1]],start_new_session=True)
+    def terminate(*_):
+        try: os.killpg(child.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        child.wait(); sys.exit(143)
+    signal.signal(signal.SIGTERM,terminate)
+    code = child.wait()
+    if "coport-delay-exit" in args[1]: time.sleep(6)
+    sys.exit(code)
+else: print('unsupported fake adb call', args,file=sys.stderr); sys.exit(1)

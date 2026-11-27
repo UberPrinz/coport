@@ -9,7 +9,6 @@ import {
     HostAppService,
     Platform,
     HomeBaseService,
-    UpdaterService,
     PlatformService,
     HostWindowService,
     AppService,
@@ -34,8 +33,6 @@ export class SettingsTabComponent extends BaseTabComponent {
     configDefaults: any
     configFile: string
     isShellIntegrationInstalled = false
-    checkingForUpdate = false
-    updateAvailable = false
     showConfigDefaults = false
     allLanguages = LocaleService.allLanguages
     @HostBinding('class.pad-window-controls') padWindowControls = false
@@ -47,7 +44,6 @@ export class SettingsTabComponent extends BaseTabComponent {
         public homeBase: HomeBaseService,
         public platform: PlatformService,
         public locale: LocaleService,
-        public updater: UpdaterService,
         private app: AppService,
         @Inject(SettingsTabProvider) public settingsProviders: SettingsTabProvider[],
         translate: TranslateService,
@@ -119,12 +115,7 @@ export class SettingsTabComponent extends BaseTabComponent {
         }
     }
 
-    async checkForUpdates () {
-        this.checkingForUpdate = true
-        this.updateAvailable = await this.updater.check()
-        this.checkingForUpdate = false
-    }
-
+    // coport: There is no in-app update action.
     showReleaseNotes () {
         this.app.openNewTabRaw({
             type: ReleaseNotesComponent,

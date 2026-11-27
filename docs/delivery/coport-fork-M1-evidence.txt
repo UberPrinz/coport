@@ -1,0 +1,123 @@
+Coport fork M1 · macOS arm64 · Electron 43.7.0 · private PTY only
+Tested input: dc8a94d4 plus the M1 changes available in each tested build.
+Full logs under dist/coport-m1/evidence.
+
+history.log
+{"case": "history-parity", "samples": 14, "lines": 20008, "bytes": 1180000, "elapsed": 32.856042, "restoredRows": 152}
+
+serial-extended.log
+{"case": "human-first", "pid": 55032, "generation": "e4a26ff8-c217-4913-8e20-e1ee4d0bfb6f", "fd": "open", "updatedBaud": 57600}
+{"case": "human-first", "pid": 55032, "fd": "closed"}
+{"case": "ai-first", "pid": 55032, "generation": "84f24dd1-9d96-47ce-b1c6-47f01a15cb34", "fd": "open", "updatedBaud": 57600}
+{"case": "ai-first", "pid": 55032, "fd": "closed"}
+{"case": "concurrent", "pid": 55032, "generation": "aa3188c4-3c69-42ca-bb06-44b3d843698f", "fd": "open", "updatedBaud": 57600}
+{"case": "concurrent", "pid": 55032, "fd": "closed"}
+{"case": "open-noise", "state": "driver-open"}
+{"case": "open-noise", "state": "ready"}
+{"case": "open-noise", "automaticReports": true, "halfLineExclusion": true, "deviceBytes": "1b5b306e61690d68756d616e"}
+
+serial-timeout.log
+{"case": "timeout", "elapsed": 15001.552416999999, "pid": 55099, "fd": "closed"}
+
+smoke.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 55672, "name": "Coport", "window": 1}
+
+lifecycle.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 59918, "name": "Coport", "window": 1}
+{"case": "profile-before-attach"}
+{"case": "profile-open", "pid": 59918, "generation": "9ab7b2d7-767a-42f1-86cc-7a804ff93874", "reused": true}
+{"case": "profile-output-acked", "deviceReceivedBytes": 15, "deviceReceivedHex": "6c6f67696e2d6f6e63650a1b5b306e"}
+{"case": "profile-reopened", "repeatLoginBytes": 0}
+{"case": "baud-confirmation", "baudrate": 961200, "ptySpeed": 115200, "fixture": "arbitrary-rate adapter", "openedFds": 1}
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 60403, "name": "Coport", "window": 1}
+{"case": "lifecycle", "closeRetainsFd": true, "dockReopen": true, "replayedHistory": true, "hexMonitor": false, "generation": "9ab7b2d7-767a-42f1-86cc-7a804ff93874", "disconnectFds": 0, "quitFds": 0, "restartFds": 0}
+
+hex-dsr.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 34737, "name": "Coport", "window": 1}
+{"case": "profile-open", "pid": 34737, "generation": "2f104078-2daa-4638-aeb2-06b81c5f22bc", "reused": true}
+{"case": "legacy-hex-dsr", "profile": "outputMode: hex", "devicePayload": "434f504f52542d534e415053484f541b5b356e", "deviceReceived": "1b5b306e"}
+
+hex-fixed.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 56487, "name": "Coport", "window": 1}
+{"case": "profile-open", "pid": 56487, "generation": "b17fda1b-1f9f-450f-bc42-cebee2029126", "reused": true}
+{"case": "profile-output-acked", "deviceReceivedBytes": 0, "deviceReceivedHex": ""}
+{"case": "baud-confirmation", "baudrate": 961200, "ptySpeed": 115200, "fixture": "arbitrary-rate adapter", "openedFds": 1}
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 56603, "name": "Coport", "window": 1}
+{"case": "lifecycle", "closeRetainsFd": true, "dockReopen": true, "replayedHistory": true, "hexMonitor": true, "generation": "b17fda1b-1f9f-450f-bc42-cebee2029126", "disconnectFds": 0, "quitFds": 0, "restartFds": 0}
+
+viewport-replay.log
+{"case": "viewport-replay-mismatch", "platform": "darwin", "liveCols": 120, "mainCols": 80, "reopenedCols": 120, "input": "100 × A, CR, B", "live": {"bColumn": 1, "cursorX": 1}, "reopened": {"bColumn": 81, "cursorX": 81}}
+
+serial-profiles.log
+# tests 2
+# pass 2
+# fail 0
+
+test-ssh.log
+# tests 14
+# pass 14
+# fail 0
+
+test-unit.log
+# tests 11
+# pass 11
+# fail 0
+
+R7 final resize validation
+macOS arm64, Electron 43.7.0, Node 22.23.5, isolated app and private PTYs.
+Full build, lint, local Electron zip packaging and ad-hoc signature verification exited 0.
+
+history-resize.log
+{"case": "history-parity", "samples": 14, "lines": 20008, "bytes": 1180000, "elapsed": 29.051208000000088, "restoredRows": 152}
+
+serial-timeout-resize.log
+{"case": "timeout", "elapsed": 15003.428416, "pid": 89543, "fd": "closed"}
+
+geometry.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 6174, "name": "Coport", "window": 1}
+{"case": "geometry-write-wide", "reply": "\u001b[28;120R\u001b[1;2R", "deviceReceivedHex": "1b5b32383b313230521b5b313b3252"}
+{"case": "geometry-grid", "cols": 120, "rows": 28, "x": 1, "y": 0, "lines": ["BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""]}
+{"case": "geometry-write-detached", "reply": "\u001b[28;120R\u001b[1;2R", "deviceReceivedHex": "1b5b32383b313230521b5b313b3252"}
+{"case": "geometry-grid", "cols": 120, "rows": 28, "x": 1, "y": 0, "lines": ["BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""]}
+{"case": "geometry-grid", "cols": 80, "rows": 24, "x": 1, "y": 0, "lines": ["BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""]}
+{"case": "geometry-grid", "cols": 120, "rows": 32, "x": 1, "y": 0, "lines": ["BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""]}
+{"case": "geometry-write-resized", "reply": "\u001b[32;120R\u001b[1;2R", "deviceReceivedHex": "1b5b33323b313230521b5b313b3252"}
+{"case": "geometry-grid", "cols": 120, "rows": 32, "x": 1, "y": 0, "lines": ["BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ""]}
+{"case": "geometry-write-ai", "reply": "\u001b[24;80R\u001b[2;2R", "deviceReceivedHex": "1b5b32343b3830521b5b323b3252"}
+{"case": "geometry-grid", "cols": 120, "rows": 28, "x": 1, "y": 1, "lines": ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "BAAAAAAAAAAAAAAAAAAA"]}
+
+lifecycle-resize.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 6775, "name": "Coport", "window": 1}
+{"case": "profile-before-attach"}
+{"case": "profile-open", "pid": 6775, "generation": "ca2885ac-3a76-40f0-a8cf-2376699da184", "reused": true}
+{"case": "profile-output-acked", "deviceReceivedBytes": 15, "deviceReceivedHex": "6c6f67696e2d6f6e63650a1b5b306e"}
+{"case": "profile-reopened", "repeatLoginBytes": 0}
+{"case": "baud-confirmation", "baudrate": 961200, "ptySpeed": 115200, "fixture": "arbitrary-rate adapter", "openedFds": 1}
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 6974, "name": "Coport", "window": 1}
+{"case": "lifecycle", "closeRetainsFd": true, "dockReopen": true, "replayedHistory": true, "hexMonitor": false, "generation": "ca2885ac-3a76-40f0-a8cf-2376699da184", "disconnectFds": 0, "quitFds": 0, "restartFds": 0}
+
+hex-resize.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 7171, "name": "Coport", "window": 1}
+{"case": "profile-open", "pid": 7171, "generation": "fb872e85-4f0f-4a9e-8af7-00b4393cdcc5", "reused": true}
+{"case": "profile-output-acked", "deviceReceivedBytes": 0, "deviceReceivedHex": ""}
+{"case": "baud-confirmation", "baudrate": 961200, "ptySpeed": 115200, "fixture": "arbitrary-rate adapter", "openedFds": 1}
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 7289, "name": "Coport", "window": 1}
+{"case": "lifecycle", "closeRetainsFd": true, "dockReopen": true, "replayedHistory": true, "hexMonitor": true, "generation": "fb872e85-4f0f-4a9e-8af7-00b4393cdcc5", "disconnectFds": 0, "quitFds": 0, "restartFds": 0}
+
+smoke-resize.log
+{"case": "startup", "bundleId": "local.coport.app", "renderer": "ready", "originalSwiftDescendants": 0, "pid": 7489, "name": "Coport", "window": 1}
+
+test-ssh-resize.log
+# tests 14
+# pass 14
+# fail 0
+
+test-unit-resize.log
+# tests 11
+# pass 11
+# fail 0
+
+serial-profiles-resize.log
+# tests 2
+# pass 2
+# fail 0

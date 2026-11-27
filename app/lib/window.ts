@@ -1,5 +1,4 @@
 import * as glasstron from 'glasstron'
-import { autoUpdater } from 'electron-updater'
 import { Subject, Observable, debounceTime } from 'rxjs'
 import { BrowserWindow, app, ipcMain, Rectangle, Menu, screen, BrowserWindowConstructorOptions, TouchBar, nativeImage, WebContents, nativeTheme } from 'electron'
 import ElectronConfig = require('electron-config')
@@ -59,7 +58,7 @@ export class Window {
         const bwOptions: BrowserWindowConstructorOptions = {
             width: 800,
             height: 600,
-            title: 'Tabby',
+            title: app.name, // coport: Use the packaged product name.
             minWidth: 400,
             minHeight: 300,
             webPreferences: {
@@ -166,7 +165,7 @@ export class Window {
         }
 
         this.setupWindowManagement()
-        this.setupUpdater()
+        // coport: Updates are managed outside the application.
 
         this.ready = new Promise(resolve => {
             const listener = event => {
@@ -462,6 +461,8 @@ export class Window {
             this.present()
         })
 
+        // coport: Keep a cancelled quit from affecting a later ordinary close.
+        this.on('window-close-cancelled', () => this.application.cancelQuitRequest())
         this.on('window-close', () => {
             this.closing = true
             this.window?.close()
@@ -524,35 +525,6 @@ export class Window {
                 return
             }
             listener(e, ...args)
-        })
-    }
-
-    private setupUpdater () {
-        autoUpdater.autoDownload = true
-        autoUpdater.autoInstallOnAppQuit = true
-
-        autoUpdater.on('update-available', () => {
-            this.send('updater:update-available')
-        })
-
-        autoUpdater.on('update-not-available', () => {
-            this.send('updater:update-not-available')
-        })
-
-        autoUpdater.on('error', err => {
-            this.send('updater:error', err)
-        })
-
-        autoUpdater.on('update-downloaded', () => {
-            this.send('updater:update-downloaded')
-        })
-
-        this.on('updater:check-for-updates', () => {
-            autoUpdater.checkForUpdates()
-        })
-
-        this.on('updater:quit-and-install', () => {
-            autoUpdater.quitAndInstall()
         })
     }
 

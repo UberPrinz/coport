@@ -28,9 +28,11 @@ export class EditSFTPContextMenu extends SFTPContextMenuItemProvider {
                 label: this.translate.instant('Copy full path'),
             },
         ]
-        if (!item.isDirectory) {
+        const backend = panel.sftp
+        // coport: Local editing requires the SSH backend's chmod and close event.
+        if (!item.isDirectory && backend instanceof SFTPSession) {
             items.push({
-                click: () => this.edit(item, panel.sftp),
+                click: () => this.edit(item, backend),
                 label: this.translate.instant('Edit locally'),
             })
         }

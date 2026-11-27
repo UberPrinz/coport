@@ -101,12 +101,16 @@ export class Application {
         app.on('before-quit', () => {
             this.quitRequested = true
         })
-
         app.on('window-all-closed', () => {
             if (this.quitRequested || process.platform !== 'darwin') {
                 app.quit()
             }
         })
+    }
+
+    // coport: A renderer that rejects the close also cancels the quit request.
+    cancelQuitRequest (): void {
+        this.quitRequested = false
     }
 
     init (): void {
@@ -211,7 +215,7 @@ export class Application {
             this.tray.setContextMenu(contextMenu)
         }
 
-        this.tray.setToolTip(`Tabby ${app.getVersion()}`)
+        this.tray.setToolTip(`${app.name} ${app.getVersion()}`) // coport: Use the packaged product name.
     }
 
     disableTray (): void {
@@ -300,7 +304,7 @@ export class Application {
             {
                 label: 'Application',
                 submenu: [
-                    { role: 'about', label: 'About Tabby' },
+                    { role: 'about', label: `About ${app.name}` },
                     { type: 'separator' },
                     {
                         label: 'Preferences',
@@ -323,7 +327,6 @@ export class Application {
                         label: 'Quit',
                         accelerator: 'Cmd+Q',
                         click: () => {
-                            this.quitRequested = true
                             app.quit()
                         },
                     },

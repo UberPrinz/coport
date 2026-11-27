@@ -100,6 +100,11 @@ export class ElectronHostWindow extends HostWindowService {
         this.electron.ipcRenderer.send('window-close')
     }
 
+    // coport: Complete the close handshake when a tab refuses to close.
+    cancelClose (): void {
+        this.electron.ipcRenderer.send('window-close-cancelled')
+    }
+
     setBounds (bounds: Bounds): void {
         this.electron.ipcRenderer.send('window-set-bounds', bounds)
     }

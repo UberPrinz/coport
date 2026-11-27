@@ -192,8 +192,12 @@ export class SSHTabComponent extends ConnectableTerminalTabComponent<SSHProfile>
         }
     }
 
-    async getRecoveryToken (options?: GetRecoveryTokenOptions): Promise<RecoveryToken> {
+    async getRecoveryToken (options?: GetRecoveryTokenOptions): Promise<RecoveryToken | null> {
         const token = await super.getRecoveryToken(options)
+        // coport: The shared connectable base allows tabs to opt out.
+        if (!token) {
+            return null
+        }
         if (this.profile.options.rememberCwd) {
             const cwd = await this.session?.getWorkingDirectory() ?? this.profile.options.cwd
             if (cwd) {

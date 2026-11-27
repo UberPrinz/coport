@@ -3,14 +3,13 @@ import { CommonModule } from '@angular/common'
 import { FormsModule } from '@angular/forms'
 import { NgbModule } from '@ng-bootstrap/ng-bootstrap'
 import { ToastrModule } from 'ngx-toastr'
-import TabbyCoreModule, { ConfigProvider, TabRecoveryProvider, HotkeyProvider, ProfileProvider } from 'tabby-core'
+import TabbyCoreModule, { ConfigProvider, HotkeyProvider, ProfileProvider } from 'tabby-core'
 import TabbyTerminalModule from 'tabby-terminal'
 
 import { SerialProfileSettingsComponent } from './components/serialProfileSettings.component'
 import { SerialTabComponent } from './components/serialTab.component'
 
 import { SerialConfigProvider } from './config'
-import { RecoveryProvider } from './recoveryProvider'
 import { SerialHotkeyProvider } from './hotkeys'
 import { SerialProfilesService } from './profiles'
 
@@ -27,7 +26,7 @@ import { SerialProfilesService } from './profiles'
     providers: [
         { provide: ConfigProvider, useClass: SerialConfigProvider, multi: true },
         { provide: ProfileProvider, useClass: SerialProfilesService, multi: true },
-        { provide: TabRecoveryProvider, useClass: RecoveryProvider, multi: true },
+        // coport: Serial profile views are opened explicitly after a restart.
         { provide: HotkeyProvider, useClass: SerialHotkeyProvider, multi: true },
     ],
     declarations: [

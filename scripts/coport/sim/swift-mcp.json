@@ -1,0 +1,285 @@
+{
+  "tools": [
+    {
+      "description": "Read shared terminal committed lines and current line. History remains readable while disconnected. wait_ms waits for new lines only with after_line.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_line": {
+            "minimum": -1,
+            "type": "integer"
+          },
+          "max_lines": {
+            "default": 200,
+            "maximum": 2000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "wait_ms": {
+            "default": 0,
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "read_terminal"
+    },
+    {
+      "description": "Queue raw bytes on the current serial port. Tabby shared sessions reject conflicting input. encoding is utf8 (default) or hex. 1...65536 encoded bytes.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "type": "string"
+          },
+          "encoding": {
+            "default": "utf8",
+            "enum": [
+              "utf8",
+              "hex"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
+      "name": "write_serial"
+    },
+    {
+      "description": "Execute a device sh command via ADB when available, otherwise the prepared idle serial shell. Serial timeout sends Ctrl+C; ADB timeout kills local adb only. Read terminal before prepare_shell if serial is not prepared.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "max_output_bytes": {
+            "default": 262144,
+            "maximum": 4194304,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "timeout_ms": {
+            "default": 30000,
+            "maximum": 600000,
+            "minimum": 1000,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "exec"
+    },
+    {
+      "description": "Get the currently viewed log snapshot: device_path, local_path, filter and search. log is null when no file is open. Local snapshot expires when Coport quits.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_view_state"
+    },
+    {
+      "description": "Prepare serial shell markers. First read_terminal and confirm a shell prompt ending # or $. Rejects fullscreen, pending human input and continuation prompts. Never prepares automatically.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "prepare_shell"
+    },
+    {
+      "description": "Open or join a Coport shared serial profile in Tabby and bind this MCP connection to its session.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "baud": {
+            "default": 115200,
+            "maximum": 4294967295,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "dataBits": {
+            "default": 8,
+            "maximum": 8,
+            "minimum": 5,
+            "type": "integer"
+          },
+          "flowControl": {
+            "default": "none",
+            "enum": [
+              "none",
+              "hardware",
+              "software"
+            ],
+            "type": "string"
+          },
+          "parity": {
+            "default": "none",
+            "enum": [
+              "none",
+              "odd",
+              "even"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "stopBits": {
+            "default": 1,
+            "enum": [
+              1,
+              2
+            ],
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "open_serial"
+    }
+  ],
+  "calls": [
+    {
+      "name": "read_terminal",
+      "result": {
+        "content": [
+          {
+            "text": "{\"gap\":false,\"lines\":[],\"fullscreen\":false,\"next_after_line\":-1,\"first_available_line\":0,\"last_line\":-1,\"current_line\":\"\"}",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "current_line": "",
+          "first_available_line": 0,
+          "fullscreen": false,
+          "gap": false,
+          "last_line": -1,
+          "lines": [],
+          "next_after_line": -1
+        }
+      }
+    },
+    {
+      "name": "write_serial",
+      "result": {
+        "content": [
+          {
+            "text": "{\"error\":{\"retryable\":true,\"message\":\"Serial port is not connected\",\"code\":\"no_serial\"}}",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "error": {
+            "code": "no_serial",
+            "message": "Serial port is not connected",
+            "retryable": true
+          }
+        }
+      }
+    },
+    {
+      "name": "exec",
+      "result": {
+        "content": [
+          {
+            "text": "{\"error\":{\"message\":\"Expected nonempty command, timeout_ms 1000...600000 and max_output_bytes 1024...4194304\",\"code\":\"invalid_argument\",\"retryable\":false}}",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "error": {
+            "code": "invalid_argument",
+            "message": "Expected nonempty command, timeout_ms 1000...600000 and max_output_bytes 1024...4194304",
+            "retryable": false
+          }
+        }
+      }
+    },
+    {
+      "name": "get_view_state",
+      "result": {
+        "content": [
+          {
+            "text": "{\"log\":null}",
+            "type": "text"
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "log": null
+        }
+      }
+    },
+    {
+      "name": "prepare_shell",
+      "result": {
+        "content": [
+          {
+            "text": "{\"error\":{\"message\":\"Serial connection is unavailable\",\"retryable\":true,\"code\":\"no_serial\"}}",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "error": {
+            "code": "no_serial",
+            "message": "Serial connection is unavailable",
+            "retryable": true
+          }
+        }
+      }
+    },
+    {
+      "name": "open_serial",
+      "result": {
+        "content": [
+          {
+            "text": "{\"error\":{\"message\":\"Invalid shared serial request\",\"retryable\":false,\"code\":\"invalid_argument\"}}",
+            "type": "text"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "error": {
+            "code": "invalid_argument",
+            "message": "Invalid shared serial request",
+            "retryable": false
+          }
+        }
+      }
+    }
+  ],
+  "config_conflict": {
+    "content": [
+      {
+        "text": "{\"error\":{\"retryable\":false,\"code\":\"config_conflict\",\"message\":\"Serial device is already using different parameters (115200 baud, 8 data bits, parity none, 1 stop bits, flow control none)\"}}",
+        "type": "text"
+      }
+    ],
+    "isError": true,
+    "structuredContent": {
+      "error": {
+        "code": "config_conflict",
+        "message": "Serial device is already using different parameters (115200 baud, 8 data bits, parity none, 1 stop bits, flow control none)",
+        "retryable": false
+      }
+    }
+  }
+}

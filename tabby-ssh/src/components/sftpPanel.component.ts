@@ -2,8 +2,8 @@ import * as C from 'constants'
 import { posix as path } from 'path'
 import { Component, Input, Output, EventEmitter, Inject, Optional } from '@angular/core'
 import { FileUpload, DirectoryUpload, DirectoryDownload, MenuItemOptions, NotificationsService, PlatformService } from 'tabby-core'
-import { SFTPSession, SFTPFile } from '../session/sftp'
-import { SSHSession } from '../session/ssh'
+import { SFTPFile } from '../session/sftp'
+import { FileBackend } from '../api/fileBackend'
 import { SFTPContextMenuItemProvider } from '../api'
 import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
 import { SFTPCreateDirectoryModalComponent } from './sftpCreateDirectoryModal.component'
@@ -19,18 +19,21 @@ interface PathSegment {
     styleUrls: ['./sftpPanel.component.scss'],
 })
 export class SFTPPanelComponent {
-    @Input() session: SSHSession
+    @Input() session: { openSFTP: () => Promise<FileBackend> } // coport: Used by SSH and ADB.
     @Output() closed = new EventEmitter<void>()
-    sftp: SFTPSession
+    sftp: FileBackend
     fileList: SFTPFile[]|null = null
     filteredFileList: SFTPFile[] = []
     @Input() path = '/'
     @Output() pathChange = new EventEmitter<string>()
     pathSegments: PathSegment[] = []
-    @Input() cwdDetectionAvailable = false
+    @Input() cwdDetectionAvailable: boolean | null = false
+    @Input() rootLabel = 'SFTP' // coport: ADB uses the same panel.
     editingPath: string|null = null
     showFilter = false
     filterText = ''
+    private navigation = 0
+    readonly getDropTarget = (): string => this.path
 
     constructor (
         private ngbModal: NgbModal,
@@ -53,6 +56,8 @@ export class SFTPPanelComponent {
     }
 
     async navigate (newPath: string, fallbackOnError = true): Promise<void> {
+        newPath = this.sftp.normalizePath?.(newPath) ?? newPath
+        const request = ++this.navigation
         const previousPath = this.path
         this.path = newPath
         this.pathChange.next(this.path)
@@ -76,11 +81,17 @@ export class SFTPPanelComponent {
         this.fileList = null
         this.filteredFileList = []
         try {
-            this.fileList = await this.sftp.readdir(this.path)
+            const entries = await this.sftp.readdir(newPath)
+            if (request !== this.navigation) {
+                return
+            }
+            this.fileList = entries
         } catch (error) {
-            this.notifications.error(error.message)
-            if (previousPath && fallbackOnError) {
-                this.navigate(previousPath, false)
+            if (request === this.navigation) {
+                this.notifications.error(error.message)
+                if (previousPath && fallbackOnError) {
+                    void this.navigate(previousPath, false)
+                }
             }
             return
         }
@@ -158,40 +169,40 @@ export class SFTPPanelComponent {
         this.navigate(path.dirname(this.path))
     }
 
+    private async resolveLink (item: SFTPFile): Promise<SFTPFile | undefined> {
+        if (!item.isSymlink) {
+            return item
+        }
+        try {
+            return await this.sftp.stat(item.fullPath)
+        } catch (error) {
+            this.notifications.error(error.message)
+            return undefined
+        }
+    }
+
     async open (item: SFTPFile): Promise<void> {
-        if (item.isDirectory) {
+        const target = await this.resolveLink(item)
+        if (!target) {
+            return
+        }
+        if (target.isDirectory) {
             await this.navigate(item.fullPath)
-        } else if (item.isSymlink) {
-            const target = path.resolve(this.path, await this.sftp.readlink(item.fullPath))
-            const stat = await this.sftp.stat(target)
-            if (stat.isDirectory) {
-                await this.navigate(item.fullPath)
-            } else {
-                await this.download(item.fullPath, stat.mode, stat.size)
-            }
         } else {
-            await this.download(item.fullPath, item.mode, item.size)
+            await this.download(item.fullPath, target.mode, target.size)
         }
     }
 
     async downloadItem (item: SFTPFile): Promise<void> {
-        if (item.isDirectory) {
+        const target = await this.resolveLink(item)
+        if (!target) {
+            return
+        }
+        if (target.isDirectory) {
             await this.downloadFolder(item)
-            return
+        } else {
+            await this.download(item.fullPath, target.mode, target.size)
         }
-
-        if (item.isSymlink) {
-            const target = path.resolve(this.path, await this.sftp.readlink(item.fullPath))
-            const stat = await this.sftp.stat(target)
-            if (stat.isDirectory) {
-                await this.downloadFolder(item)
-                return
-            }
-            await this.download(item.fullPath, stat.mode, stat.size)
-            return
-        }
-
-        await this.download(item.fullPath, item.mode, item.size)
     }
 
     async openCreateDirectoryModal (): Promise<void> {
@@ -208,48 +219,69 @@ export class SFTPPanelComponent {
     }
 
     async upload (): Promise<void> {
-        const transfers = await this.platform.startUpload({ multiple: true })
-        await Promise.all(transfers.map(t => this.uploadOne(t)))
+        const target = this.path
+        try {
+            const transfers = await this.platform.startUpload({ multiple: true })
+            await Promise.all(transfers.map(t => this.uploadOne(t, target)))
+        } catch (error) {
+            this.notifications.error(error.message)
+        }
     }
 
     async uploadFolder (): Promise<void> {
-        const transfer = await this.platform.startUploadDirectory()
-        await this.uploadOneFolder(transfer)
+        const target = this.path
+        try {
+            const transfer = await this.platform.startUploadDirectory()
+            await this.uploadOneFolder(transfer, target)
+        } catch (error) {
+            this.notifications.error(error.message)
+        }
     }
 
-    async uploadOneFolder (transfer: DirectoryUpload, accumPath = ''): Promise<void> {
-        const savedPath = this.path
-        for(const t of transfer.getChildrens()) {
-            if (t instanceof DirectoryUpload) {
+    async uploadOneFolder (transfer: DirectoryUpload, base = this.path): Promise<void> {
+        const request = this.navigation
+        try {
+            await this.uploadDirectoryEntries(transfer, base)
+            if (request === this.navigation && base === this.path) {
+                await this.navigate(base)
+            }
+        } catch (error) {
+            this.notifications.error(error.message)
+        }
+    }
+
+    private async uploadDirectoryEntries (transfer: DirectoryUpload, directory: string): Promise<void> {
+        for (const child of transfer.getChildrens()) {
+            const target = path.join(directory, child.getName())
+            if (child instanceof DirectoryUpload) {
                 try {
-                    await this.sftp.mkdir(path.posix.join(this.path, accumPath, t.getName()))
+                    await this.sftp.mkdir(target)
                 } catch {
                     // Intentionally ignoring errors from making duplicate dirs.
                 }
-                await this.uploadOneFolder(t, path.posix.join(accumPath, t.getName()))
+                await this.uploadDirectoryEntries(child, target)
             } else {
-                await this.sftp.upload(path.posix.join(this.path, accumPath, t.getName()), t)
+                await this.sftp.upload(target, child)
             }
-        }
-        if (this.path === savedPath) {
-            await this.navigate(this.path)
         }
     }
 
-    async uploadOne (transfer: FileUpload): Promise<void> {
-        const savedPath = this.path
-        await this.sftp.upload(path.join(this.path, transfer.getName()), transfer)
-        if (this.path === savedPath) {
-            await this.navigate(this.path)
+    async uploadOne (transfer: FileUpload, target = this.path): Promise<void> {
+        await this.sftp.upload(path.join(target, transfer.getName()), transfer)
+        if (this.path === target) {
+            await this.navigate(target)
         }
     }
 
     async download (itemPath: string, mode: number, size: number): Promise<void> {
-        const transfer = await this.platform.startDownload(path.basename(itemPath), mode, size)
-        if (!transfer) {
-            return
+        try {
+            const transfer = await this.platform.startDownload(path.basename(itemPath), mode, size, undefined, this.sftp.atomicDownloads)
+            if (transfer) {
+                await this.sftp.download(itemPath, transfer)
+            }
+        } catch (error) {
+            this.notifications.error(error.message)
         }
-        this.sftp.download(itemPath, transfer)
     }
 
     async downloadFolder (folder: SFTPFile): Promise<void> {
@@ -308,7 +340,7 @@ export class SFTPPanelComponent {
                 await transfer.createDirectory(itemRelativePath)
                 await this.downloadFolderRecursive(item, transfer, itemRelativePath)
             } else {
-                const fileDownload = await transfer.createFile(itemRelativePath, item.mode, item.size)
+                const fileDownload = await transfer.createFile(itemRelativePath, item.mode, item.size, this.sftp.atomicDownloads)
                 await this.sftp.download(item.fullPath, fileDownload)
             }
         }

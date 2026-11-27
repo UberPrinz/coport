@@ -4,6 +4,7 @@ import { posix as posixPath } from 'path'
 import { Injector } from '@angular/core'
 import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
+import type { FileBackend } from '../api/fileBackend'
 
 export interface SFTPFile {
     name: string
@@ -42,7 +43,7 @@ export class SFTPFileHandle {
     }
 }
 
-export class SFTPSession {
+export class SFTPSession implements FileBackend {
     get closed$ (): Observable<void> { return this.closed }
     private closed = new Subject<void>()
     private logger: Logger

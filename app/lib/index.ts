@@ -2,6 +2,8 @@
 import { logMainError } from './errors'
 
 import { app, ipcMain, Menu, dialog } from 'electron'
+import { mkdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
 // set userData Path on portable version
 import './portable'
@@ -9,6 +11,14 @@ import './portable'
 // set defaults of environment variables
 import 'dotenv/config'
 process.env.TABBY_PLUGINS ??= ''
+// coport: Explicit user-data overrides isolate config, caches, plugins and IPC.
+const isolatedDir = app.commandLine.getSwitchValue('user-data-dir')
+if (isolatedDir) {
+    const directory = resolve(isolatedDir)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    app.setPath('userData', directory)
+    process.env.TABBY_CONFIG_DIRECTORY = directory
+}
 process.env.TABBY_CONFIG_DIRECTORY ??= app.getPath('userData')
 
 process.setSourceMapsEnabled(true)
@@ -18,6 +28,12 @@ import { parseArgs } from './cli'
 import { Application } from './app'
 import electronDebug from 'electron-debug'
 import { loadConfig } from './config'
+// coport: Serial state belongs to the main process and survives renderer teardown.
+import { SessionManager } from './coport/sessionManager'
+import { installSerialIpc } from './coport/serialIpc'
+import { McpHost } from './coport/mcpHost'
+import { AdbService } from './coport/adbService'
+import { installAdbIpc } from './coport/adbIpc'
 
 const argv = parseArgs(process.argv, process.cwd())
 
@@ -34,14 +50,41 @@ try {
 process.mainModule = module
 
 const application = new Application(configStore)
+const serial = new SessionManager()
+const adb = new AdbService(isolatedDir ? process.env.COPORT_TEST_ADB : undefined, configStore?.terminal?.environment)
+const mcp = process.platform === 'darwin'
+    ? new McpHost(serial, isolatedDir && process.env.COPORT_TEST_SOCKET
+        ? process.env.COPORT_TEST_SOCKET : join(app.getPath('userData'), 'mcp.sock'), undefined, adb)
+    : undefined
+const background = process.argv.includes('--coport-background')
+
+let quitting = false
+let servicesStopped = false
+let stopAdbTransfers: (() => Promise<void>) | undefined = undefined
+// coport: Leave serial intact if the renderer cancels the quit request.
+app.on('will-quit', event => {
+    if (!servicesStopped) {
+        event.preventDefault()
+        if (!quitting) {
+            quitting = true
+            void Promise.allSettled([mcp?.stop(), serial.shutdown(), stopAdbTransfers?.()]).then(() => {
+                servicesStopped = true
+                app.quit()
+            })
+        }
+    }
+})
 
 // Register tabby:// URL scheme
-if (process.defaultApp) {
-    if (process.argv.length >= 2) {
-        app.setAsDefaultProtocolClient('tabby', process.execPath, [process.argv[1]])
+// coport: Isolated runs leave the host URL handler untouched.
+if (!isolatedDir) {
+    if (process.defaultApp) {
+        if (process.argv.length >= 2) {
+            app.setAsDefaultProtocolClient('tabby', process.execPath, [process.argv[1]])
+        }
+    } else {
+        app.setAsDefaultProtocolClient('tabby')
     }
-} else {
-    app.setAsDefaultProtocolClient('tabby')
 }
 
 ipcMain.on('app:new-window', () => {
@@ -61,6 +104,9 @@ if (argv.d) {
 }
 
 app.on('activate', async () => {
+    if (quitting || !app.isReady()) {
+        return
+    }
     if (!application.hasWindows()) {
         application.newWindow()
     } else {
@@ -81,7 +127,10 @@ app.on('open-url', async (event, url) => {
 })
 
 app.on('second-instance', async (_event, newArgv, cwd) => {
-    application.handleSecondInstance(newArgv, cwd)
+    // coport: A shim launch must not reveal any windows.
+    if (!quitting && !newArgv.includes('--coport-background')) {
+        application.handleSecondInstance(newArgv, cwd)
+    }
 })
 
 if (!app.requestSingleInstanceLock()) {
@@ -95,7 +144,7 @@ app.on('ready', async () => {
             {
                 label: 'New window',
                 click () {
-                    this.app.newWindow()
+                    void application.newWindow()
                 },
             },
         ]))
@@ -103,14 +152,24 @@ app.on('ready', async () => {
 
     try {
         application.init()
+        installSerialIpc(serial)
+        stopAdbTransfers = installAdbIpc(adb)
+        await mcp?.start()
+        console.log('coport: ready')
+        if (background) {
+            return
+        }
 
         const window = await application.newWindow({ hidden: argv.hidden })
         await window.ready
         window.passCliArguments(process.argv, process.cwd(), false)
         window.focus()
     } catch (err) {
-        logMainError('Failed to open window', err)
-        dialog.showErrorBox('Tabby failed to start', String(err?.stack ?? err))
+        await mcp?.stop()
+        logMainError('Failed to start Coport', err)
+        if (!background) {
+            dialog.showErrorBox('Coport failed to start', String(err?.stack ?? err))
+        }
         app.exit(1)
     }
 })

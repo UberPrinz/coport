@@ -1,0 +1,19 @@
+{
+  "name": "tabby-adb",
+  "version": "1.0.231-nightly.0",
+  "description": "Coport's ADB shell and file panel",
+  "keywords": ["tabby-builtin-plugin"],
+  "main": "dist/index.js",
+  "typings": "typings/index.d.ts",
+  "files": ["dist", "typings"],
+  "author": "Coport contributors",
+  "license": "MIT",
+  "peerDependencies": {
+    "@angular/core": "^15",
+    "@angular/common": "^15",
+    "tabby-core": "*",
+    "tabby-local": "*",
+    "tabby-ssh": "*",
+    "tabby-terminal": "*"
+  }
+}
