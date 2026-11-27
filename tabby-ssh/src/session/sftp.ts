@@ -5,6 +5,7 @@ import { Injector } from '@angular/core'
 import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
 import type { FileBackend } from '../api/fileBackend'
+import { runStagedSFTPUpload } from './sftpUpload'
 import {
     inspectPosixEntryViaParentReaddir,
     isSFTPChannelClosedError,
@@ -18,6 +19,7 @@ export interface SFTPFile {
     isDirectory: boolean
     isSymlink: boolean
     mode: number
+    hasMode?: boolean
     size: number
     modified: Date
 }
@@ -51,6 +53,7 @@ export class SFTPFileHandle {
 
 export class SFTPSession implements FileBackend {
     readonly atomicDownloads = true
+    readonly preserveExistingMode = true
     get closed$ (): Observable<void> { return this.closed }
     get rawSftp (): russh.SFTP { return this.sftp }
     private closed = new Subject<void>()
@@ -77,7 +80,11 @@ export class SFTPSession implements FileBackend {
         return resolvePosixPathWithReadlink(
             rawPath,
             target => this.sftp.readlink(target),
-            target => inspectPosixEntryViaParentReaddir(target, dir => this.readdir(dir)),
+            target => inspectPosixEntryViaParentReaddir(
+                target,
+                dir => this.readdir(dir),
+                p => this.stat(p),
+            ),
         )
     }
 
@@ -113,6 +120,7 @@ export class SFTPSession implements FileBackend {
             isDirectory: stats.type === russh.SFTPFileType.Directory,
             isSymlink: stats.type === russh.SFTPFileType.Symlink,
             mode: stats.permissions ?? 0,
+            hasMode: stats.permissions != null,
             size: stats.size,
             modified: new Date((stats.mtime ?? 0) * 1000),
         }
@@ -148,49 +156,11 @@ export class SFTPSession implements FileBackend {
 
     async upload (path: string, transfer: FileUpload): Promise<void> {
         this.logger.info('Uploading into', path)
-        const tempPath = path + '.tabby-upload'
-        let handle: SFTPFileHandle | null = null
-        let tempCreated = false
-        const optionalTransfer = transfer as {
-            setPendingCommit?: (pending: boolean) => void
-            setCompleted?: (completed: boolean) => void
-        }
-        optionalTransfer.setPendingCommit?.(true)
-        try {
-            if (transfer.isCancelled()) {
-                throw new Error('Upload cancelled')
-            }
-            handle = await this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE)
-            tempCreated = true
-            while (!transfer.isCancelled()) {
-                const chunk = await transfer.read()
-                if (transfer.isCancelled()) {
-                    break
-                }
-                if (!chunk.length) {
-                    await handle.close()
-                    handle = null
-                    await this.unlink(path).catch(() => null)
-                    await this.rename(tempPath, path)
-                    tempCreated = false
-                    optionalTransfer.setCompleted?.(true)
-                    transfer.close()
-                    return
-                }
-                await handle.write(chunk)
-            }
-            throw new Error('Upload cancelled')
-        } catch (e) {
-            transfer.setStatus(e instanceof Error ? e.message : String(e))
-            transfer.cancel()
-            await handle?.close().catch(() => null)
-            if (tempCreated) {
-                this.unlink(tempPath).catch(() => null)
-            }
-            throw e
-        } finally {
-            optionalTransfer.setPendingCommit?.(false)
-        }
+        await runStagedSFTPUpload(path, transfer, {
+            openTemp: tempPath => this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE),
+            unlink: targetPath => this.unlink(targetPath),
+            rename: (oldPath, newPath) => this.rename(oldPath, newPath),
+        })
     }
 
     async download (path: string, transfer: FileDownload): Promise<void> {
@@ -229,6 +199,7 @@ export class SFTPSession implements FileBackend {
             isDirectory: entry.metadata.type === russh.SFTPFileType.Directory,
             isSymlink: entry.metadata.type === russh.SFTPFileType.Symlink,
             mode: entry.metadata.permissions ?? 0,
+            hasMode: entry.metadata.permissions != null,
             size: entry.metadata.size,
             modified: new Date((entry.metadata.mtime ?? 0) * 1000),
         }

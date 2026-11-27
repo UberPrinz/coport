@@ -32,6 +32,7 @@ export interface ManagedSFTPChannel {
 
 const TRANSIENT_ERROR_PATTERN = /\b(timeout|timed out|etimedout|channel closed|disconnected|connection reset|connection refused|econnreset|epipe|broken pipe|not connected|session closed|offline|transport closed)\b/i
 const UNAVAILABLE_ERROR_PATTERN = /no\s*such\s*file|permission\s*denied|not\s*a\s*directory|enoent|eacces|enotdir|ssh_fx_no_such_file|ssh_fx_permission_denied|status(?:\s+code)?\s*[:=]?\s*[23]\b/i
+const PERMISSION_DENIED_ERROR_PATTERN = /permission\s*denied|eacces|ssh_fx_permission_denied|status(?:\s+code)?\s*[:=]?\s*3\b/i
 const CHANNEL_CLOSED_ERROR_PATTERN = /\b(channel\s+(?:is\s+)?closed|session\s+(?:is\s+)?closed|transport\s+(?:is\s+)?closed|stream\s+(?:is\s+)?closed|sftp\s+(?:channel|session)\s+(?:is\s+)?closed|broken\s+pipe|epipe|econnreset|connection\s+reset|disconnected|not\s+connected|unexpected\s*eof|end\s+of\s+file|eof)\b/i
 const EXPLICIT_NOT_SYMLINK_ERROR_PATTERN = /\b(einval|invalid\s+argument|not\s+a\s+sym(?:bolic\s+)?link)\b/i
 const GENERIC_SFTP_FAILURE_ERROR_PATTERN = /\bstatus_code\s*:\s*(?:failure|badmessage)\b|\bstatus\s*\(\s*(?:failure|bad\s*message)\s*\)|\bssh_fx_(?:failure|bad_message)\b|(?:^|[:(\s])(?:failure|bad\s*message)(?:\)|$)/i
@@ -130,6 +131,27 @@ export function isSFTPDirectoryUnavailableError (error: unknown): boolean {
     return UNAVAILABLE_ERROR_PATTERN.test(message)
 }
 
+export function isSFTPPermissionDeniedError (error: unknown): boolean {
+    if (typeof error === 'object' && error !== null) {
+        const candidate = error as {
+            code?: unknown
+            status?: unknown
+            statusCode?: unknown
+        }
+        if ([candidate.code, candidate.status, candidate.statusCode].some(value => value === 3)) {
+            return true
+        }
+        if (candidate.code === 'EACCES') {
+            return true
+        }
+    }
+    const message = extractErrorMessage(error)
+    if (TRANSIENT_ERROR_PATTERN.test(message)) {
+        return false
+    }
+    return PERMISSION_DENIED_ERROR_PATTERN.test(message)
+}
+
 export function isSFTPChannelClosedError (error: unknown): boolean {
     if (isSFTPDirectoryUnavailableError(error)) {
         return false
@@ -174,6 +196,7 @@ function isGenericSFTPFailureError (error: unknown): boolean {
 export interface PosixPathEntryType {
     isDirectory: boolean
     isSymlink: boolean
+    followedSymlinks?: boolean
 }
 
 export interface PosixReaddirEntryLike {
@@ -185,6 +208,7 @@ export interface PosixReaddirEntryLike {
 export async function inspectPosixEntryViaParentReaddir (
     targetPath: string,
     readdir: (dirPath: string) => Promise<PosixReaddirEntryLike[]>,
+    statFallback?: (targetPath: string) => Promise<PosixPathEntryType>,
 ): Promise<PosixPathEntryType | null> {
     if (!targetPath || targetPath === '/') {
         return { isDirectory: true, isSymlink: false }
@@ -198,7 +222,20 @@ export async function inspectPosixEntryViaParentReaddir (
     const lastSlash = trimmed.lastIndexOf('/')
     const parentDir = lastSlash <= 0 ? '/' : trimmed.slice(0, lastSlash)
     const baseName = lastSlash < 0 ? trimmed : trimmed.slice(lastSlash + 1)
-    const entries = await readdir(parentDir)
+    let entries: PosixReaddirEntryLike[] = []
+    try {
+        entries = await readdir(parentDir)
+    } catch (error) {
+        if (statFallback && isSFTPPermissionDeniedError(error)) {
+            const info = await statFallback(trimmed)
+            return {
+                isDirectory: info.isDirectory,
+                isSymlink: info.isSymlink,
+                followedSymlinks: true,
+            }
+        }
+        throw error
+    }
     const match = entries.find(entry => entry.name === baseName)
     if (!match) {
         return null
@@ -207,6 +244,52 @@ export async function inspectPosixEntryViaParentReaddir (
         isDirectory: match.isDirectory,
         isSymlink: match.isSymlink,
     }
+}
+
+async function recheckNonSymlinkViaReadlink (
+    candidate: string,
+    readlink: (targetPath: string) => Promise<string>,
+): Promise<string | null> {
+    try {
+        return await readlink(candidate)
+    } catch (recheckError) {
+        if (
+            isSFTPChannelClosedError(recheckError) ||
+            isTransientConnectionError(recheckError) ||
+            isSFTPDirectoryUnavailableError(recheckError)
+        ) {
+            throw recheckError
+        }
+        if (isExplicitNotSymlinkError(recheckError) || isGenericSFTPFailureError(recheckError)) {
+            return null
+        }
+        throw recheckError
+    }
+}
+
+async function resolveNonSymlinkOrRetryReadlink (
+    candidate: string,
+    originalError: unknown,
+    readlink: (targetPath: string) => Promise<string>,
+    inspectEntry?: (targetPath: string) => Promise<PosixPathEntryType | null>,
+): Promise<string | null> {
+    if (!inspectEntry) {
+        if (isExplicitNotSymlinkError(originalError)) {
+            return null
+        }
+        throw originalError
+    }
+    const info = await inspectEntry(candidate)
+    if (!info) {
+        throw Object.assign(new Error(`No such file: ${candidate}`), { code: 'ENOENT' })
+    }
+    if (!info.followedSymlinks && info.isSymlink) {
+        return readlink(candidate)
+    }
+    if (!info.isDirectory) {
+        throw originalError
+    }
+    return info.followedSymlinks ? recheckNonSymlinkViaReadlink(candidate, readlink) : null
 }
 
 export async function resolvePosixPathWithReadlink (
@@ -252,25 +335,7 @@ export async function resolvePosixPathWithReadlink (
                 throw error
             }
             if (isExplicitNotSymlinkError(error) || isGenericSFTPFailureError(error)) {
-                if (!inspectEntry) {
-                    if (isExplicitNotSymlinkError(error)) {
-                        linkTarget = null
-                    } else {
-                        throw error
-                    }
-                } else {
-                    const info = await inspectEntry(candidate)
-                    if (!info) {
-                        throw Object.assign(new Error(`No such file: ${candidate}`), { code: 'ENOENT' })
-                    }
-                    if (info.isSymlink) {
-                        linkTarget = await readlink(candidate)
-                    } else if (info.isDirectory) {
-                        linkTarget = null
-                    } else {
-                        throw error
-                    }
-                }
+                linkTarget = await resolveNonSymlinkOrRetryReadlink(candidate, error, readlink, inspectEntry)
             } else {
                 throw error
             }
@@ -472,11 +537,18 @@ export async function finalizeCanonicalDirectoryListing<T> (
         return { cancelled: false, path: canonicalPath, entries: initialEntries }
     }
     onCanonicalPath?.(canonicalPath)
-    const freshEntries = await readdir(canonicalPath)
-    if (isStale()) {
-        return { cancelled: true, path: canonicalPath, entries: [] }
+    try {
+        const freshEntries = await readdir(canonicalPath)
+        if (isStale()) {
+            return { cancelled: true, path: canonicalPath, entries: [] }
+        }
+        return { cancelled: false, path: canonicalPath, entries: freshEntries }
+    } catch (error) {
+        if (isStale()) {
+            return { cancelled: true, path: canonicalPath, entries: [] }
+        }
+        throw error
     }
-    return { cancelled: false, path: canonicalPath, entries: freshEntries }
 }
 
 export async function resolveCanonicalReadableDirectory<T> (
@@ -584,7 +656,9 @@ export async function resolveCanonicalReadableDirectory<T> (
             }
             const unavailable = isUnavailable(error)
             if (unavailable) {
-                const nextParent = getParentDirectoryPath(result.path, preserveDotDot)
+                // The finalizer reports the canonical path before re-reading it.
+                visitedStarts.add(errorTargetPath)
+                const nextParent = getParentDirectoryPath(errorTargetPath, preserveDotDot)
                 if (nextParent !== null && !visitedStarts.has(nextParent)) {
                     attemptPath = nextParent
                     continue

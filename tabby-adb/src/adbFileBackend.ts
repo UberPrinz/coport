@@ -31,6 +31,7 @@ export async function adbRequest<T> (action: string, args?: object): Promise<T> 
 
 export class AdbFileBackend implements FileBackend {
     readonly atomicDownloads = true
+    readonly preserveExistingMode = false
     readonly normalizePath = (value: string): string => posix.normalize(value)
     readonly isDirectoryUnavailable = (error: unknown): boolean =>
         typeof error === 'object' && error !== null && (error as { reason?: unknown }).reason === 'unreadable_directory'

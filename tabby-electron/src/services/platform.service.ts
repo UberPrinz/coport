@@ -12,6 +12,7 @@ import { ElectronHostWindow } from './hostWindow.service'
 import { ShellIntegrationService } from './shellIntegration.service'
 import { ElectronHostAppService } from './hostApp.service'
 import { configPath } from '../../../app/lib/config'
+import { resolveAtomicDownloadMode } from '../../../app/lib/coport/downloadMode'
 const fontManager = require('fontmanager-redux') // eslint-disable-line
 
 /* eslint-disable block-scoped-var */
@@ -338,11 +339,12 @@ export class ElectronPlatformService extends PlatformService {
 
     async startDownload (
         name: string,
-        mode: number,
+        mode: number | undefined,
         size: number,
         filePath?: string,
         atomic = false,
         canOpen?: () => boolean,
+        preserveExistingMode = false,
     ): Promise<FileDownload|null> {
         if (!filePath) {
             const result = await this.electron.dialog.showSaveDialog(
@@ -359,7 +361,7 @@ export class ElectronPlatformService extends PlatformService {
         if (canOpen && !canOpen()) {
             return null
         }
-        const transfer = new ElectronFileDownload(filePath, mode, size, this.electron, atomic, canOpen)
+        const transfer = new ElectronFileDownload(filePath, mode, size, this.electron, atomic, canOpen, preserveExistingMode)
         try {
             await wrapPromise(this.zone, transfer.open())
         } catch (error) {
@@ -523,11 +525,12 @@ class ElectronFileDownload extends FileDownload {
 
     constructor (
         private filePath: string,
-        private mode: number,
+        private mode: number | undefined,
         private size: number,
         private electron: ElectronService,
         private atomic = false,
         private canCommit?: () => boolean,
+        private preserveExistingMode = false,
     ) {
         super()
         this.powerSaveBlocker = electron.powerSaveBlocker.start('prevent-app-suspension')
@@ -578,9 +581,9 @@ class ElectronFileDownload extends FileDownload {
                 if (this.closed || this.isCancelled() || (this.canCommit && !this.canCommit())) {
                     throw new Error('Download cancelled')
                 }
-                this.file = await fs.open(this.temporary.path, 'r+', this.mode)
+                this.file = await fs.open(this.temporary.path, 'r+')
             } else {
-                this.file = await fs.open(this.filePath, 'w', this.mode)
+                this.file = await fs.open(this.filePath, 'w', this.mode ?? 0o666)
             }
             if (this.closed || this.isCancelled() || (this.canCommit && !this.canCommit())) {
                 throw new Error('Download cancelled')
@@ -629,13 +632,9 @@ class ElectronFileDownload extends FileDownload {
                 await this.waitForClose()
                 throw new Error('Download cancelled')
             }
-            const umask = process.umask()
-            const requestedMode = (this.mode & 0o777) ? (this.mode & 0o777 & ~umask) : (0o666 & ~umask)
-            let targetMode = requestedMode
+            let existingMode: number | undefined = undefined
             try {
-                const existingStat = await fs.stat(this.filePath)
-                const existingMode = existingStat.mode & 0o7777
-                targetMode = (existingMode & 0o7000) | (existingMode & requestedMode)
+                existingMode = (await fs.stat(this.filePath)).mode
             } catch (error) {
                 const isNotFound = typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT'
                 if (!isNotFound) {
@@ -644,6 +643,7 @@ class ElectronFileDownload extends FileDownload {
                     throw error
                 }
             }
+            const targetMode = resolveAtomicDownloadMode(this.mode, process.umask(), existingMode, this.preserveExistingMode)
             if (this.isCommitAborted()) {
                 this.cancel()
                 await this.waitForClose()
@@ -741,11 +741,17 @@ class ElectronDirectoryDownload extends DirectoryDownload {
         await fs.mkdir(fullPath, { recursive: true })
     }
 
-    async createFile (relativePath: string, mode: number, size: number, atomic = false): Promise<FileDownload> {
+    async createFile (
+        relativePath: string,
+        mode: number | undefined,
+        size: number,
+        atomic = false,
+        preserveExistingMode = false,
+    ): Promise<FileDownload> {
         const fullPath = resolveInsideBase(this.basePath, relativePath)
         await fs.mkdir(path.dirname(fullPath), { recursive: true })
 
-        const fileDownload = new ElectronFileDownload(fullPath, mode, size, this.electron, atomic, this.canCommit)
+        const fileDownload = new ElectronFileDownload(fullPath, mode, size, this.electron, atomic, this.canCommit, preserveExistingMode)
         await wrapPromise(this.zone, fileDownload.open())
         return fileDownload
     }

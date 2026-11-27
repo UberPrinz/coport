@@ -740,6 +740,10 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         }
     }
 
+    private getDownloadMode (item: SFTPFile): number | undefined {
+        return item.hasMode === false ? undefined : item.mode
+    }
+
     async open (item: SFTPFile, options?: { clearFilterOnDownload?: boolean }): Promise<void> {
         const backend = this.backend
         const epoch = this._sessionEpoch
@@ -757,7 +761,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
             if (options?.clearFilterOnDownload) {
                 this.clearFilter(true)
             }
-            await this.download(item.fullPath, target.mode, target.size, backend, epoch)
+            await this.download(item.fullPath, this.getDownloadMode(target), target.size, backend, epoch)
             if (options?.clearFilterOnDownload && this.isSessionActive(epoch, backend)) {
                 this.focusPanelIfOwned()
             }
@@ -790,7 +794,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         if (target.isDirectory) {
             await this.downloadFolder(item, backend, epoch)
         } else {
-            await this.download(item.fullPath, target.mode, target.size, backend, epoch)
+            await this.download(item.fullPath, this.getDownloadMode(target), target.size, backend, epoch)
         }
     }
 
@@ -980,7 +984,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
 
     async download (
         itemPath: string,
-        mode: number,
+        mode: number | undefined,
         size: number,
         backend: FileBackend | null = this.backend,
         epoch = this._sessionEpoch,
@@ -996,6 +1000,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
                 undefined,
                 backend.atomicDownloads,
                 () => this.isSessionActive(epoch, backend),
+                backend.preserveExistingMode,
             )
             if (!transfer) {
                 return
@@ -1118,7 +1123,13 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
                 }
                 await this.downloadFolderRecursive(item, transfer, itemRelativePath, backend, epoch)
             } else {
-                const fileDownload = await transfer.createFile(itemRelativePath, item.mode, item.size, backend.atomicDownloads)
+                const fileDownload = await transfer.createFile(
+                    itemRelativePath,
+                    this.getDownloadMode(item),
+                    item.size,
+                    backend.atomicDownloads,
+                    backend.preserveExistingMode,
+                )
                 if (!this.isSessionActive(epoch, backend)) {
                     fileDownload.cancel()
                     throw new Error('Download cancelled')

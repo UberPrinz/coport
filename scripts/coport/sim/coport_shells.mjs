@@ -85,6 +85,15 @@ async function prepareNavigationFixtures () {
     await symlink('/Users', join(sshRoot, 'to-root-child'))
     await writeFile(join(sshRoot, 'readable', 'readable-marker.txt'), 'readable\n')
     await chmod(join(sshRoot, 'readable', 'no-perm'), 0o000)
+    await mkdir(join(sshRoot, 'search-only', 'team', 'child'), { recursive: true })
+    await writeFile(join(sshRoot, 'search-only', 'team', 'team-marker.txt'), 'team\n')
+    await chmod(join(sshRoot, 'search-only'), 0o111)
+    await mkdir(join(sshRoot, 'srv', 'shared', 'nested'), { recursive: true })
+    await writeFile(join(sshRoot, 'srv', 'srv-marker.txt'), 'srv\n')
+    await writeFile(join(sshRoot, 'srv', 'shared', 'shared-marker.txt'), 'shared\n')
+    await mkdir(join(sshRoot, 'home-user'), { recursive: true })
+    await writeFile(join(sshRoot, 'home-user', 'home-marker.txt'), 'home\n')
+    await symlink(join(sshRoot, 'srv', 'shared', 'nested'), join(sshRoot, 'home-user', 'link'))
 }
 
 async function launchApp (env, childrenLogs) {
@@ -1532,11 +1541,16 @@ try {
             errorBannerVisible: Boolean(s1RemovedFallback.tabEl.querySelector('[data-testid="error-banner"]')),
             recentUnchanged: JSON.stringify(s1RemovedFallback.panel.recentPaths) === JSON.stringify(recentBeforeFailureSymlink),
         }
+        // The initial listing sees a regular directory. Swap it for a symlink before inspection.
+        fsMod.unlinkSync(retargetLinkPath)
+        fsMod.mkdirSync(retargetLinkPath)
         let oneShotReadlinkCalls = 0
         failSymBackend.rawSftp.readlink = async target => {
             if (target === retargetLinkPath) {
                 oneShotReadlinkCalls++
                 if (oneShotReadlinkCalls === 1) {
+                    fsMod.rmdirSync(retargetLinkPath)
+                    setRetargetLink(retargetParentAChild)
                     throw new Error('Status(Failure)')
                 }
             }
@@ -1553,6 +1567,31 @@ try {
             path: s1RemovedFallback.panel.path,
             foldedToSshRoot: s1RemovedFallback.panel.path === ${JSON.stringify(sshRoot)},
             hasOnlyInA: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'only-in-parent-a.txt')),
+        }
+
+        // 4d-search-only-0111 (Round-7 P2 #4): Regular directory under chmod 0111 search-only parent resolves '..' cleanly on real sshd (both manual navigate and startup restore).
+        const searchOnlyDotDot = ${JSON.stringify(join(sshRoot, 'search-only', 'team', 'child') + '/..')}
+        const searchOnlyTeam = ${JSON.stringify(join(sshRoot, 'search-only', 'team'))}
+        await s1RemovedFallback.panel.navigate(searchOnlyDotDot)
+        s1RemovedFallback.panel.cdr.detectChanges()
+        const searchOnly0111Manual = {
+            path: s1RemovedFallback.panel.path,
+            hasTeamMarker: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'team-marker.txt')),
+            errorBannerVisible: Boolean(s1RemovedFallback.tabEl.querySelector('[data-testid="error-banner"]')),
+        }
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: searchOnlyDotDot,
+        })
+        const s1SearchOnlyStartup = await openSftpFor('127.0.0.1')
+        s1SearchOnlyStartup.panel.cdr.detectChanges()
+        const searchOnly0111Startup = {
+            path: s1SearchOnlyStartup.panel.path,
+            hasTeamMarker: Boolean(s1SearchOnlyStartup.panel.fileList?.some(e => e.name === 'team-marker.txt')),
+            loadErrorIsNull: s1SearchOnlyStartup.panel.loadError === null,
+            bannerVisible: Boolean(s1SearchOnlyStartup.tabEl.querySelector('[data-testid="fallback-banner"]')),
         }
 
         // 4e-deep-fallback (Round-6 P2 #4): > 16 levels deep with canonicalization EACCES at every level never stalls at Loading.
@@ -1651,6 +1690,62 @@ try {
             tab1.sshSession.openSFTP = origOpenForDeepFallback
         }
 
+        // 4f-canonical-reread-fallback (Round-7 P2 #5): /home-user/link/.. initial readdir succeeds, canonicalizes to /srv/shared, then /srv/shared re-read throws EACCES -> startup fallback lands directly on /srv (skipping /home-user/link) with accurate notice.
+        const rawLinkDotDot = ${JSON.stringify(join(sshRoot, 'home-user', 'link') + '/..')}
+        const rawLinkPath = ${JSON.stringify(join(sshRoot, 'home-user', 'link'))}
+        const rawHomeUserPath = ${JSON.stringify(join(sshRoot, 'home-user'))}
+        const canonicalSharedPath = ${JSON.stringify(join(sshRoot, 'srv', 'shared'))}
+        const canonicalSrvPath = ${JSON.stringify(join(sshRoot, 'srv'))}
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: rawLinkDotDot,
+        })
+        const canonicalRereadLog = []
+        let resolvedRawPath = false
+        let restoreCanonicalBackend = () => {}
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForDeepFallback(...args)
+            const origResolve = backend.resolvePath
+            const origReaddir = backend.readdir
+            restoreCanonicalBackend = () => {
+                backend.resolvePath = origResolve
+                backend.readdir = origReaddir
+            }
+            backend.resolvePath = async dirPath => {
+                const canonical = await origResolve.call(backend, dirPath)
+                if (dirPath === rawLinkDotDot && canonical === canonicalSharedPath) {
+                    resolvedRawPath = true
+                    fsMod.chmodSync(canonicalSharedPath, 0o111)
+                }
+                return canonical
+            }
+            backend.readdir = async dirPath => {
+                if (resolvedRawPath) canonicalRereadLog.push(dirPath)
+                return origReaddir.call(backend, dirPath)
+            }
+            return backend
+        }
+        let s1CanonicalReread
+        try {
+            s1CanonicalReread = await openSftpFor('127.0.0.1')
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForDeepFallback
+            restoreCanonicalBackend()
+            fsMod.chmodSync(canonicalSharedPath, 0o700)
+        }
+        s1CanonicalReread.panel.cdr.detectChanges()
+        const canonicalFallbackBannerText = s1CanonicalReread.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent?.trim() ?? ''
+        const canonicalRereadFallback = {
+            path: s1CanonicalReread.panel.path,
+            hasSrvMarker: Boolean(s1CanonicalReread.panel.fileList?.some(e => e.name === 'srv-marker.txt')),
+            rereadCanonicalThenParent: JSON.stringify(canonicalRereadLog) === JSON.stringify([canonicalSharedPath, canonicalSrvPath]),
+            visitedRawLinkParent: canonicalRereadLog.includes(rawLinkPath) || canonicalRereadLog.includes(rawHomeUserPath),
+            bannerVisible: Boolean(s1CanonicalReread.tabEl.querySelector('[data-testid="fallback-banner"]')),
+            bannerHasRequestedAndResolved: canonicalFallbackBannerText.includes('home-user/link/..') && canonicalFallbackBannerText.includes(canonicalSrvPath),
+        }
+
         // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch with independent Bob backend (delete/upload isolation) + LRU eviction live refresh
         await closeSftpFor('127.0.0.1')
         const origProfileUser = tab1.profile.options.user
@@ -1744,6 +1839,7 @@ try {
             let cancelledSshAtomicDownloadResult = null
             let atomicDownloadPermResult = null
             let atomicDownloadCancelRenameResult = null
+            let uploadCancelCommitResult = null
             let scanFailureCleanupResult = null
             let cancelQueuedUploadResult = null
             let zeroByteQueuedUploadResult = null
@@ -1975,16 +2071,36 @@ try {
                     tempFilesAfterCommit: tempFilesAfterCommit.length,
                 }
 
-                // 5b-download-perms (Round-6 P2 #1): Overwriting existing 0600 file with remote 0644 preserves 0600; new files apply mode & ~umask.
+                // 5b-download-perms (Round-6 P2 #1 & Round-7 P2 #2/#3):
+                // - SSH overwrite strictly preserves existing mode (0755 stays 0755, 0600 stays 0600 — neither loosened nor tightened).
+                // - New SSH download distinguishes explicit remote 0000 (stays strictly 0000) vs omitted permissions: undefined (falls back to 0666 & ~umask).
+                const existing0755Dest = ${JSON.stringify(join(run, 'ssh-perm-existing-0755.txt'))}
                 const existing0600Dest = ${JSON.stringify(join(run, 'ssh-perm-existing-0600.txt'))}
                 const new0644Dest = ${JSON.stringify(join(run, 'ssh-perm-new-0644.txt'))}
                 const new0755Dest = ${JSON.stringify(join(run, 'ssh-perm-new-0755.txt'))}
+                const new0000Dest = ${JSON.stringify(join(run, 'ssh-perm-new-0000.txt'))}
+                const newUndefDest = ${JSON.stringify(join(run, 'ssh-perm-new-undef.txt'))}
+                fsMod.writeFileSync(existing0755Dest, 'EXEC-OLD')
+                fsMod.chmodSync(existing0755Dest, 0o755)
                 fsMod.writeFileSync(existing0600Dest, 'SECRET-OLD')
                 fsMod.chmodSync(existing0600Dest, 0o600)
-                try { fsMod.unlinkSync(new0644Dest) } catch {}
-                try { fsMod.unlinkSync(new0755Dest) } catch {}
+                for (const p of [new0644Dest, new0755Dest, new0000Dest, newUndefDest]) {
+                    try { fsMod.unlinkSync(p) } catch {}
+                }
                 const currentUmask = process.umask()
+                const sftpWithoutPermItem = samePanelBefore.sftp._makeFile(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, {
+                    name: 'a.txt',
+                    metadata: { type: 1, permissions: undefined, size: 6, mtime: 0 },
+                })
+                const sftpExplicitZeroItem = samePanelBefore.sftp._makeFile(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, {
+                    name: 'a.txt',
+                    metadata: { type: 1, permissions: 0, size: 6, mtime: 0 },
+                })
                 try {
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: existing0755Dest }),
+                    }
+                    await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
                     samePanelBefore.platform.electron.dialog = {
                         showSaveDialog: async () => ({ canceled: false, filePath: existing0600Dest }),
                     }
@@ -1997,14 +2113,31 @@ try {
                         showSaveDialog: async () => ({ canceled: false, filePath: new0755Dest }),
                     }
                     await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o755, 6)
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: new0000Dest }),
+                    }
+                    await samePanelBefore.downloadItem(sftpExplicitZeroItem)
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: newUndefDest }),
+                    }
+                    await samePanelBefore.downloadItem(sftpWithoutPermItem)
                 } finally {
                     samePanelBefore.platform.electron.dialog = origElectronDialog
                 }
+                const new0000ActualMode = fsMod.statSync(new0000Dest).mode & 0o7777
+                fsMod.chmodSync(new0000Dest, 0o600)
                 atomicDownloadPermResult = {
+                    existing0755ContentUpdated: fsMod.readFileSync(existing0755Dest, 'utf8') === 'sub-a\\n',
+                    existingModePreserved0755: (fsMod.statSync(existing0755Dest).mode & 0o7777) === 0o755,
                     existingContentUpdated: fsMod.readFileSync(existing0600Dest, 'utf8') === 'sub-a\\n',
                     existingModePreserved0600: (fsMod.statSync(existing0600Dest).mode & 0o7777) === 0o600,
                     new0644ModeMatchesUmask: (fsMod.statSync(new0644Dest).mode & 0o7777) === (0o644 & ~currentUmask),
                     new0755ModeMatchesUmask: (fsMod.statSync(new0755Dest).mode & 0o7777) === (0o755 & ~currentUmask),
+                    explicitZeroHasMode: sftpExplicitZeroItem.hasMode === true,
+                    undefinedPermHasModeFalse: sftpWithoutPermItem.hasMode === false,
+                    newExplicit0000StrictlyZero: new0000ActualMode === 0o000,
+                    newUndefinedModeMatchesUmask: (fsMod.statSync(newUndefDest).mode & 0o7777) === (0o666 & ~currentUmask),
+                    newPermissionsPayloadsMatch: [new0000Dest, newUndefDest].every(p => fsMod.readFileSync(p, 'utf8') === 'sub-a\\n'),
                 }
 
                 // 5b-download-cancel-rename (Round-6 P2 #2): Cancel before fs.rename preserves target + isCancelled=true; cancel during fs.rename leaves isCancelled=false & isComplete=true when rename succeeds, and cleans up + reflects failure when rename rejects.
@@ -2118,6 +2251,135 @@ try {
                     duringRenameFailCancelled: Boolean(duringRenameFailTransfer?.isCancelled()),
                     duringRenameFailComplete: Boolean(duringRenameFailTransfer?.isComplete()),
                     duringRenameFailTempFilesLeft: tempLeftAfterRenameFail,
+                }
+
+                // 5b-upload-cancel-commit (Round-7 P2 #1): Real SFTPSession.upload() on real sshd:
+                // - Cancel during handle.close() leaves remote target untouched (no unlink/rename), cleans up .tabby-upload, transfer isCancelled=true / isComplete=false.
+                // - Cancel during rename commit reflects actual commit outcome (ok => isCancelled=false & isComplete=true; fail => isCancelled=true & temp cleaned).
+                const uploadSrcPath = ${JSON.stringify(join(run, 'upload-cancel-src.txt'))}
+                fsMod.writeFileSync(uploadSrcPath, 'NEW-UPLOADED-PAYLOAD')
+                const remoteCloseCancelPath = ${JSON.stringify(join(sshRoot, 'sub-a', 'upload-close-cancel.txt'))}
+                const remoteCommitOkPath = ${JSON.stringify(join(sshRoot, 'sub-a', 'upload-commit-ok.txt'))}
+                const remoteCommitFailPath = ${JSON.stringify(join(sshRoot, 'sub-a', 'upload-commit-fail.txt'))}
+                fsMod.writeFileSync(remoteCloseCancelPath, 'REMOTE-ORIGINAL-CONTENT')
+                fsMod.writeFileSync(remoteCommitOkPath, 'OLD-REMOTE-OK')
+                fsMod.writeFileSync(remoteCommitFailPath, 'BEFORE-COMMIT-FAIL')
+                const uploadSftp = samePanelBefore.sftp
+                const origUploadOpen = uploadSftp.open.bind(uploadSftp)
+                const origUploadRename = uploadSftp.rename.bind(uploadSftp)
+                const origUploadUnlink = uploadSftp.unlink.bind(uploadSftp)
+
+                // Case A: Cancel during handle.close()
+                let releaseUploadClose = null
+                let targetUnlinkedOnCloseCancel = false
+                let targetRenamedOnCloseCancel = false
+                let closeCancelThrew = false
+                let closeCancelTempPath
+                uploadSftp.open = async (p, mode) => {
+                    const handle = await origUploadOpen(p, mode)
+                    if (p.endsWith('.tabby-upload')) {
+                        closeCancelTempPath = p
+                        const origHandleClose = handle.close.bind(handle)
+                        handle.close = () => new Promise((resolve, reject) => {
+                            releaseUploadClose = () => origHandleClose().then(resolve, reject)
+                        })
+                    }
+                    return handle
+                }
+                uploadSftp.unlink = async p => {
+                    if (p === remoteCloseCancelPath) {
+                        targetUnlinkedOnCloseCancel = true
+                    }
+                    return origUploadUnlink(p)
+                }
+                uploadSftp.rename = async (src, dst) => {
+                    if (dst === remoteCloseCancelPath) {
+                        targetRenamedOnCloseCancel = true
+                    }
+                    return origUploadRename(src, dst)
+                }
+                const [uploadCloseTransfer] = await origStartUpload.call(samePanelBefore.platform, { multiple: false }, [uploadSrcPath])
+                try {
+                    const upPromise = uploadSftp.upload(remoteCloseCancelPath, uploadCloseTransfer).catch(() => { closeCancelThrew = true })
+                    const upDeadline = Date.now() + 5000
+                    while (!releaseUploadClose && Date.now() < upDeadline) await new Promise(r => setTimeout(r, 20))
+                    uploadCloseTransfer.cancel()
+                    releaseUploadClose()
+                    await upPromise
+                } finally {
+                    uploadSftp.open = origUploadOpen
+                    uploadSftp.unlink = origUploadUnlink
+                    uploadSftp.rename = origUploadRename
+                }
+
+                // Case B: Cancel during rename commit that succeeds
+                let releaseUploadRenameOk = null
+                let commitOkTempPath
+                uploadSftp.rename = (src, dst) => {
+                    if (dst === remoteCommitOkPath) {
+                        commitOkTempPath = src
+                        return new Promise((resolve, reject) => {
+                            releaseUploadRenameOk = () => origUploadRename(src, dst).then(resolve, reject)
+                        })
+                    }
+                    return origUploadRename(src, dst)
+                }
+                const [uploadCommitOkTransfer] = await origStartUpload.call(samePanelBefore.platform, { multiple: false }, [uploadSrcPath])
+                try {
+                    const upPromise = uploadSftp.upload(remoteCommitOkPath, uploadCommitOkTransfer)
+                    const upDeadline = Date.now() + 5000
+                    while (!releaseUploadRenameOk && Date.now() < upDeadline) await new Promise(r => setTimeout(r, 20))
+                    uploadCommitOkTransfer.cancel()
+                    releaseUploadRenameOk()
+                    await upPromise
+                } finally {
+                    uploadSftp.rename = origUploadRename
+                }
+
+                // Case C: Cancel during rename commit that fails
+                let releaseUploadRenameFail = null
+                let commitFailThrew = false
+                let commitFailTempPath
+                uploadSftp.rename = (src, dst) => {
+                    if (dst === remoteCommitFailPath) {
+                        commitFailTempPath = src
+                        return new Promise((_resolve, reject) => {
+                            releaseUploadRenameFail = () => reject(new Error('Status(Failure)'))
+                        })
+                    }
+                    return origUploadRename(src, dst)
+                }
+                const [uploadCommitFailTransfer] = await origStartUpload.call(samePanelBefore.platform, { multiple: false }, [uploadSrcPath])
+                try {
+                    const upPromise = uploadSftp.upload(remoteCommitFailPath, uploadCommitFailTransfer).catch(() => { commitFailThrew = true })
+                    const upDeadline = Date.now() + 5000
+                    while (!releaseUploadRenameFail && Date.now() < upDeadline) await new Promise(r => setTimeout(r, 20))
+                    uploadCommitFailTransfer.cancel()
+                    releaseUploadRenameFail()
+                    await upPromise
+                } finally {
+                    uploadSftp.rename = origUploadRename
+                }
+
+                uploadCancelCommitResult = {
+                    closeCancelThrew,
+                    closeCancelTargetIntact: fsMod.readFileSync(remoteCloseCancelPath, 'utf8') === 'REMOTE-ORIGINAL-CONTENT',
+                    closeCancelTargetUnlinked: targetUnlinkedOnCloseCancel,
+                    closeCancelTargetRenamed: targetRenamedOnCloseCancel,
+                    closeCancelTempExists: fsMod.existsSync(closeCancelTempPath),
+                    closeCancelCancelled: uploadCloseTransfer.isCancelled(),
+                    closeCancelComplete: uploadCloseTransfer.isComplete(),
+                    commitOkTargetUpdated: fsMod.readFileSync(remoteCommitOkPath, 'utf8') === 'NEW-UPLOADED-PAYLOAD',
+                    commitOkTempExists: fsMod.existsSync(commitOkTempPath),
+                    commitOkCancelled: uploadCommitOkTransfer.isCancelled(),
+                    commitOkComplete: uploadCommitOkTransfer.isComplete(),
+                    commitFailThrew,
+                    commitFailTempExists: fsMod.existsSync(commitFailTempPath),
+                    commitFailCancelled: uploadCommitFailTransfer.isCancelled(),
+                    commitFailComplete: uploadCommitFailTransfer.isComplete(),
+                }
+                for (const p of [remoteCloseCancelPath, remoteCommitOkPath, remoteCommitFailPath]) {
+                    try { fsMod.unlinkSync(p) } catch {}
                 }
 
                 // 5b-mid-dir-upload (P2): Multi-file + nested DirectoryUpload paused during first file while switching Alice -> Bob cancels every remaining unsubmitted FileUpload exactly once & 0 writes to Bob
@@ -2411,6 +2673,7 @@ try {
                     cancelledSshAtomicDownloadResult,
                     atomicDownloadPermResult,
                     atomicDownloadCancelRenameResult,
+                    uploadCancelCommitResult,
                     scanFailureCleanupResult,
                     cancelQueuedUploadResult,
                     zeroByteQueuedUploadResult,
@@ -2513,8 +2776,11 @@ try {
             symlinkRemovedFallback,
             persistentFailureSymlink,
             oneShotFailureSymlink,
+            searchOnly0111Manual,
+            searchOnly0111Startup,
             deepFallbackRecovered,
             deepFallbackAllDenied,
+            canonicalRereadFallback,
             authUserIsolation,
             liveReconnectAccountSwitch,
             lruEvictionLiveRefresh,
@@ -2629,6 +2895,17 @@ try {
         foldedToSshRoot: false,
         hasOnlyInA: true,
     })
+    assert.deepEqual(sshIsolationPhase1.searchOnly0111Manual, {
+        path: join(sshRoot, 'search-only', 'team'),
+        hasTeamMarker: true,
+        errorBannerVisible: false,
+    })
+    assert.deepEqual(sshIsolationPhase1.searchOnly0111Startup, {
+        path: join(sshRoot, 'search-only', 'team'),
+        hasTeamMarker: true,
+        loadErrorIsNull: true,
+        bannerVisible: false,
+    })
     assert.deepEqual(sshIsolationPhase1.deepFallbackRecovered, {
         resolveCallsOver16: true,
         path: sshRoot,
@@ -2642,6 +2919,14 @@ try {
         hasLoadError: true,
         loadErrorPath: '/',
         retryVisible: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.canonicalRereadFallback, {
+        path: join(sshRoot, 'srv'),
+        hasSrvMarker: true,
+        rereadCanonicalThenParent: true,
+        visitedRawLinkParent: false,
+        bannerVisible: true,
+        bannerHasRequestedAndResolved: true,
     })
     assert.equal(await readFile(keepDownloadFile, 'utf8'), 'MUST-NOT-BE-TRUNCATED\n')
     assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
@@ -2679,10 +2964,17 @@ try {
             tempFilesAfterCommit: 0,
         },
         atomicDownloadPermResult: {
+            existing0755ContentUpdated: true,
+            existingModePreserved0755: true,
             existingContentUpdated: true,
             existingModePreserved0600: true,
             new0644ModeMatchesUmask: true,
             new0755ModeMatchesUmask: true,
+            explicitZeroHasMode: true,
+            undefinedPermHasModeFalse: true,
+            newExplicit0000StrictlyZero: true,
+            newUndefinedModeMatchesUmask: true,
+            newPermissionsPayloadsMatch: true,
         },
         atomicDownloadCancelRenameResult: {
             preRenameTargetIntact: true,
@@ -2697,6 +2989,23 @@ try {
             duringRenameFailCancelled: true,
             duringRenameFailComplete: false,
             duringRenameFailTempFilesLeft: 0,
+        },
+        uploadCancelCommitResult: {
+            closeCancelThrew: true,
+            closeCancelTargetIntact: true,
+            closeCancelTargetUnlinked: false,
+            closeCancelTargetRenamed: false,
+            closeCancelTempExists: false,
+            closeCancelCancelled: true,
+            closeCancelComplete: false,
+            commitOkTargetUpdated: true,
+            commitOkTempExists: false,
+            commitOkCancelled: false,
+            commitOkComplete: true,
+            commitFailThrew: true,
+            commitFailTempExists: false,
+            commitFailCancelled: true,
+            commitFailComplete: false,
         },
         scanFailureCleanupResult: {
             threwExpected: true,
@@ -3118,7 +3427,17 @@ try {
         return transfer.isComplete()
     })()`), true)
     assert.equal(await readFile(destination, 'utf8'), 'android fixture\n')
-    assert.equal((await stat(destination)).mode & 0o777, 0o444)
+    const adbRestrictedMode = (await stat(destination)).mode & 0o777
+    assert.equal(adbRestrictedMode, 0o444)
+    await chmod(destination, 0o600)
+    assert.equal(await evalJs(`(async () => {
+        const panel = cpComponent('coport-adb-tab sftp-panel')
+        const transfer = await panel.platform.startDownload('target', 0o644, 16, ${JSON.stringify(destination)}, true)
+        await panel.sftp.download('/sdcard/seed.txt', transfer)
+        return transfer.isComplete()
+    })()`), true)
+    const adbPreservedMode = (await stat(destination)).mode & 0o777
+    assert.equal(adbPreservedMode, 0o600)
     const advanced = await evalJs(`(async () => {
         const panel = cpComponent('coport-adb-tab sftp-panel')
         const { FileUpload } = require('tabby-core')
@@ -3270,6 +3589,7 @@ try {
         serialGeneration: serial.session_id,
         sameWindow: true,
         adbPanel,
+        adbOverwriteModes: [adbRestrictedMode.toString(8), adbPreservedMode.toString(8)],
         sshPanel,
         recentADB: 'one',
         advanced,
@@ -3291,5 +3611,7 @@ try {
     await stop(app)
     await stop(sshd)
     await chmod(join(sshRoot, 'readable', 'no-perm'), 0o700).catch(() => null)
+    await chmod(join(sshRoot, 'search-only'), 0o700).catch(() => null)
+    await chmod(join(sshRoot, 'srv', 'shared'), 0o700).catch(() => null)
     await rm(run, { recursive: true, force: true })
 }

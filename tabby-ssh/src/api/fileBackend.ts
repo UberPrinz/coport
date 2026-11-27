@@ -4,6 +4,7 @@ import type { SFTPFile } from '../session/sftp'
 
 export interface FileBackend {
     atomicDownloads?: boolean
+    preserveExistingMode?: boolean
     closed$?: Observable<void>
     normalizePath?: (path: string) => string
     resolvePath?: (path: string) => Promise<string>

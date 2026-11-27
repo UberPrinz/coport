@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
-import * as nodeModule from 'node:module'
+import { register } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { describe, it } from 'node:test'
-import { fileURLToPath } from 'node:url'
 import {
     ADB_FILE_PANEL_SCOPE,
     FILE_PANEL_STATE_IPC_CHANGED,
@@ -23,6 +22,7 @@ import {
     parseFilePanelStateSnapshot,
     subscribeFilePanelStateChanges,
 } from '../src/utils/filePanelState.ts'
+import { runStagedSFTPUpload } from '../src/session/sftpUpload.ts'
 import type { FilePanelIpcRendererLike, FilePanelStorageLike } from '../src/utils/filePanelState.ts'
 import {
     filterAndSortEntries,
@@ -38,6 +38,7 @@ import {
     isAdbDirectoryUnavailableError,
     isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
+    isSFTPPermissionDeniedError,
     isTransientConnectionError,
     resolveCanonicalReadableDirectory,
     resolvePosixPathWithReadlink,
@@ -45,24 +46,11 @@ import {
     shouldSkipQueuedFileUpload,
 } from '../src/utils/filePanelFallback.ts'
 
-// Enable Node --experimental-strip-types to resolve extensionless relative TS imports inside app/lib/coport/filePanelStateCoordinator.ts.
-if (typeof nodeModule.registerHooks === 'function') {
-    nodeModule.registerHooks({
-        resolve (specifier, context, nextResolve) {
-            if (/^\.\.?\//.test(specifier) && !/\.[cm]?[jt]s$/.test(specifier) && context.parentURL?.endsWith('.ts')) {
-                const candidate = new URL(`${specifier}.ts`, context.parentURL)
-                if (existsSync(fileURLToPath(candidate))) {
-                    return { url: candidate.href, shortCircuit: true }
-                }
-            }
-            return nextResolve(specifier, context)
-        },
-    })
-} else if (typeof nodeModule.register === 'function') {
-    nodeModule.register(new URL('../../scripts/test-hooks.mjs', import.meta.url))
-}
-
+// Share the TypeScript loader used by plugin tests so the real FileUpload class can run here.
+register(new URL('../../scripts/test-hooks.mjs', import.meta.url))
+const { FileUpload } = await import('../../tabby-core/src/api/platform.ts')
 const { createFilePanelStateCoordinator } = await import('../../app/lib/coport/filePanelStateCoordinator.ts')
+const { resolveAtomicDownloadMode } = await import('../../app/lib/coport/downloadMode.ts')
 
 function createMemoryStorage (): { storage: FilePanelStorageLike, map: Map<string, string> } {
     const map = new Map<string, string>()
@@ -1263,6 +1251,323 @@ describe('filePanelFallback', () => {
         assert.equal(shouldSkipQueuedFileUpload(pendingZeroByte), false)
         assert.equal(shouldSkipQueuedFileUpload(cancelledZeroByte), true)
         assert.equal(shouldSkipQueuedFileUpload(completedZeroByte), true)
+    })
+
+    it('resolves regular directories below 0111 search-only parents via stat + second readlink sandwich while keeping readable-parent protection', async () => {
+        assert.equal(isSFTPPermissionDeniedError(Object.assign(new Error('Permission denied'), { code: 'EACCES' })), true)
+        assert.equal(isSFTPPermissionDeniedError(Object.assign(new Error('failed'), { statusCode: 3 })), true)
+        assert.equal(isSFTPPermissionDeniedError(new Error('Status(Status { status_code: PermissionDenied, error_message: "Permission denied" })')), true)
+        assert.equal(isSFTPPermissionDeniedError(Object.assign(new Error('No such file'), { code: 'ENOENT' })), false)
+        assert.equal(isSFTPPermissionDeniedError(new Error('Request timed out')), false)
+
+        // Case A: /search-only is 0111 (readdir -> EACCES), /search-only/team & child are regular readable dirs.
+        let statCalls = 0
+        const readlinkCounts = new Map<string, number>()
+        const resolved0111 = await resolvePosixPathWithReadlink(
+            '/search-only/team/child/..',
+            async target => {
+                readlinkCounts.set(target, (readlinkCounts.get(target) ?? 0) + 1)
+                throw new Error('Status(Status { status_code: BadMessage, error_message: "Bad message" })')
+            },
+            target => inspectPosixEntryViaParentReaddir(
+                target,
+                async dirPath => {
+                    if (dirPath === '/') {
+                        return [{ name: 'search-only', isDirectory: true, isSymlink: false }]
+                    }
+                    if (dirPath === '/search-only') {
+                        throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+                    }
+                    if (dirPath === '/search-only/team') {
+                        return [{ name: 'child', isDirectory: true, isSymlink: false }]
+                    }
+                    return []
+                },
+                async statTarget => {
+                    statCalls++
+                    assert.equal(statTarget, '/search-only/team')
+                    return { isDirectory: true, isSymlink: false }
+                },
+            ),
+        )
+        assert.equal(resolved0111, '/search-only/team')
+        assert.equal(statCalls, 1)
+        // Sandwich check: readlink('/search-only/team') called twice (before & after stat fallback), others only once.
+        assert.equal(readlinkCounts.get('/search-only'), 1)
+        assert.equal(readlinkCounts.get('/search-only/team'), 2)
+        assert.equal(readlinkCounts.get('/search-only/team/child'), 1)
+
+        // Case B: Under 0111 parent, entry turns into a symlink between 1st readlink and 2nd readlink -> expands symlink target!
+        let teamReadlinkAttempts = 0
+        const expandedAfterSwap = await resolvePosixPathWithReadlink(
+            '/search-only/team/..',
+            async target => {
+                if (target === '/search-only/team') {
+                    teamReadlinkAttempts++
+                    if (teamReadlinkAttempts === 1) {
+                        throw new Error('Status(Failure)')
+                    }
+                    return '/other/child'
+                }
+                throw new Error('Status(Failure)')
+            },
+            target => inspectPosixEntryViaParentReaddir(
+                target,
+                async dirPath => {
+                    if (dirPath === '/') {
+                        return [
+                            { name: 'search-only', isDirectory: true, isSymlink: false },
+                            { name: 'other', isDirectory: true, isSymlink: false },
+                        ]
+                    }
+                    if (dirPath === '/search-only') {
+                        throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+                    }
+                    if (dirPath === '/other') {
+                        return [{ name: 'child', isDirectory: true, isSymlink: false }]
+                    }
+                    return []
+                },
+                async () => ({ isDirectory: true, isSymlink: false }),
+            ),
+        )
+        assert.equal(teamReadlinkAttempts, 2)
+        assert.equal(expandedAfterSwap, '/other')
+
+        // Case C: Under 0111 parent, 2nd readlink throws timeout / channel closed / ENOENT -> propagates directly (never folds).
+        for (const err of [
+            Object.assign(new Error('Request timed out'), { code: 'ETIMEDOUT' }),
+            new Error('SFTP channel closed'),
+            Object.assign(new Error('No such file'), { code: 'ENOENT' }),
+        ]) {
+            let calls = 0
+            await assert.rejects(
+                () => resolvePosixPathWithReadlink(
+                    '/search-only/team/..',
+                    async target => {
+                        if (target === '/search-only/team') {
+                            calls++
+                            if (calls === 1) {
+                                throw new Error('Status(Failure)')
+                            }
+                            throw err
+                        }
+                        throw new Error('Status(Failure)')
+                    },
+                    target => inspectPosixEntryViaParentReaddir(
+                        target,
+                        async dirPath => {
+                            if (dirPath === '/') {
+                                return [{ name: 'search-only', isDirectory: true, isSymlink: false }]
+                            }
+                            throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+                        },
+                        async () => ({ isDirectory: true, isSymlink: false }),
+                    ),
+                ),
+                error => error === err,
+            )
+            assert.equal(calls, 2)
+        }
+
+        // Case D: Parent readdir fails with ENOENT (not EACCES) -> statFallback is NEVER called.
+        let enoentStatCalls = 0
+        await assert.rejects(
+            () => inspectPosixEntryViaParentReaddir(
+                '/missing-parent/child',
+                async () => {
+                    throw Object.assign(new Error('No such file'), { code: 'ENOENT' })
+                },
+                async () => {
+                    enoentStatCalls++
+                    return { isDirectory: true, isSymlink: false }
+                },
+            ),
+            /No such file/,
+        )
+        assert.equal(enoentStatCalls, 0)
+
+        // Case E: Readable parent with symlink still rejects persistent Failure and NEVER invokes statFallback.
+        let readableParentStatCalls = 0
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink(
+                '/dir/..',
+                async () => {
+                    throw new Error('Status(Failure)')
+                },
+                target => inspectPosixEntryViaParentReaddir(
+                    target,
+                    async () => [{ name: 'dir', isDirectory: false, isSymlink: true }],
+                    async () => {
+                        readableParentStatCalls++
+                        return { isDirectory: true, isSymlink: false }
+                    },
+                ),
+            ),
+            /Failure/,
+        )
+        assert.equal(readableParentStatCalls, 0)
+    })
+
+    it('falls back from parent of failed canonicalPath when canonical re-read is unavailable and prevents cycles', async () => {
+        // Startup fallback: /home/user/link/.. reads OK -> canonical /srv/shared reread fails EACCES -> falls back directly to /srv (skips /home/user/link).
+        const readdirLog: string[] = []
+        const result = await resolveCanonicalReadableDirectory(
+            '/home/user/link/..',
+            async dirPath => {
+                readdirLog.push(dirPath)
+                if (dirPath === '/home/user/link/..') {
+                    return [{ name: 'old-shared-item' }]
+                }
+                if (dirPath === '/srv/shared') {
+                    throw Object.assign(new Error('Permission denied: /srv/shared'), { code: 'EACCES' })
+                }
+                if (dirPath === '/srv') {
+                    return [{ name: 'srv-marker.txt' }]
+                }
+                throw Object.assign(new Error(`Unexpected readdir: ${dirPath}`), { code: 'ENOENT' })
+            },
+            isSFTPDirectoryUnavailableError,
+            async dirPath => {
+                assert.equal(dirPath, '/home/user/link/..')
+                return '/srv/shared'
+            },
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+        )
+        assert.equal(result.ok, true)
+        if (result.ok) {
+            assert.equal(result.path, '/srv')
+            assert.equal(result.fellBackFrom, '/home/user/link/..')
+            assert.match(result.fallbackReason ?? '', /Permission denied/)
+            assert.deepEqual(result.entries, [{ name: 'srv-marker.txt' }])
+        }
+        assert.deepEqual(readdirLog, ['/home/user/link/..', '/srv/shared', '/srv'])
+        assert.equal(readdirLog.includes('/home/user/link'), false)
+
+        // When canonical path itself is '/' and reread fails EACCES, stops cleanly without looping back to raw parent.
+        const rootFailLog: string[] = []
+        const rootFail = await resolveCanonicalReadableDirectory(
+            '/home/user/root-link/..',
+            async dirPath => {
+                rootFailLog.push(dirPath)
+                if (dirPath === '/home/user/root-link/..') {
+                    return [{ name: 'stale' }]
+                }
+                throw Object.assign(new Error('Permission denied: /'), { code: 'EACCES' })
+            },
+            isSFTPDirectoryUnavailableError,
+            async () => '/',
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+        )
+        assert.equal(rootFail.ok, false)
+        assert.equal(rootFail.cancelled, false)
+        if (!rootFail.ok && !rootFail.cancelled) {
+            assert.equal(rootFail.path, '/')
+            assert.equal(rootFail.isUnavailable, true)
+        }
+        assert.deepEqual(rootFailLog, ['/home/user/root-link/..', '/'])
+    })
+
+    for (const phase of ['close', 'unlink', 'rename-success', 'rename-failure']) {
+        it(`handles cancellation during SFTP upload ${phase}`, async () => {
+            class TestUpload extends FileUpload {
+                getName () { return 'target' }
+                getSize () { return 1 }
+                getMode () { return 0o644 }
+                close () {}
+                async read () {
+                    if (this.getCompletedBytes()) {
+                        return new Uint8Array(0)
+                    }
+                    this.increaseProgress(1)
+                    return Uint8Array.of(42)
+                }
+            }
+            const transfer = new TestUpload()
+            const target = '/remote/target'
+            const commitError = new Error('Rename failed')
+            const files = new Map([[target, 7]])
+            const operations: string[] = []
+            let tempPath = ''
+
+            const cancelAt = async (operation: string) => {
+                if (phase === operation || (operation === 'rename' && phase.startsWith('rename-'))) {
+                    assert.equal(transfer.isComplete(), false)
+                    transfer.cancel()
+                    assert.equal(transfer.isCancelled(), phase === 'close')
+                }
+            }
+            const upload = runStagedSFTPUpload(target, transfer, {
+                openTemp: async path => {
+                    tempPath = path
+                    return {
+                        write: async chunk => { files.set(path, chunk[0]) },
+                        close: () => cancelAt('close'),
+                    }
+                },
+                unlink: async path => {
+                    if (path === target) {
+                        operations.push('unlink')
+                        await cancelAt('unlink')
+                    }
+                    files.delete(path)
+                },
+                rename: async (src, dst) => {
+                    operations.push('rename')
+                    await cancelAt('rename')
+                    if (phase === 'rename-failure') {
+                        throw commitError
+                    }
+                    files.set(dst, files.get(src)!)
+                    files.delete(src)
+                },
+            })
+            if (phase === 'close') {
+                await assert.rejects(upload, /Upload cancelled/)
+                assert.deepEqual(operations, [])
+                assert.equal(files.get(target), 7)
+            } else if (phase === 'rename-failure') {
+                await assert.rejects(upload, error => error === commitError)
+                assert.equal(transfer.getStatus(), 'Upload cancelled')
+            } else {
+                await upload
+                assert.deepEqual(operations, ['unlink', 'rename'])
+                assert.equal(files.get(target), 42)
+                transfer.cancel()
+            }
+            const committed = phase === 'unlink' || phase === 'rename-success'
+            assert.match(tempPath, /^\/remote\/\.[^/]+\.tabby-upload$/)
+            assert.equal(files.has(tempPath), false)
+            assert.equal(transfer.isComplete(), committed)
+            assert.equal(transfer.isCancelled(), !committed)
+        })
+    }
+
+    it('resolves atomic download permissions for SSH preserveExistingMode, explicit 0000 vs undefined, and ADB rules', () => {
+        // SSH overwrite (preserveExistingMode = true): strictly preserves target's original mode (neither loosens nor tightens)
+        assert.equal(resolveAtomicDownloadMode(0o644, 0o022, 0o100755, true), 0o755)
+        assert.equal(resolveAtomicDownloadMode(0o644, 0o022, 0o100600, true), 0o600)
+        assert.equal(resolveAtomicDownloadMode(0o000, 0o022, 0o100644, true), 0o644)
+        assert.equal(resolveAtomicDownloadMode(undefined, 0o022, 0o100750, true), 0o750)
+
+        // SSH new file (existingMode = undefined): explicit 0000 stays strictly 0000; undefined falls back to 0666 & ~umask
+        assert.equal(resolveAtomicDownloadMode(0o000, 0o022, undefined, true), 0o000)
+        assert.equal(resolveAtomicDownloadMode(0o000, 0o077, undefined, true), 0o000)
+        assert.equal(resolveAtomicDownloadMode(undefined, 0o022, undefined, true), 0o644)
+        assert.equal(resolveAtomicDownloadMode(undefined, 0o077, undefined, true), 0o600)
+        assert.equal(resolveAtomicDownloadMode(0o755, 0o022, undefined, true), 0o755)
+        assert.equal(resolveAtomicDownloadMode(0o666, 0o022, undefined, true), 0o644)
+
+        // ADB overwrite keeps only permission bits allowed by both modes.
+        assert.equal(resolveAtomicDownloadMode(0o444, 0o022, 0o100644, false), 0o444)
+        assert.equal(resolveAtomicDownloadMode(0o644, 0o022, 0o100600, false), 0o600)
+        assert.equal(resolveAtomicDownloadMode(undefined, 0o022, undefined, false), 0o644)
+        assert.equal(resolveAtomicDownloadMode(0, 0o022, undefined, false), 0o644)
+        assert.equal(resolveAtomicDownloadMode(0o444, 0o022, 0o104644, false), 0o4444)
     })
 })
 

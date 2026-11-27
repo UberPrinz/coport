@@ -64,20 +64,20 @@ export abstract class FileTransfer {
 
     // coport: Once an irreversible commit (such as atomic rename) starts,
     // cancel() cannot roll it back; pending cancel intent is replayed only if commit fails.
-    protected setCommitting (committing: boolean): void {
+    setCommitting (committing: boolean): void {
         this.committing = committing
         if (committing) {
             this.cancelRequestedDuringCommit = false
         }
     }
 
-    protected consumeCancelRequestedDuringCommit (): boolean {
+    consumeCancelRequestedDuringCommit (): boolean {
         const requested = this.cancelRequestedDuringCommit
         this.cancelRequestedDuringCommit = false
         return requested
     }
 
-    protected markCommitted (): void {
+    markCommitted (): void {
         this.committed = true
         this.committing = false
         this.cancelRequestedDuringCommit = false
@@ -142,7 +142,7 @@ export abstract class FileDownload extends FileTransfer {
 
 export abstract class DirectoryDownload extends FileTransfer {
     abstract createDirectory (relativePath: string): Promise<void>
-    abstract createFile (relativePath: string, mode: number, size: number, atomic?: boolean): Promise<FileDownload>
+    abstract createFile (relativePath: string, mode: number | undefined, size: number, atomic?: boolean, preserveExistingMode?: boolean): Promise<FileDownload>
 }
 
 export abstract class FileUpload extends FileTransfer {
@@ -221,7 +221,7 @@ export abstract class PlatformService {
     abstract loadConfig (): Promise<string>
     abstract saveConfig (content: string): Promise<void>
 
-    abstract startDownload (name: string, mode: number, size: number, filePath?: string, atomic?: boolean, canOpen?: () => boolean): Promise<FileDownload|null>
+    abstract startDownload (name: string, mode: number | undefined, size: number, filePath?: string, atomic?: boolean, canOpen?: () => boolean, preserveExistingMode?: boolean): Promise<FileDownload|null>
     abstract startDownloadDirectory (name: string, estimatedSize?: number, canOpen?: () => boolean): Promise<DirectoryDownload|null>
     abstract startUpload (options?: FileUploadOptions): Promise<FileUpload[]>
     abstract startUploadDirectory (paths?: string[]): Promise<DirectoryUpload>
