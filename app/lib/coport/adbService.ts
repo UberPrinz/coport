@@ -265,7 +265,7 @@ export class AdbService {
             }
             return fileEntry(remote, parseInt(match[1], 16), Number(match[2]), Number(match[3]))
         } catch (error) {
-            const listed = await this.list(serial, posix.dirname(remote)).catch(() => [])
+            const listed = await this.list(serial, posix.dirname(remote)).catch((): AdbEntry[] => [])
             const entry = listed.find(item => item.name === posix.basename(remote))
             if (!entry) {
                 throw error

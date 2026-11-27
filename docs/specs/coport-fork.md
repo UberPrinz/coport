@@ -168,7 +168,7 @@ flowchart TB
 1. **写入授权由主进程独占。** 渲染进程只提交 `source:'human'` 的字节，终端应答只由 headless 解析器产生，标记为 `terminal` 源。渲染端 xterm 产生的自动应答（DSR、DA、鼠标上报、焦点上报）一律丢弃，不进入 hub。这条规则同时去掉了 R6 中"终端上报被误判为人工输入"的候选成因。AI 无法自报角色。
 2. **解析器唯一，视图可随时丢弃。** headless 解析器是唯一的事实源，它和各视图消费同一个字节流。视图挂载时先取 serialize 快照，再接收增量输出；单个视图未消费的数据超过 64 KiB 就断开该视图，会话不受影响。每个代次只注册一个视图。重复打开聚焦原标签，仍由该标签决定尺寸。原视图已拆离时，以最后挂接的视图为准。
    - 人打开新代次时使用首次请求携带的视图尺寸。只有 AI 打开的新代次从 80×24 开始，视图拆离后保留最后一次上报的尺寸。
-   - 主进程完成正在解析的一批字节后应用挂接或 resize 的尺寸。挂接按新尺寸生成快照并带上输出序号。实时 resize 在同一 IPC 发送端按设备输出顺序发送 `resized`，渲染器写完此前输出后应用尺寸，再写后续输出。挂接期间的布局变化在快照回放后上报最新尺寸。
+   - 主进程完成正在解析的一批字节后应用实时 resize 的尺寸。普通视图挂接在完整 UTF-8 字符和终端控制序列的边界应用尺寸、生成快照并记下输出序号。完整的读取批次保持一次完成。若一批以未完成的 UTF-8 字符或 ESC/CSI 结尾，且 xterm 确认尾段之前的状态完整，可在尾段前挂接，剩余字节作为后续输出发送。等待边界期间主进程持续接收设备数据，最多等待 2 秒，超时可重试，视图拆离或代次结束时取消等待。实时 resize 在同一 IPC 发送端按设备输出顺序发送 `resized`，渲染器写完此前输出后应用尺寸，再写后续输出。挂接期间的布局变化在快照回放后上报最新尺寸。
    - 尺寸变化沿用 xterm 的缓冲区重排规则，已经提交的 MCP 逻辑行、序号及读取游标保持不变。回放快照时补齐其光标列，保留行尾待换行状态。
 3. **生命周期由应用掌控。** 在 macOS 上 Tabby 关窗后不退出进程（`app/lib/app.ts`），会话不依赖任何窗口。窗口同意关闭后在 `will-quit` 结束所有代次、释放 fd、删除 socket。串口标签不参与 TabRecovery（移除 `tabby-serial` 的 recoveryProvider 注册）。
 4. **仲裁按分支逐一移植。** 语义不做任何"顺手优化"，以 Swift XCTest 用例的转写和 sim 全量回归做双重对照。
@@ -317,7 +317,7 @@ sequenceDiagram
 | 消息 | 方向 | 请求 | 结果与规则 |
 |---|---|---|---|
 | `coport-serial:ensure` | 渲染→主（invoke）；mcpHost 在进程内直接调用 | `config{port:string, baudrate:number, databits:5\|6\|7\|8=8, stopbits:1\|1.5\|2=1, parity:'none'\|'odd'\|'even'\|'mark'\|'space'='none', rtscts=false, xon=false, xoff=false, xany=false}`；`reveal:boolean`；`windowId?:number, cols?:number, rows?:number`（reveal 时必填，尺寸范围与 attach 相同） | `{generation:string, reused:boolean, focus?:{windowId,tabId}}`。`port` 必须是字符设备；`baudrate` 为 1 到 4294967295 的整数（非标准值由渲染端提示，主进程不拒绝）。同一设备的打开请求按到达顺序逐个处理：首次打开失败时，所有等待者收到同一个错误；成功后，后到的请求与活动会话比较参数，一致则复用，不一致则返回 `config_conflict` 并附带 `active`（`port`、`baudrate`、`databits`、`stopbits`、`parity`、`flowControl`，最后一项保留四个流控开关）。`reveal:true` 但缺少调用方 `windowId` 或尺寸非法时返回 `invalid_argument`。截止时间为 15 秒，从请求进入主进程算起，到期返回 `timeout`；此后迟到的打开完成会被立即关闭 |
-| `coport-serial:attach`、`coport-serial:attach-display` | 渲染→主（invoke） | `{generation, cols, rows}` | `{snapshot:string, seq:number}`。主进程先应用尺寸，再返回快照。此后该 webContents 收到 `seq` 大于快照 seq 的 `output` 事件。代次已结束时返回 `channel_lost`。旧显示模式经 `attach-display` 额外取得原始字节帧 |
+| `coport-serial:attach`、`coport-serial:attach-display` | 渲染→主（invoke） | `{generation, cols, rows}` | `{snapshot:string, seq:number}`。主进程先应用尺寸，再返回快照。此后该 webContents 收到 `seq` 大于快照 seq 的 `output` 事件。普通挂接等待解析边界超时返回可重试的 `timeout`。视图拆离或代次已结束时返回 `channel_lost`。旧显示模式经 `attach-display` 取得原始字节帧，沿用当前批结束后的挂接顺序 |
 | `coport-serial:resize` | 渲染→主（invoke） | `{generation, cols, rows}` | 更新已挂接视图所属代次的尺寸，未挂接或旧代次返回 `channel_lost`，尺寸非法返回 `invalid_argument`。与 attach 相同，列数为 2 至 1000 的整数，行数为 1 至 1000 的整数 |
 | `coport-serial:resized` | 主→渲染（事件） | — | `{generation, cols, rows}`。与设备 `output` 事件按发送顺序串行应用 |
 | `coport-serial:output` | 主→渲染（事件） | — | `{generation, seq, bytes}`。每个视图独立设有 64 KiB 有界缓冲，渲染端写入 xterm 后发送 `coport-serial:ack{generation, seq}`；超过上限即断开该视图 |
@@ -399,11 +399,12 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | `tabby-electron/src/sftpContextMenu.ts`、`tabby-electron/src/services/platform.service.ts` | 本地编辑继续使用 SSH 后端能力。ADB 下载原子替换本地文件，保留既有 SFTP 下载路径 |
 | `scripts/vars.mjs`、根目录 `package.json`、`app/package.json` | 注册 `tabby-adb`；增加 shim 构建和测试脚本；在 app 包中加入 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 依赖（主进程从 app 包解析依赖），根构建在 macOS 编译 Node-API 模块和 Swift shim |
 | `app/yarn.lock` | 仅更新由 `@xterm/headless`、`@xterm/addon-serialize`、`@modelcontextprotocol/sdk` 及其传递依赖引起的锁定记录 |
+| `scripts/build-macos.mjs` | 创建归档前 ad-hoc 签名并校验 |
 | `electron-builder.yml`、`build/mac/*` | productName 改为 Coport、appId 改为 `local.coport.app`，更换图标，把 shim 加入 extraFiles |
 
 实现已定稿设计所需的依赖锁文件、构建或打包注册项、模板、样式及 i18n 条目，可以在实现时同步列入本表，并登记到上游改动记录。可注释的改动标注 `coport:`，生成锁文件和 JSON 在上游改动记录中说明。涉及范围、验收标准、对外协议或关键设计的变化需要先裁决。
 
-同步流程：每季度在 `sync/<tag>` 分支上合入 upstream 的稳定 tag，按上表解决冲突；运行 `scripts/coport/check-upstream-diff.mjs`（设计提议，白名单之外有 diff 即报错）、P1 的 history 一致性用例和全量 sim；全部通过后提交 MR 合入 main。
+同步流程：每季度在 `sync/<tag>` 分支上合入 upstream 的稳定 tag，按上表解决冲突；运行 `node scripts/coport/check-upstream-diff.mjs <tag>`（白名单之外有 diff 即报错）、P1 的 history 一致性用例和全量 sim；全部通过后提交 MR 合入 main。
 
 ## 验收矩阵
 
@@ -424,6 +425,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | exec 与 prepare_shell 全路径 | L1/L2 | `scripts/coport/sim/serial_exec.sh`（迁移）加单元测试 | `__cp` 标记、超时时预留 Ctrl-C、`ctrl_c_not_sent`、恢复观测等用例退出码均为 0 |
 | 无人工输入时不返回 busy | L2 | 提议 `coport_serial.py --open-noise`：打开瞬间灌入乱码和 `ESC[?1000h`，并注入鼠标与焦点上报 | AI 写入成功；有真实人工半行时仍返回 busy |
 | 打开统一截止并在过期后清理 | L2 | 提议用例：fake binding 打开时挂起 | 在 15±0.5 秒内返回 `timeout`；之后 fd 数为 0，会话表为空 |
+| 串口分帧挂接与增量解码 | L2 | `coport_serial.py --split-attach`（隔离 Coport.app 与私有 PTY） | 在 UTF-8 字符和颜色 CSI 的分帧之间挂接普通视图，等待中仍能读取新输出，即使每次读取都以未完成的 CSI 结尾也能在批内挂接。完成后验证渲染内容、颜色、MCP 历史和增量序号。另验实时 UTF-8/CSI 分帧、挂接期间变更尺寸、超时后在同代次重试、拆离和工具栏断开取消，及等候期间设备掉线时执行标签关闭策略 |
 | MCP 六个工具兼容与后台拉起 | L2 | `wire_test.py`、`serial_exec.sh`、`shim_autostart.py`，组合覆盖原 `ai_e2e.py` 的串口用例 | 工具清单和 schema 与原快照一致。旧版 JSON-RPC 批处理按请求顺序返回一组响应。应用未运行时可以拉起，且没有可见窗口 |
 | 关闭全部窗口时会话保持、Dock 重开挂回、退出释放、重启不重连 | L2 | `coport_serial.py --lifecycle`（迁移，Dock 用 `kAEReopenApplication` 模拟） | 关窗后 AI 仍能读写；重开后 attach 到同一代次并恢复历史；Disconnect 后 fd 为 0 且旧绑定的写入、`exec`、`prepare_shell` 返回 `channel_lost`，历史仍可读；退出后 fd 为 0、socket 已删除；重启后没有自动打开的串口标签。M1 用私有 PTY 验证关窗保持、Dock 挂回与历史恢复、Disconnect 和退出释放 fd、重启不重连。M2 接入 MCP host 后重跑整行，补齐关窗后 MCP 读写、旧绑定的 `channel_lost` 与 socket 清理 |
 | 串口视图尺寸与历史回放 | L2 | `coport_serial.py --geometry`（隔离 Coport.app 与私有 PTY） | 120 列实时输出、关窗后分别以 120 列和 80 列挂回、无窗口时沿用上次尺寸、挂接后实时 resize、AI 从 80×24 打开后以 120 列挂接。检查实际渲染 xterm 的字符位置和游标、PTY 收到的 headless 光标报告及代次复用 |
@@ -431,7 +433,7 @@ ADB 后端经由 `coport-adb:fs:*` 在主进程中执行，命令依次为：
 | ADB 文件面板后端 | L2 | `python3 -B scripts/coport/sim/coport_shells.py "$bundle"`（实际 renderer、假 adb，核对 argv） | readdir、upload、download、mkdir、rmdir、unlink 的结果和 argv 与夹具精确一致 |
 | SFTP 面板泛化后不回退 | L2 | 迁移 `coport_shells.py` 中的本机 OpenSSH 回环 | SFTP 下浏览、上传、下载、新建目录、删除全部成功 |
 | 同窗口内多类会话共存 | L2 | `coport_shells.py` | 本地终端、SSH 回环、共享串口、ADB PTY 在同一窗口内正常工作；切换标签后 AI 的绑定不变 |
-| 上游改动白名单 | L0 | 提议 `scripts/coport/check-upstream-diff.mjs` | 白名单之外 diff 为空；`upstream-changes.md` 覆盖所有修改 |
+| 上游改动白名单 | L0 | `node scripts/coport/check-upstream-diff.mjs` | 白名单之外 diff 为空；`upstream-changes.md` 覆盖所有修改 |
 
 ### 人工验收项
 

@@ -78,17 +78,19 @@ def main():
     group.add_argument("--history", action="store_true")
     group.add_argument("--hex-monitor", action="store_true")
     group.add_argument("--geometry", action="store_true")
+    group.add_argument("--split-attach", action="store_true")
     args = parser.parse_args()
     master, slave = pty.openpty()
     second_master, second_slave = pty.openpty()
     try:
-        if args.lifecycle or args.hex_monitor or args.geometry:
+        if args.lifecycle or args.hex_monitor or args.geometry or args.split_attach:
             device = os.ttyname(slave)
-            if not args.geometry:
+            if not (args.geometry or args.split_attach):
                 os.close(slave)
                 slave = None
             smoke = Path(__file__).resolve().parents[1] / "smoke.mjs"
-            command = ["node", smoke, args.electron, "--geometry" if args.geometry else "--lifecycle", device]
+            mode = "--geometry" if args.geometry else "--split-attach" if args.split_attach else "--lifecycle"
+            command = ["node", smoke, args.electron, mode, device]
             if args.hex_monitor:
                 command.append("--hex-monitor")
             with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
@@ -98,6 +100,11 @@ def main():
                         event = json.loads(line)
                         if event["case"] == "startup":
                             run_dir = Path(event["data"])
+                        if event["case"] == "split-attach-write":
+                            os.write(master, bytes.fromhex(event["hex"]))
+                        if event["case"] == "split-attach-device-lost":
+                            os.close(master)
+                            master = None
                         if event["case"].startswith("geometry-write-"):
                             os.write(master, b"\x1b[999;999H\x1b[6n\x1b[2J\x1b[H" + b"A" * 100 + b"\rB\x1b[6n")
                             response = wire(master, 0.3)

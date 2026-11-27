@@ -1,20 +1,26 @@
 #!/usr/bin/env node
 /* eslint-disable @typescript-eslint/prefer-nullish-coalescing */
 import { build as builder } from 'electron-builder'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import * as vars from './vars.mjs'
 
 const isTag = (process.env.GITHUB_REF || '').startsWith('refs/tags/')
 
 process.env.ARCH = process.env.ARCH || process.arch
 
-if (process.env.GITHUB_HEAD_REF) {
-    delete process.env.CSC_LINK
-    delete process.env.CSC_KEY_PASSWORD
-    process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false'
+// coport: This fork ships ad-hoc signed macOS packages, including PR builds.
+for (const name of ['CSC_LINK', 'CSC_KEY_PASSWORD', 'CSC_NAME']) {
+    delete process.env[name]
 }
+process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false'
+process.env.CSC_FOR_PULL_REQUEST = 'true'
 
-process.env.APPLE_ID ??= process.env.APPSTORE_USERNAME
-process.env.APPLE_APP_SPECIFIC_PASSWORD ??= process.env.APPSTORE_PASSWORD
+const codesign = promisify(execFile)
+async function signCoport ({ app }) {
+    await codesign('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', app])
+    await codesign('/usr/bin/codesign', ['--verify', '--deep', '--strict', app])
+}
 
 builder({
     dir: true,
@@ -24,12 +30,14 @@ builder({
     config: {
         extraMetadata: {
             version: vars.version,
-            teamId: process.env.APPLE_TEAM_ID,
         },
-        forceCodeSigning: !!process.env.CSC_LINK,
+        forceCodeSigning: true,
+        ...(process.env.COPORT_BUILD_OUTPUT ? { directories: { output: process.env.COPORT_BUILD_OUTPUT } } : {}),
+        ...(process.env.COPORT_ELECTRON_DIST ? { electronDist: process.env.COPORT_ELECTRON_DIST } : {}),
         mac: {
-            identity: !process.env.CI || process.env.CSC_LINK ? undefined : null,
-            notarize: !!process.env.APPLE_TEAM_ID,
+            identity: '-',
+            sign: signCoport,
+            notarize: false,
         },
         npmRebuild: process.env.ARCH !== 'arm64',
         publish: process.env.KEYGEN_TOKEN ? [

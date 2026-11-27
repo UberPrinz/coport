@@ -197,7 +197,17 @@ export class SerialSession extends EventEmitter {
             }
             const bytes = Buffer.from(this.buffer.subarray(0, count))
             const evidence = this.hub.observePromptOutput(count)
-            this.parsing = this.terminal.ingest(bytes, evidence).then(empty => {
+            let snapshotOffset = 0
+            const boundary = this.listenerCount('snapshot-boundary') ? (offset: number) => {
+                if (offset < count && this.listenerCount('snapshot-boundary')) {
+                    snapshotOffset = offset
+                    // The prefix belongs to the snapshot. Give the suffix its
+                    // own sequence number and deliver it in the usual output path.
+                    this.seq++
+                    this.emit('snapshot-boundary')
+                }
+            } : undefined
+            this.parsing = this.terminal.ingest(bytes, evidence, boundary).then(empty => {
                 if (!this.hub.connected) {
                     return
                 }
@@ -206,7 +216,7 @@ export class SerialSession extends EventEmitter {
                 }
                 this.hub.consumeBytesAheadOfInterrupt(count)
                 this.rememberDisplayFrame(bytes)
-                this.emit('output', { generation: this.generation, seq: ++this.seq, bytes })
+                this.emit('output', { generation: this.generation, seq: ++this.seq, bytes: bytes.subarray(snapshotOffset) })
             }).catch(() => this.onLoss()).finally(() => {
                 this.parsing = undefined
                 this.watch()
@@ -236,6 +246,50 @@ export class SerialSession extends EventEmitter {
             throw channelLost()
         }
         return apply()
+    }
+
+    afterSnapshotBoundary<T> (apply: () => T, signal: AbortSignal): Promise<T> {
+        return new Promise((resolve, reject) => {
+            let cleanup: (() => void) | undefined = undefined
+            const cancel = () => {
+                cleanup?.()
+                reject(new SerialFailure('channel_lost', 'Serial view was detached'))
+            }
+            const attempt = () => {
+                try {
+                    if (this.terminal.atSnapshotBoundary()) {
+                        cleanup?.()
+                        resolve(apply())
+                    }
+                } catch (error) {
+                    cleanup?.()
+                    reject(error)
+                }
+            }
+            const timer = setTimeout(() => {
+                cleanup?.()
+                reject(new SerialFailure('timeout', 'Timed out waiting for a complete terminal sequence'))
+            }, 2000)
+            cleanup = () => {
+                clearTimeout(timer)
+                this.off('output', attempt)
+                this.off('snapshot-boundary', attempt)
+                signal.removeEventListener('abort', cancel)
+            }
+
+            if (signal.aborted || !this.hub.connected) {
+                cancel()
+                return
+            }
+            signal.addEventListener('abort', cancel, { once: true })
+            // Output fires only once the parsed bytes have a sequence number.
+            // Leave the reader running so the next frame can finish the sequence.
+            this.on('output', attempt)
+            this.on('snapshot-boundary', attempt)
+            if (!this.parsing) {
+                attempt()
+            }
+        })
     }
 
     snapshot (legacyDisplay = false): { snapshot: string, seq: number, displayFrames?: Buffer[] } {
@@ -321,8 +375,8 @@ export class SessionManager {
         const config = serialConfig(input)
         // Resolve paths in parallel, but admit them to the device queue in request order.
         const previous = this.resolutionOrder
-        let release: (() => void) | undefined = undefined
-        const turn = new Promise<void>(resolve => { release = resolve })
+        const slot: { release?: () => void } = {}
+        const turn = new Promise<void>(resolve => { slot.release = resolve })
         this.resolutionOrder = previous.then(() => turn)
         const request = async () => {
             const resolution = this.identify(config.port).catch(error => {
@@ -332,7 +386,7 @@ export class SessionManager {
             const [{ path, identity }] = await Promise.all([resolution, previous])
             this.checkDeadline(deadline)
             const session = this.ensureDevice(identity, path, config, deadline, terminalReplies, profileId, size)
-            release?.()
+            slot.release?.()
             return session
         }
         let timer: ReturnType<typeof setTimeout> | undefined = undefined
@@ -345,7 +399,7 @@ export class SessionManager {
             ])
         } finally {
             clearTimeout(timer)
-            release?.()
+            slot.release?.()
         }
     }
 

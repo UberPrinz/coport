@@ -394,7 +394,10 @@ try {
     assert.ok(servers.every(([, , flags]) => JSON.stringify(flags) === JSON.stringify(['-L', 'tcp:localhost:5041'])), servers)
     assert.ok(servers.some(([, action, , variable]) => action === 'devices' && variable === 'tcp:localhost:5999'))
     assert.ok(servers.some(([, action, , variable]) => action === 'shell' && variable === 'tcp:localhost:5041'))
-    assert.equal(await evalJs("document.querySelectorAll('terminaltab,ssh-tab,serial-tab,coport-adb-tab').length"), 4)
+    assert.equal(await evalJs(`['terminaltab', 'ssh-tab', 'serial-tab', 'coport-adb-tab']
+        .every(selector => Boolean(document.querySelector(selector)))`), true)
+    assert.equal(await evalJs(`${JSON.stringify(Object.values(title))}
+        .every(name => document.body.innerText.split('\\n').includes(name))`), true)
     assert.deepEqual(await tool('write_serial', { data: 'M3-AI-STILL-BOUND\r' }), { bytes_queued: 18 })
     const again = await tool('open_serial', { path: device })
     assert.equal(again.session_id, serial.session_id)

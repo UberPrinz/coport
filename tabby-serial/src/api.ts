@@ -45,6 +45,7 @@ class SlowFeedMiddleware extends SessionMiddleware {
 export class SerialSession extends BaseSession {
     // coport: Only the main process opens or closes a physical device.
     focusedExisting = false
+    get canDisconnect (): boolean { return Boolean(this.generation) && !this.disposed }
     private generation?: string
     private disposed = false
     private ready = false
@@ -164,8 +165,11 @@ export class SerialSession extends BaseSession {
             }
             setTimeout(() => this.streamProcessor.start())
         } catch (error) {
+            const ended = this.isDisposed()
             await this.destroy()
-            throw error
+            if (!ended) {
+                throw error
+            }
         }
     }
 
@@ -248,9 +252,9 @@ export class SerialSession extends BaseSession {
         })
     }
 
-    private onEnd = (_, { generation }) => {
+    private onEnd = (_, { generation, reason }) => {
         if (generation === this.generation) {
-            this.zone.run(() => void this.destroy())
+            this.zone.run(() => void this.destroy(reason === 'device_lost'))
         }
     }
 
@@ -270,7 +274,7 @@ export class SerialSession extends BaseSession {
     }
 
     async disconnect (): Promise<void> {
-        if (this.generation && this.open) {
+        if (this.canDisconnect) {
             try {
                 await this.invoke('disconnect', { generation: this.generation })
             } finally {
@@ -279,7 +283,7 @@ export class SerialSession extends BaseSession {
         }
     }
 
-    async destroy (): Promise<void> {
+    async destroy (deviceLost = false): Promise<void> {
         if (this.disposed) {
             return
         }
@@ -294,6 +298,12 @@ export class SerialSession extends BaseSession {
         ipcRenderer.off('coport-serial:ended', this.onEnd)
         ipcRenderer.off('coport-serial:view-detached', this.onEnd)
         this.serviceMessage.complete()
+        if (deviceLost && !this.open) {
+            // BaseSession emits these only after open. A reserved generation
+            // can lose its device while waiting for a snapshot.
+            this.closed.next()
+            this.destroyed.next()
+        }
         await super.destroy()
         if (this.generation) {
             await this.invoke('detach', { generation: this.generation }).catch(() => undefined)

@@ -25,7 +25,7 @@ state = ROOT/'dist/coport-m2/evidence'
 state.mkdir(parents=True, exist_ok=True)
 run = tempfile.TemporaryDirectory(prefix='cp-exec-', dir='/tmp')
 endpoint = Path(run.name)/'mcp.sock'
-env = dict(os.environ, COPORT_TEST_SOCKET=str(endpoint), TABBY_PLUGINS='')
+env = dict(os.environ, COPORT_TEST_SOCKET=str(endpoint), COPORT_TEST_ADB=str(Path(run.name)/'no-adb'), TABBY_PLUGINS='')
 for key in ('COPORT_TEST_AUTOSTART_APP', 'ELECTRON_RUN_AS_NODE', 'TABBY_DEV'):
     env.pop(key, None)
 device = ShellDevice()

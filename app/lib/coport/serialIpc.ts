@@ -50,6 +50,7 @@ export function installSerialIpc (manager: SessionManager): void {
 
     function reserveView (session: SerialSession, sender: WebContents, window: BrowserWindow, profileId?: string): void {
         const generation = session.generation
+        const lifetime = new AbortController()
         const pending = new Map<number, number>()
         let buffered = 0
         let sentSeq = -1
@@ -104,6 +105,7 @@ export function installSerialIpc (manager: SessionManager): void {
             }
         }
         const dispose = () => {
+            lifetime.abort()
             if (views.get(generation) === view) {
                 views.delete(generation)
             }
@@ -117,13 +119,20 @@ export function installSerialIpc (manager: SessionManager): void {
         view = {
             sender, window, profileId,
             dispose,
-            attach: ({ cols, rows }, legacyDisplay) => attachPromise ??= session.afterOutput(() => {
-                checkAttachedWindow()
-                session.terminal.resize(cols, rows)
-                const result = session.snapshot(legacyDisplay)
-                attached = true
-                return result
-            }),
+            attach: ({ cols, rows }, legacyDisplay) => {
+                const attach = () => {
+                    checkAttachedWindow()
+                    session.terminal.resize(cols, rows)
+                    const result = session.snapshot(legacyDisplay)
+                    attached = true
+                    return result
+                }
+                return attachPromise ??= (legacyDisplay ? session.afterOutput(attach)
+                    : session.afterSnapshotBoundary(attach, lifetime.signal)).catch(error => {
+                    attachPromise = undefined
+                    throw error
+                })
+            },
             resize: ({ cols, rows }) => session.afterOutput(() => {
                 checkAttachedWindow()
                 if (!attached) {
