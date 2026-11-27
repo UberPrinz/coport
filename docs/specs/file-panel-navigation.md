@@ -78,12 +78,12 @@ flowchart TB
 
 源码定位与设计提议：
 - 既有模块：`tabby-ssh/src/components/sftpPanel.component.{ts,pug,scss}`、`tabby-ssh/src/components/sshTab.component.{ts,pug}`、`tabby-ssh/src/api/fileBackend.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-adb/src/adbTab.component.ts`、`tabby-adb/src/adbPanel.pug`、`tabby-adb/src/adbFileBackend.ts`、`app/lib/coport/adbIpc.ts`、`app/lib/coport/adbService.ts`。
-- 新增设计提议模块：`app/lib/coport/filePanelStateIpc.ts`、`tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts`。
+- 新增设计提议模块：`app/lib/coport/filePanelStateCoordinator.ts`、`app/lib/coport/filePanelStateIpc.ts`、`tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts`。
 
 影响范围：
-- **业务与 UI 改动**：上述 `tabby-ssh` 与 `tabby-adb` 文件。
+- **业务与 UI 改动**：上述 `app/lib`、`tabby-ssh` 与 `tabby-adb` 文件。
 - **测试与校验配套**：新增 `tabby-ssh/test/filePanelNavigation.test.ts`（L0）；扩展 `scripts/coport/sim/coport_shells.mjs` 与 `scripts/coport/sim/prepare_adb.py`（L2）；更新 `docs/coport/upstream-changes.md` 登记新增路径并通过 `scripts/coport/check-upstream-diff.mjs`。
-- **对外协议说明**：无对外协议（MCP、IPC、SSH/ADB 线协议）变更；仅扩展渲染进程内部可选接口 `FileBackend.isDirectoryUnavailable?`。
+- **协议影响说明**：不改变任何对外协议（MCP、既有 `coport-adb:*` IPC、SSH/ADB 线协议）；仅新增应用内部渲染进程↔主进程状态持久化 IPC `coport-file-panel-state:*`（随单仓同步交付，无需外部兼容），并扩展渲染进程内部可选接口 `FileBackend.isDirectoryUnavailable?` 与 `FileBackend.resolvePath?`。
 
 ### 关键设计取舍与代选记录（低风险自动准出）
 
@@ -176,38 +176,38 @@ sequenceDiagram
 
 ## 交互协议
 
-本功能不涉及跨进程或网络协议变更，以下定义渲染进程内部模块契约与持久化存储结构，确保实现与 L0/L2 测试精确对齐。
+本功能不改变对外网络协议、MCP 或既有 `coport-adb:*` IPC；以下定义应用内部渲染进程模块契约及渲染进程↔主进程原子状态持久化 IPC（`coport-file-panel-state:*`），确保实现与 L0/L2 测试精确对齐。
 
 ### 内部契约一：`FileBackend` 目录不可读判定与路径解析扩展
 
-供 `SFTPPanelComponent` 区分「目录不存在/无权限（可向上回退）」与「设备离线/通道断开/超时（应立即报错并允许重试）」，并在 SSH 含 `..` 路径下准确解析服务器真实目录身份以识别根目录。
+供 `SFTPPanelComponent` 区分「目录不存在/无权限（可向上回退）」与「设备离线/通道断开/超时（应立即报错并允许重试）」，并在 SSH 含 `..` 路径经服务端校验读取成功后解析服务器真实目录身份以识别根目录。
 
 | 项目 | 定义 |
 |---|---|
 | 调用方 / 实现方 | `tabby-ssh/src/components/sftpPanel.component.ts` → `AdbFileBackend` / `SFTPSession` |
 | 入口签名 | `FileBackend.isDirectoryUnavailable?: (error: unknown) => boolean`；`FileBackend.resolvePath?: (path: string) => Promise<string>` |
 | ADB 适配 | `adbFileBackend.ts` 在 `adbRequest` 抛出的 `Error` 上保留 `reason: string` 属性；`isDirectoryUnavailable` 仅在 `error.reason === 'unreadable_directory'` 时返回 `true` |
-| SFTP 适配 | `SFTPSession.isDirectoryUnavailable` 当错误包含 SFTP 缺失/权限语义（`No such file`、`Permission denied`、`Not a directory`、`ENOENT`、`EACCES`、`ENOTDIR` 或对应状态码 `2`/`3`）时返回 `true`；连接断开、超时、channel closed 返回 `false`。`SFTPSession.resolvePath` 在路径包含 `..` 时通过 `readlink` 按服务器符号链接语义解析真实规范路径（无 `..` 路径不增加额外往返），抵达 `/` 时准确收敛为 `'/'` |
+| SFTP 适配 | `SFTPSession.isDirectoryUnavailable` 当错误包含 SFTP 缺失/权限语义（`No such file`、`Permission denied`、`Not a directory`、`ENOENT`、`EACCES`、`ENOTDIR` 或对应状态码 `2`/`3`）时返回 `true`；连接断开、超时、channel closed 返回 `false`。`SFTPSession.resolvePath` 仅在原路径已由服务端 `readdir` 校验成功且包含 `..` 时调用，通过 `readlink` 按服务器符号链接语义确定真实规范目录路径（抵达 `/` 时收敛为 `'/'`），不提前消去服务端错误 |
 
 ### 内部契约二：主进程原子持久化结构（`userData/coport-file-panel-state.json` 与 `coport-file-panel-state:*` IPC）
 
-主进程 `app/lib/coport/filePanelStateIpc.ts` 复用 `tabby-ssh/src/utils/filePanelState.ts` 的唯一状态引擎，以临时文件 + 原子 `rename` 持久化全部作用域（键为 `'adb:shared'` 或 `'ssh:<authUsername>@<host>:<port>'`，SSH 优先取已认证的 `authUsername`，缺失时回退配置 `user`），并通过 `coport-file-panel-state:op`（同步调用，仅限主窗口主 frame）与 `coport-file-panel-state:changed`（全窗口广播）向渲染进程提供服务；非 Electron 环境回退为 `FilePanelStateStore` + `StorageLike`。
+主进程 `app/lib/coport/filePanelStateCoordinator.ts` + `filePanelStateIpc.ts` 复用 `tabby-ssh/src/utils/filePanelState.ts` 的唯一状态引擎，以临时文件 + 原子 `rename` 持久化全部作用域（键为 `'adb:shared'` 或 `'ssh:<authUsername>@<host>:<port>'`，SSH 优先取已认证的 `authUsername`，缺失时回退配置 `user`），并通过 `coport-file-panel-state:op`（同步调用，仅限主窗口主 frame；时间戳完全由主进程单调分配，不接受渲染端传入 `now`）与 `coport-file-panel-state:changed`（全窗口广播，包含本次修改的作用域以及因 50 上限被 LRU 淘汰的 `evictedScopes`）向渲染进程提供服务；非 Electron 环境回退为 `FilePanelStateStore` + `StorageLike`。
 
 | 字段路径 | 类型 | 必填 | 含义 | 约束 |
 |---|---|---|---|---|
 | `version` | `number` | 是 | 结构版本 | 固定为 `1`；非 `1` 或非法 JSON 时按空状态降级 |
 | `scopes[key].recent` | `string[]` | 是 | 最近成功打开的目录列表 | 规范化绝对路径（保留合法目录名尾随空格、区分大小写去重），最近访问排首位（`recent[0]` 即上次目录），上限 **20** |
 | `scopes[key].favorites` | `string[]` | 是 | 收藏目录列表 | 绝对路径，区分大小写去重，上限 **50**（新增超出上限时保留最新 50 条） |
-| `scopes[key].updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 在主进程单线程内严格递增；`ssh:*` 键总数上限 **50**，超限时按 `updatedAt` 淘汰最久未更新项，永不淘汰当前写入作用域与 `'adb:shared'` |
+| `scopes[key].updatedAt` | `number` | 是 | 最近更新时间戳（ms） | 仅由主进程单线程严格递增分配；`ssh:*` 键总数上限 **50**，超限时按 `updatedAt` 淘汰最久未更新项，永不淘汰当前写入作用域与 `'adb:shared'` |
 
 场景处理规则：
 
 | 场景 | 处理规则 |
 |---|---|
-| 手动跳转到不存在的目录 | 不触发父级回退、不清空当前有效 `fileList`、不写入 `recent`，仅显示错误提示 |
-| 快速连续切换目录 / 切换时关闭面板 | 递增 `navigation` 请求号；过期异步回调直接丢弃，不更新列表、不覆盖路径、不写历史 |
-| 过滤状态下执行点击、右键、Enter 或删除 | 全部操作绑定到 `filteredFileList` 中的实际 `SFTPFile` 对象，不按原始未过滤数组下标索引 |
-| `localStorage` 数据损坏或写入抛出 `QuotaExceededError` | 读取回退为空状态；写入捕获异常并保持当前内存态正常工作，不中断面板浏览 |
+| 手动跳转到不存在或非目录路径（含 `/普通文件/..`） | 先由服务端 `readdir` 校验原路径，失败时不触发父级回退、不清空当前有效 `fileList`、不写入 `recent`，仅显示错误提示 |
+| 快速连续切换目录 / 切换账号 / 切换时关闭面板 | 递增 `navigation` 请求号与 `sessionEpoch`；过期异步回调直接丢弃，旧账号尚未执行的删除/上传/建目录操作在账号切换后取消，绝不作用于新账号后端 |
+| 过滤状态下执行点击、右键、Enter 或删除 | 全部操作绑定到 `filteredFileList` 中的实际 `SFTPFile` 对象，不按原始未过滤数组下标索引；按 Enter 进入目录或触发文件下载后均清空过滤词并保持面板焦点 |
+| 持久化文件/`StorageLike` 损坏或写入抛出异常 | 读取回退为空状态；写入捕获异常并保持当前内存最新副本不被旧磁盘值覆写，不中断面板浏览 |
 
 ### 内部契约三：组件输入与属性约定（`SFTPPanelComponent`）
 
@@ -223,7 +223,7 @@ sequenceDiagram
 
 | 用户场景／验收项 | 级别 | 自动化入口（L0–L3）／验收方式 | 用户视角通过标准与证据 |
 |---|---|---|---|
-| 状态存储、作用域隔离与容量上限（20 历史 / 50 收藏 / 50 SSH 主机） | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | ADB 共用与 SSH 按 `user@host:port` 隔离互不干扰；路径规范化与大小写去重正确；历史超 20 保留最新 20，收藏超 50 保留最新 50，SSH 主机超 50 按 LRU 淘汰且不删 ADB；损坏 JSON 与写入异常不崩溃。证据：测试退出码 0 及用例名输出 |
+| 状态存储、生产协调器、作用域隔离与容量上限（20 历史 / 50 收藏 / 50 SSH 主机） | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | ADB 共用与 SSH 按 `authUsername@host:port` 隔离互不干扰；路径规范化与大小写去重正确；历史超 20 保留最新 20，收藏超 50 保留最新 50，SSH 主机超 50 按 LRU 淘汰且不删 ADB；调用生产协调器验证单调时间戳（忽略外部 `now`）、落盘失败保留内存更新、全窗口变更与 LRU 淘汰广播。证据：测试退出码 0 及用例名输出 |
 | 目录不可读逐级回退与瞬时错误不误回退 | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | 缺失/无权限路径逐级回退至最近可读父级并返回原目标与原因；断线/超时错误立即终止回退；并发过期请求结果被丢弃。证据：测试退出码 0 及用例名输出 |
 | 子串与模糊匹配、排序、高亮区间及 1,000 条目性能阈值 | L0 | `npm run test:ssh-term`（新增 `tabby-ssh/test/filePanelNavigation.test.ts`，设计提议） | 大小写不敏感子串与顺序模糊（如 `g_c`→`g_comp`）命中准确，高亮区间合并正确；1,000 条目单次过滤耗时 ≤ 16 ms（取多次实测最大值或 P95 均达标）。证据：测试退出码 0 及实测耗时日志 |
 | ADB 无 `/sdcard` 首次启动、保值恢复、跨设备共享与异常重试 | L2 | `node scripts/coport/sim/coport_shells.mjs`（扩展既有场景，设计提议） | 伪 ADB 设备不含 `/sdcard` 时，首次打开 Files 默认成功进入 `/`（不卡 `Loading`）；切换目录后重启隔离 Electron 实例仍恢复该目录，换第二台伪 ADB 设备共享恢复；若保存目录在新设备缺失则自动回退到可读父目录并显示回退提示条；根目录断线失败显示错误与重试按钮，恢复后点击重试列出目录。证据：脚本退出码 0 及断言日志 |

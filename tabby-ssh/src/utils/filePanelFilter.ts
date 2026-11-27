@@ -126,12 +126,17 @@ function mapLowerSpanToRanges (
     return mergeHighlightRanges(indices)
 }
 
+function normalizeForCaseInsensitiveMatch (text: string): string {
+    const lowered = text.toLowerCase()
+    return lowered.includes('\u03C2') ? lowered.replace(/\u03C2/g, '\u03C3') : lowered
+}
+
 export function matchFileName (name: string, query: string): FileMatchResult | null {
-    const lowerQuery = query.toLowerCase()
+    const lowerQuery = normalizeForCaseInsensitiveMatch(query)
     if (!lowerQuery) {
         return { tier: 0, ranges: [] }
     }
-    const lowerName = name.toLowerCase()
+    const lowerName = normalizeForCaseInsensitiveMatch(name)
     const lowerToOrig = lowerName.length === name.length ? null : buildLowerToOrigMap(name, lowerName)
     const queryLen = lowerQuery.length
     const nameLen = lowerName.length

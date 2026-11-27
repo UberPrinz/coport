@@ -11,6 +11,7 @@ import { FileBackend } from '../api/fileBackend'
 export class SFTPDeleteModalComponent extends BaseComponent {
     sftp: FileBackend
     item: SFTPFile
+    shouldContinue?: () => boolean
     progressMessage = ''
     cancelled = false
 
@@ -37,17 +38,35 @@ export class SFTPDeleteModalComponent extends BaseComponent {
         this.modalInstance.close()
     }
 
+    private isStopped (): boolean {
+        if (this.cancelled) {
+            return true
+        }
+        if (this.shouldContinue && !this.shouldContinue()) {
+            this.cancelled = true
+            return true
+        }
+        return false
+    }
+
     async run (file: SFTPFile): Promise<void> {
+        if (this.isStopped()) {
+            return
+        }
         this.progressMessage = file.fullPath
 
         if (file.isDirectory) {
-            for (const child of await this.sftp.readdir(file.fullPath)) {
+            const children = await this.sftp.readdir(file.fullPath)
+            if (this.isStopped()) {
+                return
+            }
+            for (const child of children) {
                 await this.run(child)
-                if (this.cancelled) {
+                if (this.isStopped()) {
                     break
                 }
             }
-            if (!this.cancelled) {
+            if (!this.isStopped()) {
                 await this.sftp.rmdir(file.fullPath)
             }
         } else {

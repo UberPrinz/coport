@@ -30,7 +30,7 @@
 | `tabby-electron/src/services/platform.service.ts` | ADB 下载经同目录暂存后原子替换本地文件。保留既有 SFTP 下载路径 |
 | `tabby-core/src/directives/dropZone.directive.ts` | 在 Finder 文件扫描前记录目标目录，保留既有 transfer 事件 |
 | `scripts/build-macos.mjs` | 创建 DMG 和 ZIP 前强制执行 ad-hoc 签名和校验。停止 Team ID 与 notarization 配置，支持通过 COPORT_BUILD_OUTPUT 和 COPORT_ELECTRON_DIST 指定隔离构建路径与缓存 Electron |
-| `app/lib/coport/*`、`extras/coport-mcp/*`、`scripts/coport/*`、`tabby-adb/*` | fork 新增的串口、MCP、ADB 代码与自动验收 |
+| `app/lib/coport/*`、`extras/coport-mcp/*`、`scripts/coport/*`、`tabby-adb/*` | fork 新增的串口、MCP、ADB、文件面板状态协调器代码与自动验收 |
 | `docs/coport/*`、`docs/delivery/coport-fork-*`、`docs/delivery/file-panel-navigation.md`、`docs/plans/coport-fork.md`、`docs/specs/coport-fork.md`、`docs/specs/file-panel-navigation.md` | fork 新增的规格、交付证据和进度记录 |
 
 ## 同步上游

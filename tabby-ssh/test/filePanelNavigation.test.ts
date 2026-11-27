@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import * as nodeModule from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
     ADB_FILE_PANEL_SCOPE,
     FILE_PANEL_STATE_IPC_CHANGED,
@@ -15,7 +17,6 @@ import {
     MAX_RECENT_PATHS,
     MAX_SSH_SCOPES,
     createSSHFilePanelScope,
-    executeFilePanelStateOp,
     getFilePanelScopeStorageKey,
     normalizeFilePanelPath,
     parseFilePanelScopeRecord,
@@ -34,9 +35,29 @@ import {
     isAdbDirectoryUnavailableError,
     isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
+    isTransientConnectionError,
     resolvePosixPathWithReadlink,
     resolveReadableDirectory,
 } from '../src/utils/filePanelFallback.ts'
+
+// Enable Node --experimental-strip-types to resolve extensionless relative TS imports inside app/lib/coport/filePanelStateCoordinator.ts.
+if (typeof nodeModule.registerHooks === 'function') {
+    nodeModule.registerHooks({
+        resolve (specifier, context, nextResolve) {
+            if (/^\.\.?\//.test(specifier) && !/\.[cm]?[jt]s$/.test(specifier) && context.parentURL?.endsWith('.ts')) {
+                const candidate = new URL(`${specifier}.ts`, context.parentURL)
+                if (existsSync(fileURLToPath(candidate))) {
+                    return { url: candidate.href, shortCircuit: true }
+                }
+            }
+            return nextResolve(specifier, context)
+        },
+    })
+} else if (typeof nodeModule.register === 'function') {
+    nodeModule.register(new URL('../../scripts/test-hooks.mjs', import.meta.url))
+}
+
+const { createFilePanelStateCoordinator } = await import('../../app/lib/coport/filePanelStateCoordinator.ts')
 
 function createMemoryStorage (): { storage: FilePanelStorageLike, map: Map<string, string> } {
     const map = new Map<string, string>()
@@ -340,42 +361,58 @@ describe('filePanelState', () => {
         assert.deepEqual(afterExternal.favorites, ['/external-fav'])
     })
 
-    it('serializes multi-window timestamps, 50 SSH LRU pruning, broadcasts, and disk write failure retention through a single coordinator', () => {
+    it('tests the production coordinator directly for monotonic timestamps, forged now rejection, fsOps failure retention, and LRU eviction broadcasts', () => {
         const tempDir = mkdtempSync(join(tmpdir(), 'coport-file-panel-state-'))
         const filePath = join(tempDir, 'coport-file-panel-state.json')
-        const originalNow = Date.now
-        Date.now = () => 1700000000000
+        let clockCall = 0
+        const clockSequence = [5000, 4000, 4000]
+        const nowProvider = (): number => {
+            if (clockCall < clockSequence.length) {
+                return clockSequence[clockCall++]
+            }
+            return 4000
+        }
         try {
-            const masterStore = new FilePanelStateStore(null)
+            const broadcastEvents: { scope: string, evictedScopes: string[] }[] = []
             const broadcastListeners: ((event: unknown, payload: unknown) => void)[] = []
-            let writeCount = 0
-            let failDiskPersist = false
+            let failWriteFile = false
+            let failRename = false
+            let unlinkCalls = 0
 
-            const dispatchOp = (request: unknown) => {
-                const response = executeFilePanelStateOp(masterStore, request)
-                if (response.ok && response.changedScope) {
-                    const tempFile = `${filePath}.${++writeCount}.tmp`
-                    try {
-                        if (failDiskPersist) {
+            const coordinator = createFilePanelStateCoordinator({
+                filePath,
+                nowProvider,
+                fsOps: {
+                    writeFileSync: (...args) => {
+                        if (failWriteFile) {
                             throw Object.assign(new Error('EACCES: read-only'), { code: 'EACCES' })
                         }
-                        writeFileSync(tempFile, JSON.stringify(masterStore.getSnapshot()), 'utf8')
-                        renameSync(tempFile, filePath)
-                    } catch {
-                        rmSync(tempFile, { force: true })
-                    }
+                        return writeFileSync(...args)
+                    },
+                    renameSync: (...args) => {
+                        if (failRename) {
+                            throw Object.assign(new Error('EXDEV: rename failed'), { code: 'EXDEV' })
+                        }
+                        return renameSync(...args)
+                    },
+                    unlinkSync: (...args) => {
+                        unlinkCalls++
+                        return unlinkSync(...args)
+                    },
+                },
+                broadcast: payload => {
+                    broadcastEvents.push(payload)
                     for (const listener of broadcastListeners) {
-                        listener({}, { scope: response.changedScope })
+                        listener({}, payload)
                     }
-                }
-                return response
-            }
+                },
+            })
 
             const makeWindowClient = (): IpcFilePanelStateClient => {
                 const ipc: FilePanelIpcRendererLike = {
                     sendSync: (channel, payload) => {
                         assert.equal(channel, FILE_PANEL_STATE_IPC_OP)
-                        return dispatchOp(payload)
+                        return coordinator.handleOp(payload)
                     },
                     on: (channel, listener) => {
                         if (channel === FILE_PANEL_STATE_IPC_CHANGED) {
@@ -388,29 +425,61 @@ describe('filePanelState', () => {
 
             const winA = makeWindowClient()
             const winB = makeWindowClient()
-            const observedScopes: string[] = []
+            const observedBroadcasts: { scope: string, evictedScopes: string[] }[] = []
             const unsubscribe = subscribeFilePanelStateChanges(event => {
                 if (event.source === null) {
-                    observedScopes.push(event.scope)
+                    observedBroadcasts.push({
+                        scope: event.scope,
+                        evictedScopes: [...(event.evictedScopes ?? [])],
+                    })
                 }
             })
 
             try {
-                winA.recordVisit(ADB_FILE_PANEL_SCOPE, '/etc')
+                // Forged backwards/duplicate `now` values passed via IPC MUST be ignored and timestamps stay strictly monotonic
+                const forged1 = coordinator.handleOp({ op: 'recordVisit', scope: ADB_FILE_PANEL_SCOPE, path: '/old', now: 5000 })
+                const forged2 = coordinator.handleOp({ op: 'recordVisit', scope: ADB_FILE_PANEL_SCOPE, path: '/old-2', now: 4000 })
+                const forged3 = coordinator.handleOp({ op: 'addFavorite', scope: ADB_FILE_PANEL_SCOPE, path: '/old', now: 4000 })
+                assert.equal(forged1.ok, true)
+                assert.equal(forged2.ok, true)
+                assert.equal(forged3.ok, true)
+                const ts1 = (forged1.result as { updatedAt: number }).updatedAt
+                const ts2 = (forged2.result as { updatedAt: number }).updatedAt
+                const ts3 = (forged3.result as { updatedAt: number }).updatedAt
+                assert.equal(ts1, 5000)
+                assert.equal(ts2, 5001)
+                assert.equal(ts3, 5002)
+
+                // Fill 50 SSH scopes with forged decreasing `now` values -> LRU order still follows real monotonic server order
                 for (let i = 1; i <= MAX_SSH_SCOPES; i++) {
-                    winA.recordVisit(createSSHFilePanelScope('dev', `host-${String(i).padStart(2, '0')}`, 22), `/srv/${i}`)
+                    const scope = createSSHFilePanelScope('dev', `host-${String(i).padStart(2, '0')}`, 22)
+                    const resp = coordinator.handleOp({ op: 'recordVisit', scope, path: `/srv/${i}`, now: 1000 - i })
+                    assert.equal(resp.ok, true)
+                    assert.deepEqual(resp.evictedScopes, [])
                 }
-                // Interleave writes from both windows at the exact same frozen millisecond around the 50-host cap
+
+                // Refresh host-05 and add host-51 & host-52 across windows -> host-01 & host-02 are evicted and broadcast includes evictedScopes
+                const host01 = createSSHFilePanelScope('dev', 'host-01', 22)
+                const host02 = createSSHFilePanelScope('dev', 'host-02', 22)
                 const host05 = createSSHFilePanelScope('dev', 'host-05', 22)
                 const host51 = createSSHFilePanelScope('dev', 'host-51', 22)
                 const host52 = createSSHFilePanelScope('dev', 'host-52', 22)
-                const rec05 = winB.recordVisit(host05, '/srv/05-refreshed')
-                const rec51 = winA.recordVisit(host51, '/srv/51')
-                const rec52 = winB.recordVisit(host52, '/srv/52')
+                const rec05 = winB.recordVisit(host05, '/srv/05-refreshed', 1)
+                const rec51 = winA.recordVisit(host51, '/srv/51', 1)
+                const rec52 = winB.recordVisit(host52, '/srv/52', 1)
 
                 assert.ok(rec05 && rec51 && rec52)
                 assert.ok(rec51.updatedAt > rec05.updatedAt, 'timestamps must strictly increase across windows')
                 assert.ok(rec52.updatedAt > rec51.updatedAt, 'timestamps must strictly increase across windows')
+
+                const evictEvent51 = broadcastEvents.find(ev => ev.scope === host51)
+                const evictEvent52 = broadcastEvents.find(ev => ev.scope === host52)
+                assert.deepEqual(evictEvent51, { scope: host51, evictedScopes: [host01] })
+                assert.deepEqual(evictEvent52, { scope: host52, evictedScopes: [host02] })
+                assert.ok(
+                    observedBroadcasts.some(ev => ev.scope === host51 && ev.evictedScopes.includes(host01)),
+                    'IPC change bridge must propagate evictedScopes to subscribers',
+                )
 
                 const snapshot = winA.getSnapshot()
                 const sshScopes = Object.keys(snapshot.scopes).filter(k => k.startsWith('ssh:'))
@@ -418,30 +487,38 @@ describe('filePanelState', () => {
                 assert.equal(winB.getLastPath(host05), '/srv/05-refreshed')
                 assert.equal(winB.getLastPath(host51), '/srv/51')
                 assert.equal(winA.getLastPath(host52), '/srv/52')
-                assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-01', 22)), null)
-                assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-02', 22)), null)
+                assert.equal(winA.getLastPath(host01), null)
+                assert.equal(winA.getLastPath(host02), null)
                 assert.equal(winA.getLastPath(createSSHFilePanelScope('dev', 'host-03', 22)), '/srv/3')
-                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/etc')
-                assert.ok(observedScopes.includes(host51) && observedScopes.includes(host52))
+                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/old-2')
 
-                // Reloading from the atomic JSON file preserves full state across restart
-                const reloaded = new FilePanelStateStore(null)
-                reloaded.loadSnapshot(parseFilePanelStateSnapshot(readFileSync(filePath, 'utf8')))
-                assert.equal(reloaded.getLastPath(host51), '/srv/51')
-                assert.equal(reloaded.getLastPath(host52), '/srv/52')
-                assert.equal(reloaded.getLastPath(ADB_FILE_PANEL_SCOPE), '/etc')
+                // Reloading from the atomic JSON file via production coordinator preserves full state across restart
+                const reloaded = createFilePanelStateCoordinator({ filePath })
+                assert.equal(reloaded.store.getLastPath(host51), '/srv/51')
+                assert.equal(reloaded.store.getLastPath(host52), '/srv/52')
+                assert.equal(reloaded.store.getLastPath(ADB_FILE_PANEL_SCOPE), '/old-2')
 
-                // Disk write failure (e.g. EACCES / read-only) retains in-memory updates without rolling back to old JSON
-                failDiskPersist = true
-                winA.recordVisit(ADB_FILE_PANEL_SCOPE, '/new-while-readonly')
-                assert.equal(winA.toggleFavorite(ADB_FILE_PANEL_SCOPE, '/new-while-readonly'), true)
-                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/new-while-readonly')
-                assert.deepEqual(winB.getFavorites(ADB_FILE_PANEL_SCOPE), ['/new-while-readonly'])
+                // Inject writeFileSync failure when /old-2 is already persisted -> /new & favorite remain in memory, not overwritten by old disk JSON
+                failWriteFile = true
+                winA.recordVisit(ADB_FILE_PANEL_SCOPE, '/new')
+                assert.equal(winA.toggleFavorite(ADB_FILE_PANEL_SCOPE, '/new'), true)
+                assert.equal(winB.getLastPath(ADB_FILE_PANEL_SCOPE), '/new')
+                assert.deepEqual(winB.getFavorites(ADB_FILE_PANEL_SCOPE), ['/new', '/old'])
+
+                // Inject renameSync failure too -> temp file cleaned up and in-memory state preserved
+                failWriteFile = false
+                failRename = true
+                const unlinkBefore = unlinkCalls
+                winB.recordVisit(ADB_FILE_PANEL_SCOPE, '/new-after-rename-fail')
+                assert.equal(winA.getLastPath(ADB_FILE_PANEL_SCOPE), '/new-after-rename-fail')
+                assert.ok(unlinkCalls > unlinkBefore, 'failed rename must clean up temp file')
+                // Disk file still holds previous valid atomic snapshot (never corrupted)
+                const diskAfterFail = parseFilePanelStateSnapshot(readFileSync(filePath, 'utf8'))
+                assert.equal(diskAfterFail.scopes[ADB_FILE_PANEL_SCOPE].recent[0], '/old-2')
             } finally {
                 unsubscribe()
             }
         } finally {
-            Date.now = originalNow
             try {
                 chmodSync(tempDir, 0o700)
             } catch {
@@ -598,17 +675,26 @@ describe('filePanelFallback', () => {
         assert.equal(p1Initial, p2Initial)
         assert.equal(created.length, 1)
 
-        // Normal SFTP operational Failure must NOT invalidate or leak ch1
+        // Normal SFTP operational Failure must NOT invalidate, leak, or close healthy shared ch1 on Retry
+        const operationalFailure = new Error('Status(Failure)')
         assert.equal(isSFTPChannelClosedError(new Error('Failure')), false)
-        assert.equal(isSFTPChannelClosedError(new Error('Status(Failure)')), false)
+        assert.equal(isSFTPChannelClosedError(operationalFailure), false)
+        assert.equal(isTransientConnectionError(operationalFailure), false)
         assert.equal(isSFTPChannelClosedError(new Error('No such file')), false)
         assert.equal(isSFTPChannelClosedError(new Error('Permission denied')), false)
         assert.equal(isSFTPChannelClosedError(new Error('Request timed out')), false)
+        assert.equal(isTransientConnectionError(new Error('Request timed out')), true)
         assert.equal(isSFTPChannelClosedError(new Error('SFTP channel closed')), true)
         assert.equal(isSFTPChannelClosedError(new Error('UnexpectedEof')), true)
         assert.equal(isSFTPChannelClosedError(new Error('broken pipe')), true)
         assert.equal(isSFTPChannelClosedError(new Error('disconnected')), true)
         assert.equal(pool.current, p1Initial)
+
+        // Simulating Panel 1 Retry after operational Failure (failedBackend NOT set) -> reuses ch1 with 0 close() calls
+        const p1RetryAfterOperationalError = await pool.acquire(undefined)
+        assert.equal(p1RetryAfterOperationalError, p1Initial)
+        assert.equal(p1Initial.closeCalls, 0)
+        assert.equal(created.length, 1)
 
         // Panel 1 retries with failed channel ch1 -> closes ch1 exactly once and opens ch2
         const p1Recovered = await pool.acquire(p1Initial)
@@ -672,6 +758,42 @@ describe('filePanelFallback', () => {
 
         // Missing intermediate falls back to original path so readdir reports the exact server error
         assert.equal(await resolvePosixPathWithReadlink('/missing/..', readlink), '/missing/..')
+
+        // Post-readdir fallback flow: /link/../missing -> server rejects missing, reads /link/.. -> post-resolve converges to '/'
+        const readdirAttempted: string[] = []
+        const fallbackResult = await resolveReadableDirectory(
+            '/link/../missing',
+            async dirPath => {
+                readdirAttempted.push(dirPath)
+                if (dirPath === '/link/..') {
+                    return ['real', 'etc']
+                }
+                throw new Error('No such file')
+            },
+            isSFTPDirectoryUnavailableError,
+            undefined,
+            true,
+        )
+        assert.equal(fallbackResult.ok, true)
+        assert.deepEqual(readdirAttempted, ['/link/../missing', '/link/..'])
+        if (fallbackResult.ok) {
+            const canonical = await resolvePosixPathWithReadlink(fallbackResult.path, readlink)
+            assert.equal(canonical, '/')
+        }
+
+        // Manual /regular-file/.. hits server readdir FIRST (fails ENOTDIR/Failure) without prematurely calling readlink or listing '/'
+        const readlinkBeforeManual = readlinkCalls
+        let listedRoot = false
+        await assert.rejects(async () => {
+            const candidate = '/regular-file/..'
+            if (candidate === '/') {
+                listedRoot = true
+                return []
+            }
+            throw new Error('Status(Failure)')
+        }, /Status\(Failure\)/)
+        assert.equal(listedRoot, false)
+        assert.equal(readlinkCalls, readlinkBeforeManual)
     })
 })
 
@@ -748,6 +870,17 @@ describe('filePanelFilter', () => {
             { text: 'İ', highlighted: false },
             { text: 'ΟΣ', highlighted: true },
         ])
+
+        for (const sigmaQuery of ['Σ', 'σ', 'ς']) {
+            const matchSigma = matchFileName('İΟΣ', sigmaQuery)
+            assert.ok(matchSigma, `expected 'İΟΣ' to match '${sigmaQuery}'`)
+            assert.equal(matchSigma.tier, 2)
+            assert.deepEqual(matchSigma.ranges, [[2, 3]])
+            assert.deepEqual(splitTextByHighlights('İΟΣ', matchSigma.ranges), [
+                { text: 'İΟ', highlighted: false },
+                { text: 'Σ', highlighted: true },
+            ])
+        }
     })
 
     it('preserves directory-first lexicographical order when query is empty', () => {

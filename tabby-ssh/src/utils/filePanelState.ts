@@ -53,16 +53,17 @@ export interface FilePanelIpcRendererLike {
 
 export type FilePanelStateOpRequest =
     | { op: 'getScope', scope: string | null | undefined }
-    | { op: 'recordVisit', scope: string | null | undefined, path: string, now?: number }
-    | { op: 'addFavorite', scope: string | null | undefined, path: string, now?: number }
-    | { op: 'removeFavorite', scope: string | null | undefined, path: string, now?: number }
-    | { op: 'toggleFavorite', scope: string | null | undefined, path: string, now?: number }
+    | { op: 'recordVisit', scope: string | null | undefined, path: string }
+    | { op: 'addFavorite', scope: string | null | undefined, path: string }
+    | { op: 'removeFavorite', scope: string | null | undefined, path: string }
+    | { op: 'toggleFavorite', scope: string | null | undefined, path: string }
     | { op: 'getSnapshot' }
 
 export interface FilePanelStateOpResponse {
     ok: boolean
     result?: unknown
     changedScope?: string
+    evictedScopes?: string[]
     error?: string
 }
 
@@ -70,6 +71,7 @@ export interface FilePanelStateChangeEvent {
     scope: string
     storageKey: string
     source: FilePanelStateClient | null
+    evictedScopes?: string[]
 }
 
 export type FilePanelStateChangeListener = (event: FilePanelStateChangeEvent) => void
@@ -251,26 +253,37 @@ export class FilePanelStateStore implements FilePanelStateClient {
     private storage: FilePanelStorageLike | null
     private keyPrefix: string
     private sshKeyPrefix: string
+    private nowProvider: () => number
     private memoryScopes = new Map<string, FilePanelScopeRecord>()
     private failedStorageRaw = new Map<string, string | null>()
+    private lastEvictedScopes: string[] = []
     private lastTimestamp = 0
 
     constructor (
         storage?: FilePanelStorageLike | null,
         storageKeyPrefix = FILE_PANEL_STATE_STORAGE_KEY,
+        nowProvider: () => number = () => Date.now(),
     ) {
         this.storage = storage ?? null
         this.keyPrefix = storageKeyPrefix.endsWith(':') ? storageKeyPrefix : `${storageKeyPrefix}:`
         this.sshKeyPrefix = `${this.keyPrefix}ssh:`
+        this.nowProvider = nowProvider
     }
 
     getScopeStorageKey (scope: string): string {
         return `${this.keyPrefix}${scope}`
     }
 
+    consumeLastEvictedScopes (): string[] {
+        const evicted = [...this.lastEvictedScopes]
+        this.lastEvictedScopes = []
+        return evicted
+    }
+
     loadSnapshot (snapshot: FilePanelStateSnapshot): void {
         this.memoryScopes.clear()
         this.failedStorageRaw.clear()
+        this.lastEvictedScopes = []
         this.lastTimestamp = 0
         for (const [scope, record] of Object.entries(snapshot.scopes)) {
             if (!scope || FORBIDDEN_KEYS.has(scope)) {
@@ -340,7 +353,9 @@ export class FilePanelStateStore implements FilePanelStateClient {
             this.lastTimestamp = Math.max(this.lastTimestamp, explicitNow)
             return explicitNow
         }
-        const now = Math.max(Date.now(), this.lastTimestamp + 1, maxExisting + 1)
+        const providedNow = this.nowProvider()
+        const baseNow = typeof providedNow === 'number' && Number.isFinite(providedNow) ? providedNow : Date.now()
+        const now = Math.max(baseNow, this.lastTimestamp + 1, maxExisting + 1)
         this.lastTimestamp = now
         return now
     }
@@ -371,11 +386,11 @@ export class FilePanelStateStore implements FilePanelStateClient {
         return parsed
     }
 
-    private pruneMemorySSHScopes (protectedScope?: string): void {
+    private pruneMemorySSHScopes (protectedScope?: string): string[] {
         const sshScopes = [...this.memoryScopes.entries()]
             .filter(([scope]) => scope.startsWith('ssh:'))
         if (sshScopes.length <= MAX_SSH_SCOPES) {
-            return
+            return []
         }
         const evictable = sshScopes
             .filter(([scope]) => scope !== protectedScope && scope !== ADB_FILE_PANEL_SCOPE)
@@ -387,21 +402,24 @@ export class FilePanelStateStore implements FilePanelStateClient {
                 return aScope < bScope ? -1 : aScope > bScope ? 1 : 0
             })
         const excess = sshScopes.length - MAX_SSH_SCOPES
+        const evictedScopes: string[] = []
         for (let i = 0; i < excess && i < evictable.length; i++) {
             const victimScope = evictable[i][0]
             this.memoryScopes.delete(victimScope)
             this.failedStorageRaw.delete(victimScope)
+            evictedScopes.push(victimScope)
         }
+        return evictedScopes
     }
 
-    private pruneSSHScopes (protectedScope?: string): void {
+    private pruneSSHScopes (protectedScope?: string): string[] {
         if (this.storage) {
             const sshEntries = this.listMatchingStorageEntries(this.sshKeyPrefix).map(entry => ({
                 ...entry,
                 updatedAt: parseFilePanelScopeRecord(entry.raw, true).updatedAt,
             }))
             if (sshEntries.length <= MAX_SSH_SCOPES) {
-                return
+                return []
             }
             const evictable = sshEntries
                 .filter(entry => entry.scope !== protectedScope && entry.scope !== ADB_FILE_PANEL_SCOPE)
@@ -413,6 +431,7 @@ export class FilePanelStateStore implements FilePanelStateClient {
                     return a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0
                 })
             const excess = sshEntries.length - MAX_SSH_SCOPES
+            const evictedScopes: string[] = []
             for (let i = 0; i < excess && i < evictable.length; i++) {
                 const victim = evictable[i]
                 try {
@@ -422,20 +441,21 @@ export class FilePanelStateStore implements FilePanelStateClient {
                 }
                 this.memoryScopes.delete(victim.scope)
                 this.failedStorageRaw.delete(victim.scope)
+                evictedScopes.push(victim.scope)
             }
-            return
+            return evictedScopes
         }
 
-        this.pruneMemorySSHScopes(protectedScope)
+        return this.pruneMemorySSHScopes(protectedScope)
     }
 
-    private writeScopeRecord (scope: string, record: FilePanelScopeRecord): void {
+    private writeScopeRecord (scope: string, record: FilePanelScopeRecord): string[] {
         this.memoryScopes.set(scope, cloneFilePanelScopeRecord(record))
         if (!this.storage) {
             if (scope.startsWith('ssh:')) {
-                this.pruneMemorySSHScopes(scope)
+                return this.pruneMemorySSHScopes(scope)
             }
-            return
+            return []
         }
         const storageKey = this.getScopeStorageKey(scope)
         let previousRaw: string | null = null
@@ -458,19 +478,20 @@ export class FilePanelStateStore implements FilePanelStateClient {
         try {
             this.storage.setItem(storageKey, serialized)
             this.failedStorageRaw.delete(scope)
-            if (scope.startsWith('ssh:')) {
-                this.pruneSSHScopes(scope)
-            }
+            const evictedScopes = scope.startsWith('ssh:') ? this.pruneSSHScopes(scope) : []
             notifyFilePanelStateChanges({
                 scope,
                 storageKey,
                 source: this,
+                evictedScopes,
             })
+            return evictedScopes
         } catch {
             this.failedStorageRaw.set(scope, previousRaw)
             if (scope.startsWith('ssh:')) {
-                this.pruneMemorySSHScopes(scope)
+                return this.pruneMemorySSHScopes(scope)
             }
+            return []
         }
     }
 
@@ -479,13 +500,14 @@ export class FilePanelStateStore implements FilePanelStateClient {
         now: number | undefined,
         mutator: (record: FilePanelScopeRecord) => void,
     ): FilePanelScopeRecord | null {
+        this.lastEvictedScopes = []
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return null
         }
         const record = this.readScopeRecord(scope)
         mutator(record)
         record.updatedAt = this.nextTimestamp(now)
-        this.writeScopeRecord(scope, record)
+        this.lastEvictedScopes = this.writeScopeRecord(scope, record)
         return cloneFilePanelScopeRecord(record)
     }
 
@@ -603,7 +625,6 @@ export function executeFilePanelStateOp (
     }
     const scope = typeof request.scope === 'string' ? request.scope : null
     const pathValue = typeof request.path === 'string' ? request.path : ''
-    const now = typeof request.now === 'number' && Number.isFinite(request.now) ? request.now : undefined
 
     switch (request.op) {
         case 'getScope':
@@ -611,25 +632,56 @@ export function executeFilePanelStateOp (
         case 'getSnapshot':
             return { ok: true, result: store.getSnapshot() }
         case 'recordVisit': {
-            const result = store.recordVisit(scope, pathValue, now)
-            return { ok: true, result, changedScope: result && scope ? scope : undefined }
+            const result = store.recordVisit(scope, pathValue)
+            const evictedScopes = store.consumeLastEvictedScopes()
+            return {
+                ok: true,
+                result,
+                changedScope: result && scope ? scope : undefined,
+                evictedScopes,
+            }
         }
         case 'addFavorite': {
-            const result = store.addFavorite(scope, pathValue, now)
-            return { ok: true, result, changedScope: result && scope ? scope : undefined }
+            const result = store.addFavorite(scope, pathValue)
+            const evictedScopes = store.consumeLastEvictedScopes()
+            return {
+                ok: true,
+                result,
+                changedScope: result && scope ? scope : undefined,
+                evictedScopes,
+            }
         }
         case 'removeFavorite': {
-            const result = store.removeFavorite(scope, pathValue, now)
-            return { ok: true, result, changedScope: result && scope ? scope : undefined }
+            const result = store.removeFavorite(scope, pathValue)
+            const evictedScopes = store.consumeLastEvictedScopes()
+            return {
+                ok: true,
+                result,
+                changedScope: result && scope ? scope : undefined,
+                evictedScopes,
+            }
         }
         case 'toggleFavorite': {
-            const added = store.toggleFavorite(scope, pathValue, now)
+            const added = store.toggleFavorite(scope, pathValue)
+            const evictedScopes = store.consumeLastEvictedScopes()
             const validScope = scope && !FORBIDDEN_KEYS.has(scope) ? scope : undefined
-            return { ok: true, result: added, changedScope: validScope }
+            return {
+                ok: true,
+                result: added,
+                changedScope: validScope,
+                evictedScopes,
+            }
         }
         default:
             return { ok: false, error: `Unknown file panel state operation: ${request.op}` }
     }
+}
+
+function sanitizeEvictedScopes (raw: unknown): string[] {
+    if (!Array.isArray(raw)) {
+        return []
+    }
+    return raw.filter((item): item is string => typeof item === 'string' && item.length > 0 && !FORBIDDEN_KEYS.has(item))
 }
 
 function attachIpcChangeBridge (ipcRenderer: FilePanelIpcRendererLike): void {
@@ -645,6 +697,7 @@ function attachIpcChangeBridge (ipcRenderer: FilePanelIpcRendererLike): void {
             scope: payload.scope,
             storageKey: getFilePanelScopeStorageKey(payload.scope),
             source: null,
+            evictedScopes: sanitizeEvictedScopes(payload.evictedScopes),
         })
     })
 }
@@ -674,7 +727,7 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
         return null
     }
 
-    private notifyLocalChange (scope: string | null | undefined): void {
+    private notifyLocalChange (scope: string | null | undefined, evictedScopes: string[] = []): void {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return
         }
@@ -682,6 +735,7 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
             scope,
             storageKey: getFilePanelScopeStorageKey(scope),
             source: this,
+            evictedScopes,
         })
     }
 
@@ -729,9 +783,9 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return null
         }
-        const response = this.invoke({ op: 'recordVisit', scope, path: rawPath, now })
+        const response = this.invoke({ op: 'recordVisit', scope, path: rawPath })
         if (response) {
-            this.notifyLocalChange(scope)
+            this.notifyLocalChange(scope, sanitizeEvictedScopes(response.evictedScopes))
             return isPlainRecord(response.result)
                 ? sanitizeScopeRecord(response.result, shouldPreserveDotDot(scope))
                 : null
@@ -743,9 +797,9 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return null
         }
-        const response = this.invoke({ op: 'addFavorite', scope, path: rawPath, now })
+        const response = this.invoke({ op: 'addFavorite', scope, path: rawPath })
         if (response) {
-            this.notifyLocalChange(scope)
+            this.notifyLocalChange(scope, sanitizeEvictedScopes(response.evictedScopes))
             return isPlainRecord(response.result)
                 ? sanitizeScopeRecord(response.result, shouldPreserveDotDot(scope))
                 : null
@@ -757,9 +811,9 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return null
         }
-        const response = this.invoke({ op: 'removeFavorite', scope, path: rawPath, now })
+        const response = this.invoke({ op: 'removeFavorite', scope, path: rawPath })
         if (response) {
-            this.notifyLocalChange(scope)
+            this.notifyLocalChange(scope, sanitizeEvictedScopes(response.evictedScopes))
             return isPlainRecord(response.result)
                 ? sanitizeScopeRecord(response.result, shouldPreserveDotDot(scope))
                 : null
@@ -771,9 +825,9 @@ export class IpcFilePanelStateClient implements FilePanelStateClient {
         if (!scope || FORBIDDEN_KEYS.has(scope)) {
             return false
         }
-        const response = this.invoke({ op: 'toggleFavorite', scope, path: rawPath, now })
+        const response = this.invoke({ op: 'toggleFavorite', scope, path: rawPath })
         if (response && typeof response.result === 'boolean') {
-            this.notifyLocalChange(scope)
+            this.notifyLocalChange(scope, sanitizeEvictedScopes(response.evictedScopes))
             return response.result
         }
         return this.fallback.toggleFavorite(scope, rawPath, now)

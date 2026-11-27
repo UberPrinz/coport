@@ -23,7 +23,7 @@ import { FileUpload, DirectoryUpload, DirectoryDownload, MenuItemOptions, Notifi
 import { SFTPFile } from '../session/sftp'
 import { FileBackend } from '../api/fileBackend'
 import { SFTPContextMenuItemProvider } from '../api'
-import { NgbModal } from '@ng-bootstrap/ng-bootstrap'
+import { NgbModal, NgbModalRef } from '@ng-bootstrap/ng-bootstrap'
 import { SFTPCreateDirectoryModalComponent } from './sftpCreateDirectoryModal.component'
 import {
     createDefaultFilePanelStateClient,
@@ -40,7 +40,9 @@ import {
 } from '../utils/filePanelFilter'
 import {
     extractErrorMessage,
-    hasDotDotSegment,
+    hasRelativePathSegment,
+    isSFTPChannelClosedError,
+    isTransientConnectionError,
     resolveReadableDirectory,
 } from '../utils/filePanelFallback'
 
@@ -112,10 +114,11 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
     loadError: PanelErrorNotice | null = null
 
     private backend: FileBackend | null = null
-    private failedBackend: FileBackend | null = null
+    private failedBackendForReopen: FileBackend | null = null
     private backendClosedSub: Subscription | null = null
     private bodyResizeObserver: ResizeObserver | null = null
     private unsubscribeStateChanges: (() => void) | null = null
+    private openModals = new Set<NgbModalRef>()
     private initialPathInput: string | null = null
     private currentPath = '/'
     private unfilteredEntries: FilteredFileEntry<SFTPFile>[] = []
@@ -123,10 +126,40 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
     private visibleStartIndex = 0
     private visibleEndIndex = 0
     private navigation = 0
+    private _sessionEpoch = 0
     private initialized = false
     private destroyed = false
     private persistentStore: FilePanelStateClient
     private memoryStore = new FilePanelStateStore(null)
+
+    get sessionEpoch (): number {
+        return this._sessionEpoch
+    }
+
+    isSessionActive (epoch: number, backend: FileBackend | null | undefined): boolean {
+        return !this.destroyed &&
+            epoch === this._sessionEpoch &&
+            Boolean(backend) &&
+            this.backend === backend
+    }
+
+    registerModal (modal: NgbModalRef): void {
+        this.openModals.add(modal)
+        modal.result.finally(() => {
+            this.openModals.delete(modal)
+        }).catch(() => null)
+    }
+
+    private dismissOpenModals (): void {
+        for (const modal of [...this.openModals]) {
+            try {
+                modal.dismiss('session-changed')
+            } catch {
+                // Ignore already-closed modal.
+            }
+        }
+        this.openModals.clear()
+    }
 
     readonly getDropTarget = (): string => this.path
 
@@ -176,11 +209,15 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
             window.addEventListener('storage', this.handleStorageEvent)
         }
         this.unsubscribeStateChanges = subscribeFilePanelStateChanges(event => {
-            if (this.destroyed || !this.stateScope || event.scope !== this.stateScope) {
+            if (this.destroyed || !this.stateScope) {
+                return
+            }
+            const evicted = Boolean(event.evictedScopes?.includes(this.stateScope))
+            if (event.scope !== this.stateScope && !evicted) {
                 return
             }
             this.syncStoredPlaces()
-            if (event.source !== this.persistentStore) {
+            if (event.source !== this.persistentStore || evicted) {
                 this.cdr.detectChanges()
             } else {
                 this.cdr.markForCheck()
@@ -210,14 +247,16 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         if (!sessionChanged && !scopeChanged) {
             return
         }
+        this._sessionEpoch++
         this.navigation++
+        this.dismissOpenModals()
         this.backendClosedSub?.unsubscribe()
         this.backendClosedSub = null
         if (sessionChanged) {
             this.backend = null
             this.sftp = null as unknown as FileBackend
         }
-        this.failedBackend = null
+        this.failedBackendForReopen = null
         if (!('path' in changes)) {
             this.initialPathInput = null
         }
@@ -237,9 +276,11 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
 
     ngOnDestroy (): void {
         this.destroyed = true
+        this._sessionEpoch++
         this.navigation++
+        this.dismissOpenModals()
         this.detachBackend()
-        this.failedBackend = null
+        this.failedBackendForReopen = null
         this.bodyResizeObserver?.disconnect()
         this.bodyResizeObserver = null
         this.unsubscribeStateChanges?.()
@@ -251,7 +292,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
 
     private detachBackend (rememberAsFailed = false): void {
         if (rememberAsFailed && this.backend) {
-            this.failedBackend = this.backend
+            this.failedBackendForReopen = this.backend
         }
         this.backendClosedSub?.unsubscribe()
         this.backendClosedSub = null
@@ -261,7 +302,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
     private attachBackend (backend: FileBackend): void {
         this.backend = backend
         this.sftp = backend
-        this.failedBackend = null
+        this.failedBackendForReopen = null
         this.backendClosedSub?.unsubscribe()
         this.backendClosedSub = backend.closed$?.subscribe(() => {
             if (this.backend === backend) {
@@ -276,10 +317,6 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
                 }
             }
         }) ?? null
-    }
-
-    private getActiveBackend (): FileBackend | null {
-        return this.backend
     }
 
     private get activeStore (): FilePanelStateClient {
@@ -314,8 +351,8 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         return basePath.endsWith('/') ? `${basePath}${childName}` : `${basePath}/${childName}`
     }
 
-    private isDirectoryUnavailableError (error: unknown): boolean {
-        return this.backend?.isDirectoryUnavailable?.(error) ?? false
+    private isDirectoryUnavailableError (error: unknown, backend: FileBackend | null = this.backend): boolean {
+        return backend?.isDirectoryUnavailable?.(error) ?? false
     }
 
     private resetFileLists (): void {
@@ -331,16 +368,26 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         this.selectedIndex = -1
     }
 
-    private async resolveTargetPath (backend: FileBackend, normalizedPath: string): Promise<string> {
-        if (!this.shouldPreserveDotDot || !backend.resolvePath || !hasDotDotSegment(normalizedPath)) {
-            return normalizedPath
+    private async resolveCanonicalDirectoryPath (backend: FileBackend, succeededPath: string): Promise<string> {
+        if (!this.shouldPreserveDotDot || !backend.resolvePath || !hasRelativePathSegment(succeededPath)) {
+            return succeededPath
         }
         try {
-            const resolved = await backend.resolvePath(normalizedPath)
+            const resolved = await backend.resolvePath(succeededPath)
             return this.normalizePathValue(resolved)
         } catch {
-            return normalizedPath
+            return succeededPath
         }
+    }
+
+    private rebaseEntriesIfNeeded (entries: SFTPFile[], rawDirPath: string, canonicalDirPath: string): SFTPFile[] {
+        if (canonicalDirPath === rawDirPath) {
+            return entries
+        }
+        return entries.map(entry => ({
+            ...entry,
+            fullPath: this.joinChildPath(canonicalDirPath, entry.name),
+        }))
     }
 
     private async initializeBackendAndNavigate (
@@ -453,18 +500,10 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         this.errorNotice = null
         this.fallbackNotice = null
 
-        const resolvedTarget = await this.resolveTargetPath(backend, normalizedTarget)
-        if (this.isRequestStale(request)) {
-            return
-        }
-        if (resolvedTarget !== normalizedTarget) {
-            this.setCurrentPath(resolvedTarget, false)
-        }
-
         const result = await resolveReadableDirectory(
-            resolvedTarget,
+            normalizedTarget,
             dirPath => backend.readdir(dirPath),
-            error => this.isDirectoryUnavailableError(error),
+            error => this.isDirectoryUnavailableError(error, backend),
             () => this.isRequestStale(request),
             this.shouldPreserveDotDot,
         )
@@ -474,22 +513,27 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         }
 
         if (result.ok) {
-            this.setCurrentPath(result.path, true)
-            this.applyLoadedEntries(result.entries)
+            const canonicalPath = await this.resolveCanonicalDirectoryPath(backend, result.path)
+            if (this.isRequestStale(request)) {
+                return
+            }
+            const entries = this.rebaseEntriesIfNeeded(result.entries, result.path, canonicalPath)
+            this.setCurrentPath(canonicalPath, true)
+            this.applyLoadedEntries(entries)
             this.loadError = null
             if (result.fellBackFrom) {
                 this.fallbackNotice = {
                     requestedPath: result.fellBackFrom,
-                    resolvedPath: result.path,
+                    resolvedPath: canonicalPath,
                     reason: result.fallbackReason ?? 'Directory is unavailable',
                 }
             }
-            this.recordCurrentDirectory(result.path)
+            this.recordCurrentDirectory(canonicalPath)
             this.focusPanelIfOwned()
             return
         }
 
-        if (!result.isUnavailable) {
+        if (isSFTPChannelClosedError(result.error) && this.backend === backend) {
             this.detachBackend(true)
         }
         this.setCurrentPath(result.path, false)
@@ -507,7 +551,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
 
     private async navigateWithRequest (newPath: string, request: number): Promise<void> {
         if (!this.backend) {
-            await this.initializeBackendAndNavigate(newPath, null, request)
+            await this.initializeBackendAndNavigate(newPath, this.failedBackendForReopen, request)
             return
         }
         const backend = this.backend
@@ -519,46 +563,48 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
             this.loadError = null
         }
 
-        const resolvedPath = await this.resolveTargetPath(backend, normalizedPath)
-        if (this.isRequestStale(request)) {
-            return
-        }
-
         try {
-            const entries = await backend.readdir(resolvedPath)
+            const rawEntries = await backend.readdir(normalizedPath)
             if (this.isRequestStale(request)) {
                 return
             }
-            this.setCurrentPath(resolvedPath, true)
+            const canonicalPath = await this.resolveCanonicalDirectoryPath(backend, normalizedPath)
+            if (this.isRequestStale(request)) {
+                return
+            }
+            const entries = this.rebaseEntriesIfNeeded(rawEntries, normalizedPath, canonicalPath)
+            this.setCurrentPath(canonicalPath, true)
             this.clearFilter()
             this.fallbackNotice = null
             this.errorNotice = null
             this.loadError = null
             this.applyLoadedEntries(entries)
-            this.recordCurrentDirectory(resolvedPath)
+            this.recordCurrentDirectory(canonicalPath)
             this.focusPanelIfOwned()
         } catch (error) {
             if (this.isRequestStale(request)) {
                 return
             }
             const message = extractErrorMessage(error)
-            const unavailable = this.isDirectoryUnavailableError(error)
+            const unavailable = this.isDirectoryUnavailableError(error, backend)
+            const channelClosed = isSFTPChannelClosedError(error)
+            const transient = isTransientConnectionError(error)
             this.notifications.error(message)
-            if (hadValidList && unavailable) {
+            if (hadValidList && (unavailable || !transient)) {
                 this.errorNotice = {
-                    path: resolvedPath,
+                    path: normalizedPath,
                     message,
                 }
                 this.cdr.detectChanges()
                 this.focusPanelIfOwned()
             } else {
-                if (!unavailable) {
+                if (channelClosed && this.backend === backend) {
                     this.detachBackend(true)
                 }
-                this.setCurrentPath(resolvedPath, false)
+                this.setCurrentPath(normalizedPath, false)
                 this.resetFileLists()
                 this.loadError = {
-                    path: resolvedPath,
+                    path: normalizedPath,
                     message,
                 }
             }
@@ -567,9 +613,13 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
 
     async retryLoad (): Promise<void> {
         const retryPath = this.loadError?.path ?? this.currentPath
-        const failed = this.backend ?? this.failedBackend
-        this.detachBackend()
-        this.failedBackend = null
+        if (this.backend && !this.failedBackendForReopen) {
+            await this.initializeBackendAndNavigate(retryPath, null)
+            return
+        }
+        const failed = this.failedBackendForReopen
+        this.detachBackend(false)
+        this.failedBackendForReopen = null
         await this.initializeBackendAndNavigate(retryPath, failed)
     }
 
@@ -659,33 +709,53 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         void this.navigate(parts.length > 0 ? `/${parts.join('/')}` : '/')
     }
 
-    private async resolveLink (item: SFTPFile, request?: number): Promise<SFTPFile | undefined> {
+    private async resolveLink (
+        item: SFTPFile,
+        request?: number,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<SFTPFile | undefined> {
         if (!item.isSymlink) {
             return item
         }
-        if (!this.backend) {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
             return undefined
         }
         try {
-            return await this.backend.stat(item.fullPath)
+            const resolved = await backend.stat(item.fullPath)
+            if (!this.isSessionActive(epoch, backend)) {
+                return undefined
+            }
+            return resolved
         } catch (error) {
-            if (!this.destroyed && (request === undefined || request === this.navigation)) {
+            if (this.isSessionActive(epoch, backend) && (request === undefined || request === this.navigation)) {
                 this.notifications.error(extractErrorMessage(error))
             }
             return undefined
         }
     }
 
-    async open (item: SFTPFile): Promise<void> {
+    async open (item: SFTPFile, options?: { clearFilterOnDownload?: boolean }): Promise<void> {
+        const backend = this.backend
+        const epoch = this._sessionEpoch
+        if (!backend) {
+            return
+        }
         const request = ++this.navigation
-        const target = await this.resolveLink(item, request)
-        if (!target || this.destroyed || request !== this.navigation) {
+        const target = await this.resolveLink(item, request, backend, epoch)
+        if (!target || !this.isSessionActive(epoch, backend) || request !== this.navigation) {
             return
         }
         if (target.isDirectory) {
             await this.navigateWithRequest(item.fullPath, request)
         } else {
-            await this.download(item.fullPath, target.mode, target.size)
+            if (options?.clearFilterOnDownload) {
+                this.clearFilter(true)
+            }
+            await this.download(item.fullPath, target.mode, target.size, backend, epoch)
+            if (options?.clearFilterOnDownload && this.isSessionActive(epoch, backend)) {
+                this.focusPanelIfOwned()
+            }
         }
     }
 
@@ -699,40 +769,53 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         void this.showContextMenu(item, event)
     }
 
-    async downloadItem (item: SFTPFile): Promise<void> {
+    async downloadItem (
+        item: SFTPFile,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
+            return
+        }
         const request = this.navigation
-        const target = await this.resolveLink(item, request)
-        if (!target || this.destroyed || request !== this.navigation) {
+        const target = await this.resolveLink(item, request, backend, epoch)
+        if (!target || !this.isSessionActive(epoch, backend) || request !== this.navigation) {
             return
         }
         if (target.isDirectory) {
-            await this.downloadFolder(item)
+            await this.downloadFolder(item, backend, epoch)
         } else {
-            await this.download(item.fullPath, target.mode, target.size)
+            await this.download(item.fullPath, target.mode, target.size, backend, epoch)
         }
     }
 
-    async openCreateDirectoryModal (): Promise<void> {
-        if (!this.backend) {
+    async openCreateDirectoryModal (
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
             return
         }
         const request = this.navigation
         const basePath = this.path
         const modal = this.ngbModal.open(SFTPCreateDirectoryModalComponent)
+        this.registerModal(modal)
         const directoryName = await modal.result.catch(() => null)
-        const activeBackend = this.getActiveBackend()
-        if (this.destroyed || request !== this.navigation || !activeBackend) {
+        if (!this.isSessionActive(epoch, backend) || request !== this.navigation) {
             return
         }
         if (directoryName?.trim()) {
             const targetPath = this.joinChildPath(basePath, directoryName)
-            activeBackend.mkdir(targetPath).then(() => {
+            backend.mkdir(targetPath).then(() => {
+                if (!this.isSessionActive(epoch, backend)) {
+                    return
+                }
                 this.notifications.notice('The directory was created successfully')
-                if (!this.destroyed && request === this.navigation) {
+                if (request === this.navigation) {
                     void this.navigate(targetPath)
                 }
             }).catch(() => {
-                if (!this.destroyed) {
+                if (this.isSessionActive(epoch, backend)) {
                     this.notifications.error('The directory could not be created')
                 }
             })
@@ -740,94 +823,188 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
     }
 
     async upload (): Promise<void> {
+        const backend = this.backend
+        const epoch = this._sessionEpoch
+        if (!backend) {
+            return
+        }
         const request = this.navigation
         const target = this.path
         try {
             const transfers = await this.platform.startUpload({ multiple: true })
-            await Promise.all(transfers.map(t => this.uploadOne(t, target, request)))
+            if (!this.isSessionActive(epoch, backend)) {
+                for (const transfer of transfers) {
+                    transfer.cancel()
+                    transfer.close()
+                }
+                return
+            }
+            await Promise.all(transfers.map(t => this.uploadOne(t, target, request, backend, epoch)))
         } catch (error) {
-            this.notifications.error(extractErrorMessage(error))
+            if (this.isSessionActive(epoch, backend)) {
+                this.notifications.error(extractErrorMessage(error))
+            }
+        }
+    }
+
+    private cancelDirectoryUpload (transfer: DirectoryUpload): void {
+        for (const child of transfer.getChildrens()) {
+            if (child instanceof DirectoryUpload) {
+                this.cancelDirectoryUpload(child)
+            } else {
+                child.cancel()
+                child.close()
+            }
         }
     }
 
     async uploadFolder (): Promise<void> {
+        const backend = this.backend
+        const epoch = this._sessionEpoch
+        if (!backend) {
+            return
+        }
         const request = this.navigation
         const target = this.path
         try {
             const transfer = await this.platform.startUploadDirectory()
-            await this.uploadOneFolder(transfer, target, request)
+            if (!this.isSessionActive(epoch, backend)) {
+                this.cancelDirectoryUpload(transfer)
+                return
+            }
+            await this.uploadOneFolder(transfer, target, request, backend, epoch)
         } catch (error) {
-            this.notifications.error(extractErrorMessage(error))
+            if (this.isSessionActive(epoch, backend)) {
+                this.notifications.error(extractErrorMessage(error))
+            }
         }
     }
 
-    async uploadOneFolder (transfer: DirectoryUpload, base = this.path, request = this.navigation): Promise<void> {
+    async uploadOneFolder (
+        transfer: DirectoryUpload,
+        base = this.path,
+        request = this.navigation,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
+            return
+        }
         try {
-            await this.uploadDirectoryEntries(transfer, base)
-            if (!this.destroyed && request === this.navigation && base === this.path) {
+            await this.uploadDirectoryEntries(transfer, base, backend, epoch)
+            if (this.isSessionActive(epoch, backend) && request === this.navigation && base === this.path) {
                 await this.navigate(base)
             }
         } catch (error) {
-            this.notifications.error(extractErrorMessage(error))
-        }
-    }
-
-    private async uploadDirectoryEntries (transfer: DirectoryUpload, directory: string): Promise<void> {
-        if (!this.backend) {
-            return
-        }
-        for (const child of transfer.getChildrens()) {
-            const target = this.joinChildPath(directory, child.getName())
-            if (child instanceof DirectoryUpload) {
-                try {
-                    await this.backend.mkdir(target)
-                } catch {
-                    // Intentionally ignoring errors from making duplicate dirs.
-                }
-                await this.uploadDirectoryEntries(child, target)
-            } else {
-                await this.backend.upload(target, child)
+            if (this.isSessionActive(epoch, backend)) {
+                this.notifications.error(extractErrorMessage(error))
             }
         }
     }
 
-    async uploadOne (transfer: FileUpload, target = this.path, request = this.navigation): Promise<void> {
-        if (!this.backend) {
+    private async uploadDirectoryEntries (
+        transfer: DirectoryUpload,
+        directory: string,
+        backend: FileBackend,
+        epoch: number,
+    ): Promise<void> {
+        if (!this.isSessionActive(epoch, backend)) {
             return
         }
-        await this.backend.upload(this.joinChildPath(target, transfer.getName()), transfer)
-        if (!this.destroyed && request === this.navigation && this.path === target) {
+        for (const child of transfer.getChildrens()) {
+            if (!this.isSessionActive(epoch, backend)) {
+                return
+            }
+            const target = this.joinChildPath(directory, child.getName())
+            if (child instanceof DirectoryUpload) {
+                try {
+                    await backend.mkdir(target)
+                } catch {
+                    // Intentionally ignoring errors from making duplicate dirs.
+                }
+                if (!this.isSessionActive(epoch, backend)) {
+                    return
+                }
+                await this.uploadDirectoryEntries(child, target, backend, epoch)
+            } else {
+                await backend.upload(target, child)
+            }
+        }
+    }
+
+    async uploadOne (
+        transfer: FileUpload,
+        target = this.path,
+        request = this.navigation,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
+            return
+        }
+        await backend.upload(this.joinChildPath(target, transfer.getName()), transfer)
+        if (this.isSessionActive(epoch, backend) && request === this.navigation && this.path === target) {
             await this.navigate(target)
         }
     }
 
-    async download (itemPath: string, mode: number, size: number): Promise<void> {
-        if (!this.backend) {
+    async download (
+        itemPath: string,
+        mode: number,
+        size: number,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
             return
         }
         try {
-            const transfer = await this.platform.startDownload(path.basename(itemPath), mode, size, undefined, this.backend.atomicDownloads)
-            if (transfer) {
-                await this.backend.download(itemPath, transfer)
+            const transfer = await this.platform.startDownload(path.basename(itemPath), mode, size, undefined, backend.atomicDownloads)
+            if (!transfer) {
+                return
             }
+            if (!this.isSessionActive(epoch, backend)) {
+                transfer.cancel()
+                transfer.close()
+                return
+            }
+            await backend.download(itemPath, transfer)
         } catch (error) {
-            this.notifications.error(extractErrorMessage(error))
+            if (this.isSessionActive(epoch, backend)) {
+                this.notifications.error(extractErrorMessage(error))
+            }
         }
     }
 
-    async downloadFolder (folder: SFTPFile): Promise<void> {
+    async downloadFolder (
+        folder: SFTPFile,
+        backend: FileBackend | null = this.backend,
+        epoch = this._sessionEpoch,
+    ): Promise<void> {
+        if (!backend || !this.isSessionActive(epoch, backend)) {
+            return
+        }
         try {
             const transfer = await this.platform.startDownloadDirectory(folder.name, 0)
             if (!transfer) {
                 return
             }
+            if (!this.isSessionActive(epoch, backend)) {
+                transfer.cancel()
+                transfer.close()
+                return
+            }
 
             // Start background size calculation and download simultaneously
-            const sizeCalculationPromise = this.calculateFolderSizeAndUpdate(folder, transfer)
-            const downloadPromise = this.downloadFolderRecursive(folder, transfer, '')
+            const sizeCalculationPromise = this.calculateFolderSizeAndUpdate(folder, transfer, backend, epoch)
+            const downloadPromise = this.downloadFolderRecursive(folder, transfer, '', backend, epoch)
 
             try {
                 await Promise.all([sizeCalculationPromise, downloadPromise])
+                if (!this.isSessionActive(epoch, backend)) {
+                    transfer.cancel()
+                    return
+                }
                 transfer.setStatus('')
                 transfer.setCompleted(true)
             } catch (error) {
@@ -837,20 +1014,33 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
                 transfer.close()
             }
         } catch (error) {
-            this.notifications.error(`Failed to download folder: ${extractErrorMessage(error)}`)
-            throw error
+            if (this.isSessionActive(epoch, backend)) {
+                this.notifications.error(`Failed to download folder: ${extractErrorMessage(error)}`)
+                throw error
+            }
         }
     }
 
-    private async calculateFolderSizeAndUpdate (folder: SFTPFile, transfer: DirectoryDownload): Promise<number> {
-        if (!this.backend) {
+    private async calculateFolderSizeAndUpdate (
+        folder: SFTPFile,
+        transfer: DirectoryDownload,
+        backend: FileBackend,
+        epoch: number,
+    ): Promise<number> {
+        if (!this.isSessionActive(epoch, backend)) {
             return 0
         }
         let totalSize = 0
-        const items = await this.backend.readdir(folder.fullPath)
+        const items = await backend.readdir(folder.fullPath)
+        if (!this.isSessionActive(epoch, backend)) {
+            return 0
+        }
         for (const item of items) {
+            if (!this.isSessionActive(epoch, backend)) {
+                return totalSize
+            }
             if (item.isDirectory) {
-                totalSize += await this.calculateFolderSizeAndUpdate(item, transfer)
+                totalSize += await this.calculateFolderSizeAndUpdate(item, transfer, backend, epoch)
             } else {
                 totalSize += item.size
             }
@@ -859,14 +1049,23 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         return totalSize
     }
 
-    private async downloadFolderRecursive (folder: SFTPFile, transfer: DirectoryDownload, relativePath: string): Promise<void> {
-        if (!this.backend) {
-            return
+    private async downloadFolderRecursive (
+        folder: SFTPFile,
+        transfer: DirectoryDownload,
+        relativePath: string,
+        backend: FileBackend,
+        epoch: number,
+    ): Promise<void> {
+        if (!this.isSessionActive(epoch, backend)) {
+            throw new Error('Download cancelled')
         }
-        const items = await this.backend.readdir(folder.fullPath)
+        const items = await backend.readdir(folder.fullPath)
+        if (!this.isSessionActive(epoch, backend)) {
+            throw new Error('Download cancelled')
+        }
 
         for (const item of items) {
-            if (transfer.isCancelled()) {
+            if (transfer.isCancelled() || !this.isSessionActive(epoch, backend)) {
                 throw new Error('Download cancelled')
             }
 
@@ -875,10 +1074,18 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
             transfer.setStatus(itemRelativePath)
             if (item.isDirectory) {
                 await transfer.createDirectory(itemRelativePath)
-                await this.downloadFolderRecursive(item, transfer, itemRelativePath)
+                if (!this.isSessionActive(epoch, backend)) {
+                    throw new Error('Download cancelled')
+                }
+                await this.downloadFolderRecursive(item, transfer, itemRelativePath, backend, epoch)
             } else {
-                const fileDownload = await transfer.createFile(itemRelativePath, item.mode, item.size, this.backend.atomicDownloads)
-                await this.backend.download(item.fullPath, fileDownload)
+                const fileDownload = await transfer.createFile(itemRelativePath, item.mode, item.size, backend.atomicDownloads)
+                if (!this.isSessionActive(epoch, backend)) {
+                    fileDownload.cancel()
+                    fileDownload.close()
+                    throw new Error('Download cancelled')
+                }
+                await backend.download(item.fullPath, fileDownload)
             }
         }
     }
@@ -1224,7 +1431,7 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
             return
         }
         const item = this.filteredEntries[this.selectedIndex].item
-        await this.open(item)
+        await this.open(item, { clearFilterOnDownload: true })
     }
 
     handleEscape (event?: Event): void {

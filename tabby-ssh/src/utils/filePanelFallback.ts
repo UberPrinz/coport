@@ -41,6 +41,13 @@ export function hasDotDotSegment (rawPath: string): boolean {
     return rawPath.split('/').includes('..')
 }
 
+export function hasRelativePathSegment (rawPath: string): boolean {
+    if (typeof rawPath !== 'string' || !rawPath) {
+        return false
+    }
+    return rawPath.split('/').some(segment => segment === '..' || segment === '.')
+}
+
 export function normalizeFallbackPath (rawPath: string, preserveDotDot = false): string {
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
         return '/'
@@ -135,6 +142,13 @@ export function isSFTPChannelClosedError (error: unknown): boolean {
     return /(?:^|[\s:(])closed\b/i.test(message) && !/\bstatus\s*\(\s*failure\s*\)/i.test(message)
 }
 
+export function isTransientConnectionError (error: unknown): boolean {
+    if (isSFTPChannelClosedError(error)) {
+        return true
+    }
+    return TRANSIENT_ERROR_PATTERN.test(extractErrorMessage(error))
+}
+
 export async function resolvePosixPathWithReadlink (
     rawPath: string,
     readlink: (targetPath: string) => Promise<string>,
@@ -143,8 +157,12 @@ export async function resolvePosixPathWithReadlink (
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
         return '/'
     }
-    const initialParts = rawPath.split('/').filter(part => part !== '' && part !== '.')
+    const rawSegments = rawPath.split('/')
+    const initialParts = rawSegments.filter(part => part !== '' && part !== '.')
     if (!initialParts.includes('..')) {
+        if (rawSegments.includes('.')) {
+            return initialParts.length > 0 ? `/${initialParts.join('/')}` : '/'
+        }
         return rawPath
     }
     const queue: string[] = [...initialParts]

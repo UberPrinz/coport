@@ -77,6 +77,7 @@ async function prepareNavigationFixtures () {
     await writeFile(join(sshRoot, 'real-parent', 'from-real-parent.txt'), 'real\n')
     await writeFile(join(sshRoot, 'link-parent', 'from-link-parent.txt'), 'link\n')
     await symlink(join(sshRoot, 'real-parent', 'real-child'), join(sshRoot, 'link-parent', 'to-real-child'))
+    await symlink('/Users', join(sshRoot, 'to-root-child'))
     await writeFile(join(sshRoot, 'readable', 'readable-marker.txt'), 'readable\n')
     await chmod(join(sshRoot, 'readable', 'no-perm'), 0o000)
 }
@@ -450,19 +451,31 @@ try {
             const d3 = Date.now() + 5000
             while (downloads.length < 2 && Date.now() < d3) await new Promise(r => setTimeout(r, 30))
 
-            // 3. Keyboard Enter on focused filter input
+            // 3. Keyboard Enter on focused filter input -> downloads file, clears filter, keeps panel focus
             filterInput.focus()
             document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
             const d4 = Date.now() + 5000
             while (downloads.length < 3 && Date.now() < d4) await new Promise(r => setTimeout(r, 30))
+            panel.cdr.detectChanges()
+            const filterTextAfterEnterDownload = panel.filterText
+            const showFilterAfterEnterDownload = panel.showFilter
+            const focusedAfterEnterDownload = document.activeElement === panelEl || panelEl.contains(document.activeElement)
 
-            // 4. Real contextmenu event on filtered row 0 -> invoke Delete item and verify actual target deleted
+            // 4. Re-filter and trigger real contextmenu event on filtered row 0 -> invoke Delete item and verify actual target deleted
+            panelEl.focus()
+            panelEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', bubbles: true, cancelable: true }))
+            panel.cdr.detectChanges()
+            const refilterInput = panelEl.querySelector('[data-testid="filter-input"]')
+            refilterInput.value = 'z-tar'
+            refilterInput.dispatchEvent(new Event('input', { bubbles: true }))
+            panel.cdr.detectChanges()
+            const refilteredRow0 = panelEl.querySelector('.list-group-item.file-row[data-index="0"]')
             const origShowMessageBox = panel.platform.showMessageBox
             panel.platform.showMessageBox = async () => ({ response: 0 })
             let remainingAfterDelete = []
             try {
                 capturedMenu = null
-                row0.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+                refilteredRow0.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
                 const d5 = Date.now() + 5000
                 while (!capturedMenu && Date.now() < d5) await new Promise(r => setTimeout(r, 30))
                 const deleteItem = capturedMenu.find(item => item.label === 'Delete')
@@ -477,7 +490,15 @@ try {
             }
 
             panel.clearFilter(true)
-            return { rawIndex, row0Name, downloads, remainingAfterDelete }
+            return {
+                rawIndex,
+                row0Name,
+                downloads,
+                filterTextAfterEnterDownload,
+                showFilterAfterEnterDownload,
+                focusedAfterEnterDownload,
+                remainingAfterDelete,
+            }
         } finally {
             panel.platform.startDownload = origStartDownload
             panel.platform.popupContextMenu = origPopup
@@ -491,6 +512,9 @@ try {
         { remotePath: '/data/filter-actions/z-target.txt', content: 'z-target-content\n' },
         { remotePath: '/data/filter-actions/z-target.txt', content: 'z-target-content\n' },
     ])
+    assert.equal(filteredActions.filterTextAfterEnterDownload, '')
+    assert.equal(filteredActions.showFilterAfterEnterDownload, false)
+    assert.equal(filteredActions.focusedAfterEnterDownload, true)
     assert.equal(filteredActions.remainingAfterDelete.includes('z-target.txt'), false)
     assert.equal(filteredActions.remainingAfterDelete.includes('a-first.txt'), true)
     assert.equal(filteredActions.remainingAfterDelete.includes('m-middle.txt'), true)
@@ -1064,8 +1088,73 @@ try {
         const goUpHiddenAtRoot = !s1PanelEl.querySelector('[data-testid="go-up-item"]')
         const dotDotLeakedInRecent = s1Reopened.panel.recentPaths.some(p => p.split('/').includes('..'))
         await s1Reopened.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        s1Reopened.panel.cdr.detectChanges()
 
-        // 3. Real SFTP channel close -> error + Retry rebuilds channel; second panel reusing same SSHSession does NOT close recovered channel
+        // 2b. Manual jump to /<regular-file>/.. MUST hit server readdir first, report error, keep previous list, and NOT list '/' or record history
+        const recentBeforeFileDotDot = [...s1Reopened.panel.recentPaths]
+        s1PanelEl.querySelector('[data-testid="edit-path-btn"]').click()
+        s1Reopened.panel.cdr.detectChanges()
+        const fileDotDotInput = s1PanelEl.querySelector('[data-testid="path-input"]')
+        const invalidFileDotDotPath = ${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt') + '/..')}
+        fileDotDotInput.value = invalidFileDotDotPath
+        fileDotDotInput.dispatchEvent(new Event('input', { bubbles: true }))
+        fileDotDotInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+        const fileDotDotDeadline = Date.now() + 5000
+        while (!s1PanelEl.querySelector('[data-testid="error-banner"]') && Date.now() < fileDotDotDeadline) {
+            await new Promise(r => setTimeout(r, 30))
+        }
+        s1Reopened.panel.cdr.detectChanges()
+        const manualFileDotDot = {
+            path: s1Reopened.panel.path,
+            keptATxt: (s1Reopened.panel.fileList || []).some(e => e.name === 'a.txt'),
+            errorBannerVisible: Boolean(s1PanelEl.querySelector('[data-testid="error-banner"]')),
+            recentUnchanged: JSON.stringify(s1Reopened.panel.recentPaths) === JSON.stringify(recentBeforeFileDotDot),
+        }
+
+        // 3a. Normal SFTP operational Status(Failure) + Retry MUST NOT close healthy shared channel or break sibling panel
+        const healthyRawSftp = s1Reopened.tab.sshSession.sftp
+        const healthyBackend = s1Reopened.panel.sftp
+        const siblingHealthyBackend = await s1Reopened.tab.sshSession.openSFTP()
+        let healthyCloseCalls = 0
+        const origHealthyClose = healthyRawSftp.close.bind(healthyRawSftp)
+        healthyRawSftp.close = async (...args) => {
+            healthyCloseCalls++
+            return origHealthyClose(...args)
+        }
+        const origHealthyReaddir = healthyBackend.readdir.bind(healthyBackend)
+        let failOnceOperational = true
+        healthyBackend.readdir = async (...args) => {
+            if (failOnceOperational) {
+                failOnceOperational = false
+                throw new Error('Status(Failure)')
+            }
+            return origHealthyReaddir(...args)
+        }
+        let operationalFailureRetry = null
+        try {
+            s1Reopened.panel.fileList = null
+            await s1Reopened.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+            s1Reopened.panel.cdr.detectChanges()
+            const retryShownOnOperational = Boolean(s1Reopened.tabEl.querySelector('[data-testid="retry-button"]'))
+            s1Reopened.tabEl.querySelector('[data-testid="retry-button"]').click()
+            const opRetryDeadline = Date.now() + 5000
+            while ((!Array.isArray(s1Reopened.panel.fileList) || s1Reopened.panel.loadError) && Date.now() < opRetryDeadline) {
+                await new Promise(r => setTimeout(r, 30))
+            }
+            const siblingOkAfterOpRetry = (await siblingHealthyBackend.readdir(${JSON.stringify(join(sshRoot, 'sub-a'))})).some(e => e.name === 'a.txt')
+            operationalFailureRetry = {
+                retryShownOnOperational,
+                healthyCloseCalls,
+                sameChannelKept: s1Reopened.tab.sshSession.sftp === healthyRawSftp && s1Reopened.panel.sftp === healthyBackend,
+                recoveredATxt: s1Reopened.panel.fileList.some(e => e.name === 'a.txt'),
+                siblingOkAfterOpRetry,
+            }
+        } finally {
+            healthyRawSftp.close = origHealthyClose
+            healthyBackend.readdir = origHealthyReaddir
+        }
+
+        // 3b. Real SFTP channel close -> error + Retry rebuilds channel; second panel reusing same SSHSession does NOT close recovered channel
         const oldSftp = s1Reopened.tab.sshSession.sftp
         const oldBackend = s1Reopened.panel.sftp
         const siblingFailedBackend = await s1Reopened.tab.sshSession.openSFTP()
@@ -1134,16 +1223,35 @@ try {
             bannerText: s1NoPermFallback.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent ?? '',
         }
 
-        // Restore sub-a for restart check
-        await s1NoPermFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        // 4b. Symlink whose target has parent '/' (to-root-child -> /Users): fallback from .../to-root-child/../missing resolves to '/' post-readdir
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: ${JSON.stringify(join(sshRoot, 'to-root-child') + '/../missing-for-root-fallback')},
+        })
+        const s1SymlinkRootFallback = await openSftpFor('127.0.0.1')
+        s1SymlinkRootFallback.panel.cdr.detectChanges()
+        const sshSymlinkRootFallback = {
+            path: s1SymlinkRootFallback.panel.path,
+            goUpHidden: !s1SymlinkRootFallback.tabEl.querySelector('[data-testid="go-up-item"]'),
+            recentFirst: s1SymlinkRootFallback.panel.recentPaths[0] ?? null,
+            resolvedDotDotRecorded: s1SymlinkRootFallback.panel.recentPaths.includes(${JSON.stringify(join(sshRoot, 'to-root-child') + '/..')}),
+            bannerText: s1SymlinkRootFallback.tabEl.querySelector('[data-testid="fallback-banner"]')?.textContent ?? '',
+        }
 
-        // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch while panel stays OPEN
+        // Restore sub-a for restart check
+        await s1SymlinkRootFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+
+        // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch with independent Bob backend (delete/upload isolation) + LRU eviction live refresh
         await closeSftpFor('127.0.0.1')
         const origProfileUser = tab1.profile.options.user
         const origAuthUsername = tab1.sshSession.authUsername
         const origSshSession = tab1.sshSession
         let authUserIsolation = null
         let liveReconnectAccountSwitch = null
+        let lruEvictionLiveRefresh = null
+        let bobRawSftp = null
         try {
             tab1.profile.options.user = ''
             tab1.sshSession.authUsername = 'alice'
@@ -1164,7 +1272,7 @@ try {
             bobOpen.tabEl.querySelector('sftp-panel [data-testid="favorite-toggle"]').click()
             await closeSftpFor('127.0.0.1')
 
-            // Open as alice, keep panel OPEN, and swap session + authUsername to a fresh account 'charlie' (and then 'bob')
+            // Open as alice, keep panel OPEN, and build a genuinely INDEPENDENT SFTP backend for bob
             tab1.sshSession.authUsername = 'alice'
             const aliceReopen = await openSftpFor('127.0.0.1')
             authUserIsolation = {
@@ -1176,57 +1284,184 @@ try {
                 aliceRestoredFavorites: [...aliceReopen.panel.favorites],
             }
 
-            // Keep the SAME panel instance open! Simulate reconnect under a different account ('bob') via new session object
             const samePanelBefore = aliceReopen.panel
+            const aliceBackend = samePanelBefore.sftp
+            const SFTPSessionCtor = aliceBackend.constructor
+            bobRawSftp = await origSshSession.ssh.activateSFTP(await origSshSession.ssh.openSessionChannel())
+            const bobBackend = new SFTPSessionCtor(bobRawSftp, tab1.injector)
+            const bobOps = { unlink: 0, rmdir: 0, upload: 0, mkdir: 0 }
+            const origBobUnlink = bobBackend.unlink.bind(bobBackend)
+            const origBobRmdir = bobBackend.rmdir.bind(bobBackend)
+            const origBobUpload = bobBackend.upload.bind(bobBackend)
+            const origBobMkdir = bobBackend.mkdir.bind(bobBackend)
+            bobBackend.unlink = async (...args) => { bobOps.unlink++; return origBobUnlink(...args) }
+            bobBackend.rmdir = async (...args) => { bobOps.rmdir++; return origBobRmdir(...args) }
+            bobBackend.upload = async (...args) => { bobOps.upload++; return origBobUpload(...args) }
+            bobBackend.mkdir = async (...args) => { bobOps.mkdir++; return origBobMkdir(...args) }
+
             let bobSessionOpenCalls = 0
             let failFirstBobOpen = true
             const bobSessionProxy = Object.assign(Object.create(origSshSession), {
                 authUsername: 'bob',
-                openSFTP: async (failed) => {
+                openSFTP: async () => {
                     bobSessionOpenCalls++
                     if (failFirstBobOpen) {
                         failFirstBobOpen = false
                         throw new Error('simulated bob reconnect transient error')
                     }
-                    return origSshSession.openSFTP(failed)
+                    return bobBackend
                 },
             })
-            tab1.sshSession = bobSessionProxy
-            tab1.injector.get(require('@angular/core').ApplicationRef).tick()
-            const bobErrDeadline = Date.now() + 5000
-            while (!samePanelBefore.loadError && Date.now() < bobErrDeadline) {
-                await new Promise(r => setTimeout(r, 25))
-            }
-            samePanelBefore.cdr.detectChanges()
-            const bobRetryTargetPath = samePanelBefore.loadError?.path ?? null
-            const bobFavoritesDuringError = [...samePanelBefore.favorites]
 
-            // Click Retry -> must recover bob's directory (sub-b), never alice's (sub-a)
-            aliceReopen.tabEl.querySelector('[data-testid="retry-button"]').click()
-            const bobRecoverDeadline = Date.now() + 5000
-            while ((!Array.isArray(samePanelBefore.fileList) || samePanelBefore.loadError) && Date.now() < bobRecoverDeadline) {
-                await new Promise(r => setTimeout(r, 25))
+            // 5a. Open Delete confirmation dialog on Alice's open panel, switch live to Bob, then confirm Delete -> Bob receives 0 unlink/rmdir
+            const origShowMessageBox = samePanelBefore.platform.showMessageBox
+            const origPopupMenu = samePanelBefore.platform.popupContextMenu
+            const origStartUpload = samePanelBefore.platform.startUpload
+            let releaseDeleteConfirm = null
+            let aliceMenu = null
+            let deleteClickPromise = null
+            let bobRetryTargetPath = null
+            let bobFavoritesDuringError = []
+            let bobRecoveredPath = null
+            let bobRecoveredFavorites = []
+            let bobLeakedAlicePath = false
+            let uploadTransferCancelled = false
+            try {
+                samePanelBefore.platform.popupContextMenu = items => { aliceMenu = items }
+                samePanelBefore.platform.showMessageBox = () => new Promise(resolve => { releaseDeleteConfirm = resolve })
+                const aliceRowA = aliceReopen.tabEl.querySelector('.list-group-item.file-row[data-name="a.txt"]')
+                aliceRowA.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+                const menuDeadline = Date.now() + 5000
+                while (!aliceMenu && Date.now() < menuDeadline) await new Promise(r => setTimeout(r, 20))
+                deleteClickPromise = aliceMenu.find(item => item.label === 'Delete').click()
+                const confirmDeadline = Date.now() + 5000
+                while (!releaseDeleteConfirm && Date.now() < confirmDeadline) await new Promise(r => setTimeout(r, 20))
+
+                // Keep the SAME panel instance open and switch account to bob while Alice's Delete dialog is pending
+                tab1.sshSession = bobSessionProxy
+                tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                const bobErrDeadline = Date.now() + 5000
+                while (!samePanelBefore.loadError && Date.now() < bobErrDeadline) {
+                    await new Promise(r => setTimeout(r, 25))
+                }
+                samePanelBefore.cdr.detectChanges()
+                bobRetryTargetPath = samePanelBefore.loadError?.path ?? null
+                bobFavoritesDuringError = [...samePanelBefore.favorites]
+
+                // Click Retry -> must recover bob's directory (sub-b) on bobBackend, never alice's (sub-a)
+                aliceReopen.tabEl.querySelector('[data-testid="retry-button"]').click()
+                const bobRecoverDeadline = Date.now() + 5000
+                while ((!Array.isArray(samePanelBefore.fileList) || samePanelBefore.loadError) && Date.now() < bobRecoverDeadline) {
+                    await new Promise(r => setTimeout(r, 25))
+                }
+                samePanelBefore.cdr.detectChanges()
+                bobRecoveredPath = samePanelBefore.path
+                bobRecoveredFavorites = [...samePanelBefore.favorites]
+                bobLeakedAlicePath = samePanelBefore.recentPaths.includes(${JSON.stringify(join(sshRoot, 'sub-a'))})
+
+                // Now confirm the stale Alice Delete dialog -> MUST NOT delete on Bob (0 unlink/rmdir)
+                releaseDeleteConfirm({ response: 0 })
+                await deleteClickPromise
+                await new Promise(r => setTimeout(r, 80))
+
+                // 5b. Switch back to Alice on the SAME open panel, start pending upload(), switch to Bob before picker resolves -> 0 upload/mkdir on Bob
+                tab1.sshSession = origSshSession
+                tab1.sshSession.authUsername = 'alice'
+                tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                const backToAliceDeadline = Date.now() + 5000
+                while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-a'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < backToAliceDeadline) {
+                    await new Promise(r => setTimeout(r, 25))
+                }
+                let releaseUploadPicker = null
+                samePanelBefore.platform.startUpload = () => new Promise(resolve => { releaseUploadPicker = resolve })
+                const pendingAliceUpload = samePanelBefore.upload()
+                const uploadPickerDeadline = Date.now() + 5000
+                while (!releaseUploadPicker && Date.now() < uploadPickerDeadline) await new Promise(r => setTimeout(r, 20))
+
+                // Switch live to Bob while Alice's upload picker is waiting
+                tab1.sshSession = bobSessionProxy
+                tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                const backToBobDeadline = Date.now() + 5000
+                while ((samePanelBefore.path !== ${JSON.stringify(join(sshRoot, 'sub-b'))} || !Array.isArray(samePanelBefore.fileList)) && Date.now() < backToBobDeadline) {
+                    await new Promise(r => setTimeout(r, 25))
+                }
+                const staleUploadTransfer = {
+                    getName: () => 'should-never-hit-bob.txt',
+                    read: async () => Buffer.alloc(0),
+                    cancel () { uploadTransferCancelled = true },
+                    close () {},
+                    setStatus () {},
+                    isCancelled: () => uploadTransferCancelled,
+                }
+                releaseUploadPicker([staleUploadTransfer])
+                await pendingAliceUpload
+                await new Promise(r => setTimeout(r, 80))
+            } finally {
+                samePanelBefore.platform.showMessageBox = origShowMessageBox
+                samePanelBefore.platform.popupContextMenu = origPopupMenu
+                samePanelBefore.platform.startUpload = origStartUpload
             }
-            samePanelBefore.cdr.detectChanges()
-            const bobRecoveredPath = samePanelBefore.path
-            const bobRecoveredFavorites = [...samePanelBefore.favorites]
-            const bobLeakedAlicePath = samePanelBefore.recentPaths.includes(${JSON.stringify(join(sshRoot, 'sub-a'))})
 
             liveReconnectAccountSwitch = {
                 samePanelReused: cpPanelForEl(aliceReopen.tabEl) === samePanelBefore,
+                distinctBobBackend: samePanelBefore.sftp === bobBackend && bobBackend !== aliceBackend,
                 bobSessionOpenCalls,
                 bobRetryTargetPath,
                 bobFavoritesDuringError,
                 bobRecoveredPath,
                 bobRecoveredFavorites,
                 bobLeakedAlicePath,
+                bobOps,
+                uploadTransferCancelled,
+            }
+
+            // 5c. LRU eviction live refresh: Bob's panel is currently OPEN with favorite [sub-b]; write 50 new SSH scopes -> Bob's open panel immediately clears favorites, recent & star
+            samePanelBefore.cdr.detectChanges()
+            const favoritesBeforeEvict = [...samePanelBefore.favorites]
+            const starredBeforeEvict = samePanelBefore.isCurrentPathFavorite
+            const favoritesBarBeforeEvict = Boolean(aliceReopen.tabEl.querySelector('[data-testid="favorites-bar"]'))
+            for (let i = 1; i <= 50; i++) {
+                ipcRenderer.sendSync('coport-file-panel-state:op', {
+                    op: 'recordVisit',
+                    scope: 'ssh:evict-user@evict-host-' + String(i).padStart(2, '0') + ':22',
+                    path: '/tmp',
+                })
+            }
+            const evictDeadline = Date.now() + 5000
+            while ((samePanelBefore.favorites.length > 0 || samePanelBefore.isCurrentPathFavorite) && Date.now() < evictDeadline) {
+                await new Promise(r => setTimeout(r, 25))
+            }
+            samePanelBefore.cdr.detectChanges()
+            lruEvictionLiveRefresh = {
+                favoritesBeforeEvict,
+                starredBeforeEvict,
+                favoritesBarBeforeEvict,
+                favoritesAfterEvict: [...samePanelBefore.favorites],
+                recentAfterEvict: [...samePanelBefore.recentPaths],
+                starredAfterEvict: samePanelBefore.isCurrentPathFavorite,
+                favoritesBarAfterEvict: Boolean(aliceReopen.tabEl.querySelector('[data-testid="favorites-bar"]')),
             }
             await closeSftpFor('127.0.0.1')
         } finally {
             tab1.sshSession = origSshSession
             tab1.profile.options.user = origProfileUser
             tab1.sshSession.authUsername = origAuthUsername
+            if (bobRawSftp) {
+                await bobRawSftp.close().catch(() => null)
+            }
         }
+
+        // Re-seed ssh1 (sub-a + favorite) after the 50-scope LRU eviction test so Phase 2 restart check verifies both ssh1 & ssh2 persistence
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: ${JSON.stringify(join(sshRoot, 'sub-a'))},
+        })
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'addFavorite',
+            scope: tab1.sftpStateScope,
+            path: ${JSON.stringify(join(sshRoot, 'sub-a'))},
+        })
 
         // 6. Second SSH host ('localhost') independent scope
         const s2 = await openSftpFor('localhost')
@@ -1248,19 +1483,23 @@ try {
             convergedToRoot,
             goUpHiddenAtRoot,
             dotDotLeakedInRecent,
+            manualFileDotDot,
+            operationalFailureRetry,
             channelClearedOnClose,
             retryShownAfterClose,
             retryRecovered,
             siblingReusedRecoveredChannel,
             sshMissingFallback,
             sshNoPermFallback,
+            sshSymlinkRootFallback,
             authUserIsolation,
             liveReconnectAccountSwitch,
+            lruEvictionLiveRefresh,
             ssh2InitialPath,
             ssh2InitialFavorites,
             ssh2FinalPath: s2.panel.path,
         }
-    })()`, 25000)
+    })()`, 30000)
     assert.equal(sshIsolationPhase1.ssh1InitialCwdPath, join(sshRoot, 'cwd-dir'))
     assert.deepEqual(sshIsolationPhase1.ssh1InitialFavorites, [])
     assert.equal(sshIsolationPhase1.ssh1StillVisibleAfterClicks, true)
@@ -1273,6 +1512,19 @@ try {
     assert.equal(sshIsolationPhase1.convergedToRoot, true)
     assert.equal(sshIsolationPhase1.goUpHiddenAtRoot, true)
     assert.equal(sshIsolationPhase1.dotDotLeakedInRecent, false)
+    assert.deepEqual(sshIsolationPhase1.manualFileDotDot, {
+        path: join(sshRoot, 'sub-a'),
+        keptATxt: true,
+        errorBannerVisible: true,
+        recentUnchanged: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.operationalFailureRetry, {
+        retryShownOnOperational: true,
+        healthyCloseCalls: 0,
+        sameChannelKept: true,
+        recoveredATxt: true,
+        siblingOkAfterOpRetry: true,
+    })
     assert.equal(sshIsolationPhase1.channelClearedOnClose, true)
     assert.equal(sshIsolationPhase1.retryShownAfterClose, true)
     assert.equal(sshIsolationPhase1.retryRecovered, true)
@@ -1291,6 +1543,14 @@ try {
         sshIsolationPhase1.sshNoPermFallback.bannerText.includes(join(sshRoot, 'readable')),
         sshIsolationPhase1.sshNoPermFallback.bannerText,
     )
+    assert.equal(sshIsolationPhase1.sshSymlinkRootFallback.path, '/')
+    assert.equal(sshIsolationPhase1.sshSymlinkRootFallback.goUpHidden, true)
+    assert.equal(sshIsolationPhase1.sshSymlinkRootFallback.recentFirst, '/')
+    assert.equal(sshIsolationPhase1.sshSymlinkRootFallback.resolvedDotDotRecorded, false)
+    assert.ok(
+        sshIsolationPhase1.sshSymlinkRootFallback.bannerText.includes('missing-for-root-fallback'),
+        sshIsolationPhase1.sshSymlinkRootFallback.bannerText,
+    )
     assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
         aliceScope: `ssh:alice@127.0.0.1:${port}`,
         bobScope: `ssh:bob@127.0.0.1:${port}`,
@@ -1301,12 +1561,24 @@ try {
     })
     assert.deepEqual(sshIsolationPhase1.liveReconnectAccountSwitch, {
         samePanelReused: true,
-        bobSessionOpenCalls: 2,
+        distinctBobBackend: true,
+        bobSessionOpenCalls: 3,
         bobRetryTargetPath: join(sshRoot, 'sub-b'),
         bobFavoritesDuringError: [join(sshRoot, 'sub-b')],
         bobRecoveredPath: join(sshRoot, 'sub-b'),
         bobRecoveredFavorites: [join(sshRoot, 'sub-b')],
         bobLeakedAlicePath: false,
+        bobOps: { unlink: 0, rmdir: 0, upload: 0, mkdir: 0 },
+        uploadTransferCancelled: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.lruEvictionLiveRefresh, {
+        favoritesBeforeEvict: [join(sshRoot, 'sub-b')],
+        starredBeforeEvict: true,
+        favoritesBarBeforeEvict: true,
+        favoritesAfterEvict: [],
+        recentAfterEvict: [],
+        starredAfterEvict: false,
+        favoritesBarAfterEvict: false,
     })
     assert.equal(sshIsolationPhase1.ssh2InitialPath, '/')
     assert.deepEqual(sshIsolationPhase1.ssh2InitialFavorites, [])
