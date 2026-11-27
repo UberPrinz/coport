@@ -36,11 +36,15 @@ if args[0] == 'track-devices':
             body = ''.join(s+'\t'+v+'\n' for s,v in current).encode()
             sys.stdout.buffer.write(('%04x'%len(body)).encode()+body); sys.stdout.buffer.flush(); previous = current
         time.sleep(.03)
-if serial == 'offline':
+if serial == 'offline' or serial in state().get('offline_serials', []):
     print('error: device offline',file=sys.stderr); sys.exit(1)
+def device_root():
+    per_serial = root/'devices'/serial
+    return per_serial if per_serial.is_dir() else root/'device'
 def remote(path):
-    candidate = root/'device'/path.lstrip('/')
-    if not candidate.resolve().is_relative_to((root/'device').resolve()):
+    base = device_root()
+    candidate = base/path.lstrip('/')
+    if not candidate.resolve().is_relative_to(base.resolve()):
         sys.exit('fixture path escaped its synthetic device')
     return candidate
 
@@ -62,11 +66,11 @@ elif args[0] == 'ls':
     # Real adb: a missing or unreadable directory prints nothing and exits 0; an existing one
     # always lists '.' and '..' first (verified on a BusyBox device, 2026-11-18).
     settings = state()
-    remote = args[1]
-    time.sleep(settings.get('list_delays', {}).get(serial, {}).get(remote, 0))
-    directory = root/'device'/remote.lstrip('/')
-    if remote == '/denied' or remote in settings.get('unreadable', {}).get(serial, []) or not directory.is_dir(): sys.exit(0)
-    if remote in settings.get('no_search', {}).get(serial, []):
+    remote_path = args[1]
+    time.sleep(settings.get('list_delays', {}).get(serial, {}).get(remote_path, 0))
+    directory = device_root()/remote_path.lstrip('/')
+    if remote_path == '/denied' or remote_path in settings.get('unreadable', {}).get(serial, []) or not directory.is_dir(): sys.exit(0)
+    if remote_path in settings.get('no_search', {}).get(serial, []):
         for name in ('.', '..', 'unstatable.log'): print('00000000 00000000 00000000 ' + name)
         sys.exit(0)
     print('%08x %08x %08x .' % (0o040755,4096,0)); print('%08x %08x %08x ..' % (0o040755,4096,0))
@@ -74,7 +78,7 @@ elif args[0] == 'ls':
         info = child.lstat()
         print('%08x %08x %08x %s' % (info.st_mode, info.st_size, int(info.st_mtime), child.name))
 elif args[0] == 'pull':
-    source, dest = root/'device'/args[1].lstrip('/'), Path(args[2])
+    source, dest = device_root()/args[1].lstrip('/'), Path(args[2])
     if not source.is_file(): print('No such file',file=sys.stderr); sys.exit(1)
     try:
         with source.open('rb') as inp, dest.open('wb') as out:

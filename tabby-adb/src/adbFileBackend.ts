@@ -8,11 +8,23 @@ interface Entry extends Omit<SFTPFile, 'modified'> {
     modified: number
 }
 
+export interface AdbRequestError extends Error {
+    reason?: string
+    stderr?: string
+}
+
 export async function adbRequest<T> (action: string, args?: object): Promise<T> {
     const reply = await ipcRenderer.invoke(`coport-adb:${action}`, args)
     if (!reply.ok) {
-        const { message, stderr } = reply.error
-        throw new Error(stderr ? `${message}: ${stderr.trim()}` : message)
+        const { message, stderr, reason } = reply.error
+        const error: AdbRequestError = new Error(stderr ? `${message}: ${stderr.trim()}` : message)
+        if (typeof reason === 'string') {
+            error.reason = reason
+        }
+        if (typeof stderr === 'string') {
+            error.stderr = stderr
+        }
+        throw error
     }
     return reply.result
 }
@@ -20,6 +32,9 @@ export async function adbRequest<T> (action: string, args?: object): Promise<T> 
 export class AdbFileBackend implements FileBackend {
     readonly atomicDownloads = true
     readonly normalizePath = (value: string): string => posix.normalize(value)
+    readonly isDirectoryUnavailable = (error: unknown): boolean =>
+        typeof error === 'object' && error !== null && (error as { reason?: unknown }).reason === 'unreadable_directory'
+
     private uploads = Promise.resolve()
 
     constructor (private serial: string) {}

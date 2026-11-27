@@ -1,16 +1,36 @@
 :host {
     display: flex;
     flex-direction: column;
+    outline: none;
 
     > .header {
-        padding: 5px 15px 0 20px;
+        padding: 5px 15px 5px 20px;
         display: flex;
         align-items: center;
         flex: none;
+        gap: 2px;
+    }
+
+    > .favorites-bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 20px 6px;
+        flex: none;
+        overflow-x: auto;
+        white-space: nowrap;
+        border-bottom: 1px solid rgba(255, 255, 255, .08);
     }
 
     > .filter-bar {
         flex: none;
+    }
+
+    > .status-banner {
+        flex: none;
+        border-radius: 0;
+        padding: 6px 20px;
+        font-size: 12px;
     }
 
     > .body {
@@ -23,6 +43,15 @@
         background: none;
         padding: 0;
         margin: 0;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+
+    .breadcrumb-spacer {
+        min-width: 24px;
+        min-height: 24px;
+        cursor: text;
     }
 
     .breadcrumb-item {
@@ -33,9 +62,147 @@
         font-weight: bold;
     }
 
+    .favorite-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 12px;
+        cursor: pointer;
+        background: rgba(255, 255, 255, .07);
+        border: 1px solid rgba(255, 255, 255, .1);
+        flex-shrink: 0;
+
+        &:hover {
+            background: rgba(255, 255, 255, .13);
+        }
+
+        &.active {
+            background: rgba(var(--bs-primary-rgb, 13, 110, 253), .25);
+            border-color: rgba(var(--bs-primary-rgb, 13, 110, 253), .55);
+        }
+    }
+
+    .favorite-chip-label {
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .favorite-chip-remove {
+        border: none;
+        background: transparent;
+        color: inherit;
+        opacity: .6;
+        padding: 0 0 0 6px;
+        line-height: 1;
+        cursor: pointer;
+
+        &:hover {
+            opacity: 1;
+        }
+    }
+
+    .places-menu {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        z-index: 30;
+        min-width: 280px;
+        max-width: 440px;
+        max-height: 360px;
+        overflow-y: auto;
+        margin-top: 4px;
+        padding: 6px 0;
+        border-radius: 6px;
+        background: var(--bs-dark, #1e222a);
+        border: 1px solid rgba(255, 255, 255, .15);
+    }
+
+    .places-section-title {
+        padding: 4px 12px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+        opacity: .6;
+    }
+
+    .places-empty {
+        padding: 4px 12px 6px;
+        font-size: 12px;
+        opacity: .5;
+    }
+
+    .places-item {
+        display: flex;
+        align-items: center;
+        padding: 5px 12px;
+        font-size: 12px;
+        cursor: pointer;
+
+        &:hover {
+            background: rgba(255, 255, 255, .08);
+        }
+
+        &.active {
+            background: rgba(var(--bs-primary-rgb, 13, 110, 253), .22);
+        }
+    }
+
+    .places-path {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: monospace;
+    }
+
+    .places-remove {
+        opacity: .65;
+        color: inherit;
+
+        &:hover {
+            opacity: 1;
+        }
+    }
+
+    .places-divider {
+        height: 1px;
+        margin: 6px 0;
+        background: rgba(255, 255, 255, .1);
+    }
+
+    .filter-count {
+        font-family: monospace;
+        font-size: 12px;
+    }
+
+    .file-name {
+        margin-left: 6px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    mark.filter-match {
+        padding: 0;
+        border-radius: 2px;
+        background: rgba(255, 193, 7, .35);
+        color: inherit;
+        font-weight: 600;
+    }
+
     .list-group-item-action {
         &:hover {
             background: rgba(white, .05);
+        }
+
+        &.selected {
+            background: rgba(var(--bs-primary-rgb, 13, 110, 253), .24);
+            outline: 1px solid rgba(var(--bs-primary-rgb, 13, 110, 253), .55);
+            outline-offset: -1px;
         }
     }
 

@@ -5,6 +5,7 @@ import { Injector } from '@angular/core'
 import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
 import type { FileBackend } from '../api/fileBackend'
+import { isSFTPDirectoryUnavailableError } from '../utils/filePanelFallback'
 
 export interface SFTPFile {
     name: string
@@ -54,6 +55,10 @@ export class SFTPSession implements FileBackend {
             this.closed.next()
             this.closed.complete()
         })
+    }
+
+    isDirectoryUnavailable (error: unknown): boolean {
+        return isSFTPDirectoryUnavailableError(error)
     }
 
     async readdir (p: string): Promise<SFTPFile[]> {

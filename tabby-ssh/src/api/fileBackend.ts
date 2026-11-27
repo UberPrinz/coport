@@ -4,6 +4,7 @@ import type { SFTPFile } from '../session/sftp'
 export interface FileBackend {
     atomicDownloads?: boolean
     normalizePath?: (path: string) => string
+    isDirectoryUnavailable?: (error: unknown) => boolean
     readdir: (path: string) => Promise<SFTPFile[]>
     stat: (path: string) => Promise<SFTPFile>
     readlink: (path: string) => Promise<string>

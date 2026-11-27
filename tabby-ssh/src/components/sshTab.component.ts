@@ -11,6 +11,7 @@ import { SSHPortForwardingModalComponent } from './sshPortForwardingModal.compon
 import { SSHProfile } from '../api'
 import { SSHShellSession } from '../session/shell'
 import { SSHMultiplexerService } from '../services/sshMultiplexer.service'
+import { createSSHFilePanelScope } from '../utils/filePanelState'
 
 /** @hidden */
 @Component({
@@ -27,9 +28,17 @@ export class SSHTabComponent extends ConnectableTerminalTabComponent<SSHProfile>
     sshSession: SSHSession|null = null
     session: SSHShellSession|null = null
     sftpPanelVisible = false
-    sftpPath = '/'
+    sftpPath: string | null = null
     enableToolbar = true
     activeKIPrompt: KeyboardInteractivePrompt|null = null
+
+    get sftpStateScope (): string {
+        return createSSHFilePanelScope(
+            this.profile.options.user,
+            this.profile.options.host,
+            this.profile.options.port,
+        )
+    }
 
     constructor (
         injector: Injector,
@@ -240,7 +249,8 @@ export class SSHTabComponent extends ConnectableTerminalTabComponent<SSHProfile>
     }
 
     async openSFTP (): Promise<void> {
-        this.sftpPath = await this.session?.getWorkingDirectory() ?? this.sftpPath
+        const detectedCwd = await this.session?.getWorkingDirectory()
+        this.sftpPath = detectedCwd ?? null
         setTimeout(() => {
             this.sftpPanelVisible = true
         }, 100)

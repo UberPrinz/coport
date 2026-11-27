@@ -70,3 +70,4 @@ export { FileBackend } from './api/fileBackend'
 export { SFTPFile, SFTPSession } from './session/sftp'
 export { SFTPPanelComponent, SSHTabComponent }
 export { PasswordStorageService } from './services/passwordStorage.service'
+export { ADB_FILE_PANEL_SCOPE, FILE_PANEL_STATE_STORAGE_KEY, FilePanelStateStore, createSSHFilePanelScope, normalizeFilePanelPath } from './utils/filePanelState'
