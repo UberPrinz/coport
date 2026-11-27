@@ -102,6 +102,8 @@ export class AdbFileBackend implements FileBackend {
                 }
                 if (!data.length) {
                     await adbRequest('fs:finish', { id })
+                    const optionalTransfer = transfer as { setCompleted?: (completed: boolean) => void }
+                    optionalTransfer.setCompleted?.(true)
                     transfer.close()
                     return
                 }

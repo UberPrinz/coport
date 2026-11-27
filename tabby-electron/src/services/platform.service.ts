@@ -469,7 +469,7 @@ class ElectronFileUpload extends FileUpload {
             }
             this.file = handle
         } catch (error) {
-            this.close()
+            this.cancel()
             throw error
         }
     }
@@ -492,7 +492,7 @@ class ElectronFileUpload extends FileUpload {
         }
         const result = await this.file.read(this.buffer, 0, this.buffer.length, null)
         this.increaseProgress(result.bytesRead)
-        if (this.getCompletedBytes() >= this.getSize()) {
+        if (this.getSize() > 0 && this.getCompletedBytes() >= this.getSize()) {
             this.setCompleted(true)
         }
         return this.buffer.slice(0, result.bytesRead)
@@ -503,6 +503,9 @@ class ElectronFileUpload extends FileUpload {
             return
         }
         this.closed = true
+        if (!this.isCancelled() && this.getCompletedBytes() >= this.getSize()) {
+            this.setCompleted(true)
+        }
         this.electron.powerSaveBlocker.stop(this.powerSaveBlocker)
         const handle = this.file
         this.file = undefined
@@ -613,22 +616,73 @@ class ElectronFileDownload extends FileDownload {
         return this.closing ??= this.file?.close() ?? Promise.resolve()
     }
 
+    private isCommitAborted (): boolean {
+        return this.closed || this.isCancelled() || !this.temporary || Boolean(this.canCommit && !this.canCommit())
+    }
+
     async completeDownload (): Promise<void> {
         if (this.temporary) {
+            const tempPath = this.temporary.path
             await this.closeHandle()
-            if (this.isCancelled() || (this.canCommit && !this.canCommit())) {
+            if (this.isCommitAborted()) {
                 this.cancel()
                 await this.waitForClose()
                 throw new Error('Download cancelled')
             }
-            const targetMode = (this.mode & 0o777) ? (this.mode & 0o777 & ~process.umask()) : (0o666 & ~process.umask())
-            await fs.chmod(this.temporary.path, targetMode)
-            if (this.isCancelled() || (this.canCommit && !this.canCommit())) {
+            const umask = process.umask()
+            const requestedMode = (this.mode & 0o777) ? (this.mode & 0o777 & ~umask) : (0o666 & ~umask)
+            let targetMode = requestedMode
+            try {
+                const existingStat = await fs.stat(this.filePath)
+                const existingMode = existingStat.mode & 0o7777
+                targetMode = (existingMode & 0o7000) | (existingMode & requestedMode)
+            } catch (error) {
+                const isNotFound = typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT'
+                if (!isNotFound) {
+                    this.close()
+                    await this.waitForClose()
+                    throw error
+                }
+            }
+            if (this.isCommitAborted()) {
                 this.cancel()
                 await this.waitForClose()
                 throw new Error('Download cancelled')
             }
-            await fs.rename(this.temporary.path, this.filePath)
+            try {
+                await fs.chmod(tempPath, targetMode)
+            } catch (error) {
+                if (this.isCommitAborted()) {
+                    this.cancel()
+                    await this.waitForClose()
+                    throw new Error('Download cancelled')
+                }
+                this.close()
+                await this.waitForClose()
+                throw error
+            }
+            if (this.isCommitAborted()) {
+                this.cancel()
+                await this.waitForClose()
+                throw new Error('Download cancelled')
+            }
+            this.setCommitting(true)
+            try {
+                await fs.rename(tempPath, this.filePath)
+            } catch (error) {
+                const cancelRequested = this.consumeCancelRequestedDuringCommit()
+                this.setCommitting(false)
+                if (cancelRequested) {
+                    this.cancel()
+                } else {
+                    this.close()
+                }
+                await this.waitForClose()
+                throw error
+            }
+            await super.completeDownload()
+            await this.waitForClose()
+            return
         } else if (this.isCancelled() || (this.canCommit && !this.canCommit())) {
             this.cancel()
             await this.waitForClose()

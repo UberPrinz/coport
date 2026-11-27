@@ -6,6 +6,7 @@ import { FileDownload, FileUpload, Logger, LogService } from 'tabby-core'
 import * as russh from 'russh'
 import type { FileBackend } from '../api/fileBackend'
 import {
+    inspectPosixEntryViaParentReaddir,
     isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
     resolvePosixPathWithReadlink,
@@ -76,7 +77,7 @@ export class SFTPSession implements FileBackend {
         return resolvePosixPathWithReadlink(
             rawPath,
             target => this.sftp.readlink(target),
-            target => this.stat(target),
+            target => inspectPosixEntryViaParentReaddir(target, dir => this.readdir(dir)),
         )
     }
 
@@ -150,6 +151,11 @@ export class SFTPSession implements FileBackend {
         const tempPath = path + '.tabby-upload'
         let handle: SFTPFileHandle | null = null
         let tempCreated = false
+        const optionalTransfer = transfer as {
+            setPendingCommit?: (pending: boolean) => void
+            setCompleted?: (completed: boolean) => void
+        }
+        optionalTransfer.setPendingCommit?.(true)
         try {
             if (transfer.isCancelled()) {
                 throw new Error('Upload cancelled')
@@ -167,6 +173,7 @@ export class SFTPSession implements FileBackend {
                     await this.unlink(path).catch(() => null)
                     await this.rename(tempPath, path)
                     tempCreated = false
+                    optionalTransfer.setCompleted?.(true)
                     transfer.close()
                     return
                 }
@@ -181,6 +188,8 @@ export class SFTPSession implements FileBackend {
                 this.unlink(tempPath).catch(() => null)
             }
             throw e
+        } finally {
+            optionalTransfer.setPendingCommit?.(false)
         }
     }
 

@@ -171,15 +171,48 @@ function isGenericSFTPFailureError (error: unknown): boolean {
     return GENERIC_SFTP_FAILURE_ERROR_PATTERN.test(extractErrorMessage(error).trim())
 }
 
-export interface PosixPathStatLike {
+export interface PosixPathEntryType {
     isDirectory: boolean
-    isSymlink?: boolean
+    isSymlink: boolean
+}
+
+export interface PosixReaddirEntryLike {
+    name: string
+    isDirectory: boolean
+    isSymlink: boolean
+}
+
+export async function inspectPosixEntryViaParentReaddir (
+    targetPath: string,
+    readdir: (dirPath: string) => Promise<PosixReaddirEntryLike[]>,
+): Promise<PosixPathEntryType | null> {
+    if (!targetPath || targetPath === '/') {
+        return { isDirectory: true, isSymlink: false }
+    }
+    const trimmed = targetPath.length > 1 && targetPath.endsWith('/')
+        ? targetPath.replace(/\/+$/, '') || '/'
+        : targetPath
+    if (trimmed === '/') {
+        return { isDirectory: true, isSymlink: false }
+    }
+    const lastSlash = trimmed.lastIndexOf('/')
+    const parentDir = lastSlash <= 0 ? '/' : trimmed.slice(0, lastSlash)
+    const baseName = lastSlash < 0 ? trimmed : trimmed.slice(lastSlash + 1)
+    const entries = await readdir(parentDir)
+    const match = entries.find(entry => entry.name === baseName)
+    if (!match) {
+        return null
+    }
+    return {
+        isDirectory: match.isDirectory,
+        isSymlink: match.isSymlink,
+    }
 }
 
 export async function resolvePosixPathWithReadlink (
     rawPath: string,
     readlink: (targetPath: string) => Promise<string>,
-    stat?: (targetPath: string) => Promise<PosixPathStatLike>,
+    inspectEntry?: (targetPath: string) => Promise<PosixPathEntryType | null>,
     maxSymlinks = 40,
 ): Promise<string> {
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
@@ -218,20 +251,26 @@ export async function resolvePosixPathWithReadlink (
             ) {
                 throw error
             }
-            if (isExplicitNotSymlinkError(error)) {
-                if (stat) {
-                    const info = await stat(candidate)
-                    if (!info.isDirectory || info.isSymlink) {
+            if (isExplicitNotSymlinkError(error) || isGenericSFTPFailureError(error)) {
+                if (!inspectEntry) {
+                    if (isExplicitNotSymlinkError(error)) {
+                        linkTarget = null
+                    } else {
+                        throw error
+                    }
+                } else {
+                    const info = await inspectEntry(candidate)
+                    if (!info) {
+                        throw Object.assign(new Error(`No such file: ${candidate}`), { code: 'ENOENT' })
+                    }
+                    if (info.isSymlink) {
+                        linkTarget = await readlink(candidate)
+                    } else if (info.isDirectory) {
+                        linkTarget = null
+                    } else {
                         throw error
                     }
                 }
-                linkTarget = null
-            } else if (isGenericSFTPFailureError(error) && stat) {
-                const info = await stat(candidate)
-                if (!info.isDirectory || info.isSymlink) {
-                    throw error
-                }
-                linkTarget = null
             } else {
                 throw error
             }
@@ -440,6 +479,130 @@ export async function finalizeCanonicalDirectoryListing<T> (
     return { cancelled: false, path: canonicalPath, entries: freshEntries }
 }
 
+export async function resolveCanonicalReadableDirectory<T> (
+    startPath: string,
+    readdir: (dirPath: string) => Promise<T[]>,
+    isUnavailable: (error: unknown) => boolean,
+    resolvePath: ((dirPath: string) => Promise<string>) | undefined,
+    normalizePath: (rawPath: string) => string,
+    isStale?: () => boolean,
+    preserveDotDot = false,
+): Promise<DirectoryFallbackSuccess<T> | DirectoryFallbackFailure | DirectoryFallbackCancelled> {
+    const requestedPath = normalizePath(startPath)
+    let attemptPath = requestedPath
+    let initialFallbackReason: string | undefined = undefined
+    const visitedStarts = new Set<string>()
+
+    while (true) {
+        visitedStarts.add(attemptPath)
+        const result = await resolveReadableDirectory(
+            attemptPath,
+            readdir,
+            isUnavailable,
+            isStale,
+            preserveDotDot,
+        )
+
+        if (result.cancelled || isStale?.()) {
+            return {
+                ok: false,
+                cancelled: true,
+                path: result.path,
+                requestedPath,
+            }
+        }
+
+        if (!result.ok) {
+            return {
+                ok: false,
+                cancelled: false,
+                path: result.path,
+                requestedPath,
+                error: result.error,
+                errorMessage: result.errorMessage,
+                isUnavailable: result.isUnavailable,
+            }
+        }
+
+        if (initialFallbackReason === undefined && result.fallbackReason) {
+            initialFallbackReason = result.fallbackReason
+        }
+
+        let errorTargetPath = result.path
+        try {
+            const finalized = await finalizeCanonicalDirectoryListing(
+                result.path,
+                result.entries,
+                resolvePath,
+                readdir,
+                normalizePath,
+                () => Boolean(isStale?.()),
+                preserveDotDot,
+                resolved => {
+                    errorTargetPath = resolved
+                },
+            )
+            if (finalized.cancelled || isStale?.()) {
+                return {
+                    ok: false,
+                    cancelled: true,
+                    path: finalized.path,
+                    requestedPath,
+                }
+            }
+            const fellBack = Boolean(result.fellBackFrom) || attemptPath !== requestedPath
+            if (fellBack) {
+                return {
+                    ok: true,
+                    cancelled: false,
+                    path: finalized.path,
+                    entries: finalized.entries,
+                    requestedPath,
+                    fellBackFrom: requestedPath,
+                    fallbackReason: initialFallbackReason ?? result.fallbackReason ?? 'Directory is unavailable',
+                }
+            }
+            return {
+                ok: true,
+                cancelled: false,
+                path: finalized.path,
+                entries: finalized.entries,
+                requestedPath,
+            }
+        } catch (error) {
+            if (isStale?.()) {
+                return {
+                    ok: false,
+                    cancelled: true,
+                    path: errorTargetPath,
+                    requestedPath,
+                }
+            }
+            const errorMessage = extractErrorMessage(error)
+            if (initialFallbackReason === undefined) {
+                initialFallbackReason = errorMessage
+            }
+            const unavailable = isUnavailable(error)
+            if (unavailable) {
+                const nextParent = getParentDirectoryPath(result.path, preserveDotDot)
+                if (nextParent !== null && !visitedStarts.has(nextParent)) {
+                    attemptPath = nextParent
+                    continue
+                }
+            }
+            return {
+                ok: false,
+                cancelled: false,
+                path: errorTargetPath,
+                requestedPath,
+                error,
+                errorMessage,
+                isUnavailable: unavailable,
+            }
+        }
+    }
+}
+
 export interface CancellableFileUploadLike {
     isCancelled?: () => boolean
     isComplete?: () => boolean
@@ -459,9 +622,6 @@ function isDirectoryUploadTree<T extends CancellableFileUploadLike> (
 
 export function isFileUploadAlreadyComplete<T extends CancellableFileUploadLike> (transfer: T): boolean {
     if (typeof transfer.isComplete !== 'function') {
-        return false
-    }
-    if (typeof transfer.getSize === 'function' && transfer.getSize() === 0) {
         return false
     }
     return transfer.isComplete()

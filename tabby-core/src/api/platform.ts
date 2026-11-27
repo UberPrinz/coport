@@ -50,11 +50,47 @@ export abstract class FileTransfer {
         this.pendingCommit = pending
     }
 
+    protected isPendingCommit (): boolean {
+        return this.pendingCommit
+    }
+
+    protected isCompleted (): boolean {
+        return this.completed
+    }
+
     isCancelled (): boolean {
         return this.cancelled
     }
 
+    // coport: Once an irreversible commit (such as atomic rename) starts,
+    // cancel() cannot roll it back; pending cancel intent is replayed only if commit fails.
+    protected setCommitting (committing: boolean): void {
+        this.committing = committing
+        if (committing) {
+            this.cancelRequestedDuringCommit = false
+        }
+    }
+
+    protected consumeCancelRequestedDuringCommit (): boolean {
+        const requested = this.cancelRequestedDuringCommit
+        this.cancelRequestedDuringCommit = false
+        return requested
+    }
+
+    protected markCommitted (): void {
+        this.committed = true
+        this.committing = false
+        this.cancelRequestedDuringCommit = false
+    }
+
     cancel (): void {
+        if (this.committed) {
+            return
+        }
+        if (this.committing) {
+            this.cancelRequestedDuringCommit = true
+            return
+        }
         this.cancelled = true
         this.close()
     }
@@ -86,6 +122,9 @@ export abstract class FileTransfer {
     private lastChunkSpeed = 0
     private cancelled = false
     private pendingCommit = false
+    private committing = false
+    private committed = false
+    private cancelRequestedDuringCommit = false
     private completed = false
     private status = ''
 }
@@ -94,6 +133,7 @@ export abstract class FileDownload extends FileTransfer {
     abstract write (buffer: Uint8Array): Promise<void>
 
     async completeDownload (): Promise<void> {
+        this.markCommitted()
         this.setPendingCommit(false)
         this.setCompleted(true)
         this.close()
@@ -110,6 +150,18 @@ export abstract class FileUpload extends FileTransfer {
 
     abstract read (): Promise<Uint8Array>
 
+    // coport: Queued 0-byte uploads must not appear complete before upload finishes and commits.
+    isComplete (): boolean {
+        if (this.isCancelled() || this.isPendingCommit()) {
+            return false
+        }
+        if (this.isCompleted()) {
+            return true
+        }
+        const size = this.getSize()
+        return size > 0 && this.getCompletedBytes() >= size
+    }
+
     async readAll (): Promise<Uint8Array> {
         const result = new Uint8Array(this.getSize())
         let pos = 0
@@ -121,6 +173,8 @@ export abstract class FileUpload extends FileTransfer {
             result.set(buf, pos)
             pos += buf.length
         }
+        this.setCompleted(true)
+        this.close()
         return result
     }
 }
@@ -360,6 +414,9 @@ export class HTMLFileUpload extends FileUpload {
             return
         }
         this.closed = true
+        if (!this.isCancelled() && this.getCompletedBytes() >= this.getSize()) {
+            this.setCompleted(true)
+        }
         void this.reader.cancel().catch(() => null)
     }
 }

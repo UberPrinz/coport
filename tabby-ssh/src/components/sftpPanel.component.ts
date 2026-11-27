@@ -43,10 +43,9 @@ import {
     cancelPendingFileUpload,
     extractErrorMessage,
     finalizeCanonicalDirectoryListing,
-    getParentDirectoryPath,
     isSFTPChannelClosedError,
     isTransientConnectionError,
-    resolveReadableDirectory,
+    resolveCanonicalReadableDirectory,
     shouldSkipQueuedFileUpload,
 } from '../utils/filePanelFallback'
 
@@ -497,100 +496,46 @@ export class SFTPPanelComponent implements OnInit, AfterViewInit, OnChanges, OnD
         this.errorNotice = null
         this.fallbackNotice = null
 
-        let attemptPath = normalizedTarget
-        let initialFallbackReason: string | undefined = undefined
-        const visitedStarts = new Set<string>()
+        const result = await resolveCanonicalReadableDirectory(
+            normalizedTarget,
+            dirPath => backend.readdir(dirPath),
+            error => this.isDirectoryUnavailableError(error, backend),
+            backend.resolvePath ? dirPath => backend.resolvePath!(dirPath) : undefined,
+            rawPath => this.normalizePathValue(rawPath),
+            () => this.isNavigationStale(request, epoch, backend),
+            this.shouldPreserveDotDot,
+        )
 
-        while (visitedStarts.size < 16) {
-            visitedStarts.add(attemptPath)
-            const result = await resolveReadableDirectory(
-                attemptPath,
-                dirPath => backend.readdir(dirPath),
-                error => this.isDirectoryUnavailableError(error, backend),
-                () => this.isNavigationStale(request, epoch, backend),
-                this.shouldPreserveDotDot,
-            )
-
-            if (result.cancelled || this.isNavigationStale(request, epoch, backend)) {
-                return
-            }
-
-            if (result.ok) {
-                if (initialFallbackReason === undefined && result.fallbackReason) {
-                    initialFallbackReason = result.fallbackReason
-                }
-                let errorTargetPath = result.path
-                try {
-                    const finalized = await finalizeCanonicalDirectoryListing(
-                        result.path,
-                        result.entries,
-                        backend.resolvePath ? dirPath => backend.resolvePath!(dirPath) : undefined,
-                        dirPath => backend.readdir(dirPath),
-                        rawPath => this.normalizePathValue(rawPath),
-                        () => this.isNavigationStale(request, epoch, backend),
-                        this.shouldPreserveDotDot,
-                        resolved => {
-                            errorTargetPath = resolved
-                        },
-                    )
-                    if (finalized.cancelled || this.isNavigationStale(request, epoch, backend)) {
-                        return
-                    }
-                    this.setCurrentPath(finalized.path, true)
-                    this.applyLoadedEntries(finalized.entries)
-                    this.loadError = null
-                    const fellBack = Boolean(result.fellBackFrom) || attemptPath !== normalizedTarget
-                    if (fellBack) {
-                        this.fallbackNotice = {
-                            requestedPath: normalizedTarget,
-                            resolvedPath: finalized.path,
-                            reason: initialFallbackReason ?? result.fallbackReason ?? 'Directory is unavailable',
-                        }
-                    }
-                    this.recordCurrentDirectory(finalized.path)
-                    this.focusPanelIfOwned()
-                    return
-                } catch (error) {
-                    if (this.isNavigationStale(request, epoch, backend)) {
-                        return
-                    }
-                    const errorMessage = extractErrorMessage(error)
-                    if (initialFallbackReason === undefined) {
-                        initialFallbackReason = errorMessage
-                    }
-                    if (this.isDirectoryUnavailableError(error, backend)) {
-                        const nextParent = getParentDirectoryPath(errorTargetPath, this.shouldPreserveDotDot)
-                        if (nextParent !== null && !visitedStarts.has(nextParent)) {
-                            attemptPath = nextParent
-                            continue
-                        }
-                    }
-                    if (isSFTPChannelClosedError(error) && this.backend === backend) {
-                        this.detachBackend(true)
-                    }
-                    this.setCurrentPath(errorTargetPath, false)
-                    this.resetFileLists()
-                    this.loadError = {
-                        path: errorTargetPath,
-                        message: errorMessage,
-                    }
-                    this.notifications.error(errorMessage)
-                    return
-                }
-            }
-
-            if (isSFTPChannelClosedError(result.error) && this.backend === backend) {
-                this.detachBackend(true)
-            }
-            this.setCurrentPath(result.path, false)
-            this.resetFileLists()
-            this.loadError = {
-                path: result.path,
-                message: result.errorMessage,
-            }
-            this.notifications.error(result.errorMessage)
+        if (result.cancelled || this.isNavigationStale(request, epoch, backend)) {
             return
         }
+
+        if (result.ok) {
+            this.setCurrentPath(result.path, true)
+            this.applyLoadedEntries(result.entries)
+            this.loadError = null
+            if (result.fellBackFrom) {
+                this.fallbackNotice = {
+                    requestedPath: normalizedTarget,
+                    resolvedPath: result.path,
+                    reason: result.fallbackReason ?? 'Directory is unavailable',
+                }
+            }
+            this.recordCurrentDirectory(result.path)
+            this.focusPanelIfOwned()
+            return
+        }
+
+        if (isSFTPChannelClosedError(result.error) && this.backend === backend) {
+            this.detachBackend(true)
+        }
+        this.setCurrentPath(result.path, false)
+        this.resetFileLists()
+        this.loadError = {
+            path: result.path,
+            message: result.errorMessage,
+        }
+        this.notifications.error(result.errorMessage)
     }
 
     async navigate (newPath: string, _fallbackOnError = false): Promise<void> {

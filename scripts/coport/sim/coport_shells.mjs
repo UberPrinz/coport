@@ -1506,6 +1506,151 @@ try {
         }
         setRetargetLink(retargetParentAChild)
 
+        // 4e-readlink-failure-symlink (Round-6 P2 #3): readlink('/retarget-link') returns Failure while on-disk /retarget-link is a symlink to another dir.
+        // stat() follows symlink and would report isDirectory: true, whereas parent readdir reports isSymlink: true.
+        // Persistent Failure MUST NOT fold '..' to sshRoot; one-shot Failure retries readlink and resolves to retarget-parent-a.
+        await s1RemovedFallback.panel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        const recentBeforeFailureSymlink = [...s1RemovedFallback.panel.recentPaths]
+        const failSymBackend = s1RemovedFallback.panel.sftp
+        const origFailSymReadlink = failSymBackend.rawSftp.readlink.bind(failSymBackend.rawSftp)
+        failSymBackend.rawSftp.readlink = async target => {
+            if (target === retargetLinkPath) {
+                throw new Error('Status(Failure)')
+            }
+            return origFailSymReadlink(target)
+        }
+        try {
+            await s1RemovedFallback.panel.navigate(retargetLinkPath + '/..')
+        } finally {
+            failSymBackend.rawSftp.readlink = origFailSymReadlink
+        }
+        s1RemovedFallback.panel.cdr.detectChanges()
+        const persistentFailureSymlink = {
+            path: s1RemovedFallback.panel.path,
+            foldedToSshRoot: s1RemovedFallback.panel.path === ${JSON.stringify(sshRoot)},
+            keptATxt: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'a.txt')),
+            errorBannerVisible: Boolean(s1RemovedFallback.tabEl.querySelector('[data-testid="error-banner"]')),
+            recentUnchanged: JSON.stringify(s1RemovedFallback.panel.recentPaths) === JSON.stringify(recentBeforeFailureSymlink),
+        }
+        let oneShotReadlinkCalls = 0
+        failSymBackend.rawSftp.readlink = async target => {
+            if (target === retargetLinkPath) {
+                oneShotReadlinkCalls++
+                if (oneShotReadlinkCalls === 1) {
+                    throw new Error('Status(Failure)')
+                }
+            }
+            return origFailSymReadlink(target)
+        }
+        try {
+            await s1RemovedFallback.panel.navigate(retargetLinkPath + '/..')
+        } finally {
+            failSymBackend.rawSftp.readlink = origFailSymReadlink
+        }
+        s1RemovedFallback.panel.cdr.detectChanges()
+        const oneShotFailureSymlink = {
+            readlinkCalls: oneShotReadlinkCalls,
+            path: s1RemovedFallback.panel.path,
+            foldedToSshRoot: s1RemovedFallback.panel.path === ${JSON.stringify(sshRoot)},
+            hasOnlyInA: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'only-in-parent-a.txt')),
+        }
+
+        // 4e-deep-fallback (Round-6 P2 #4): > 16 levels deep with canonicalization EACCES at every level never stalls at Loading.
+        const deepSuffixParts = []
+        for (let i = 1; i <= 18; i++) {
+            deepSuffixParts.push('deep-' + i, '..')
+        }
+        const deepFallbackPath = ${JSON.stringify(sshRoot)} + '/' + deepSuffixParts.join('/')
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: deepFallbackPath,
+        })
+        const origOpenForDeepFallback = tab1.sshSession.openSFTP.bind(tab1.sshSession)
+        let deepResolveCalls = 0
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForDeepFallback(...args)
+            const origReaddir = backend.readdir.bind(backend)
+            const origResolve = backend.resolvePath.bind(backend)
+            backend.readdir = async dirPath => {
+                if (dirPath.includes('/deep-') && dirPath.includes('..')) {
+                    return [{ name: 'stub.txt', fullPath: dirPath + '/stub.txt', isDirectory: false, isSymlink: false, mode: 0o644, size: 1, modified: new Date() }]
+                }
+                return origReaddir(dirPath)
+            }
+            backend.resolvePath = async dirPath => {
+                if (dirPath.includes('/deep-') && dirPath.includes('..')) {
+                    deepResolveCalls++
+                    throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+                }
+                return origResolve(dirPath)
+            }
+            return backend
+        }
+        let s1DeepRecovered
+        try {
+            s1DeepRecovered = await openSftpFor('127.0.0.1')
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForDeepFallback
+        }
+        s1DeepRecovered.panel.cdr.detectChanges()
+        const deepFallbackRecovered = {
+            resolveCallsOver16: deepResolveCalls > 16,
+            path: s1DeepRecovered.panel.path,
+            hasSubA: Boolean(s1DeepRecovered.panel.fileList?.some(e => e.name === 'sub-a')),
+            loadErrorIsNull: s1DeepRecovered.panel.loadError === null,
+            bannerVisible: Boolean(s1DeepRecovered.tabEl.querySelector('[data-testid="fallback-banner"]')),
+        }
+
+        // 4e-deep-fallback-all-denied (Round-6 P2 #4): when even ancestors & '/' throw EACCES, panel ends in loadError + Retry, never stuck Loading.
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: deepFallbackPath,
+        })
+        let deepAllDeniedResolveCalls = 0
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForDeepFallback(...args)
+            backend.readdir = async dirPath => {
+                if (dirPath.includes('/deep-') && dirPath.includes('..')) {
+                    return [{ name: 'stub.txt', fullPath: dirPath + '/stub.txt', isDirectory: false, isSymlink: false, mode: 0o644, size: 1, modified: new Date() }]
+                }
+                throw Object.assign(new Error('Permission denied on ancestor'), { code: 'EACCES' })
+            }
+            backend.resolvePath = async () => {
+                deepAllDeniedResolveCalls++
+                throw Object.assign(new Error('Permission denied during resolve'), { code: 'EACCES' })
+            }
+            return backend
+        }
+        let deepFallbackAllDenied
+        try {
+            tab1.openSFTP()
+            tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+            const tabEl = cpSshTabEl('127.0.0.1')
+            const deepErrDeadline = Date.now() + 8000
+            let panel = null
+            while (Date.now() < deepErrDeadline) {
+                panel = cpPanelForEl(tabEl)
+                if (panel && (panel.loadError || Array.isArray(panel.fileList))) {
+                    break
+                }
+                await new Promise(r => setTimeout(r, 25))
+            }
+            panel?.cdr.detectChanges()
+            deepFallbackAllDenied = {
+                resolveCallsOver16: deepAllDeniedResolveCalls > 16,
+                fileListIsNull: panel?.fileList === null,
+                hasLoadError: Boolean(panel?.loadError),
+                loadErrorPath: panel?.loadError?.path ?? null,
+                retryVisible: Boolean(tabEl.querySelector('[data-testid="retry-button"]')),
+            }
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForDeepFallback
+        }
+
         // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch with independent Bob backend (delete/upload isolation) + LRU eviction live refresh
         await closeSftpFor('127.0.0.1')
         const origProfileUser = tab1.profile.options.user
@@ -1597,8 +1742,11 @@ try {
             let midDirCancelCounts = null
             let delayedOpenDownloadResult = null
             let cancelledSshAtomicDownloadResult = null
+            let atomicDownloadPermResult = null
+            let atomicDownloadCancelRenameResult = null
             let scanFailureCleanupResult = null
             let cancelQueuedUploadResult = null
+            let zeroByteQueuedUploadResult = null
             let closedPanelDropResult = null
             let samePanelForLru = samePanelBefore
             try {
@@ -1827,6 +1975,151 @@ try {
                     tempFilesAfterCommit: tempFilesAfterCommit.length,
                 }
 
+                // 5b-download-perms (Round-6 P2 #1): Overwriting existing 0600 file with remote 0644 preserves 0600; new files apply mode & ~umask.
+                const existing0600Dest = ${JSON.stringify(join(run, 'ssh-perm-existing-0600.txt'))}
+                const new0644Dest = ${JSON.stringify(join(run, 'ssh-perm-new-0644.txt'))}
+                const new0755Dest = ${JSON.stringify(join(run, 'ssh-perm-new-0755.txt'))}
+                fsMod.writeFileSync(existing0600Dest, 'SECRET-OLD')
+                fsMod.chmodSync(existing0600Dest, 0o600)
+                try { fsMod.unlinkSync(new0644Dest) } catch {}
+                try { fsMod.unlinkSync(new0755Dest) } catch {}
+                const currentUmask = process.umask()
+                try {
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: existing0600Dest }),
+                    }
+                    await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: new0644Dest }),
+                    }
+                    await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    samePanelBefore.platform.electron.dialog = {
+                        showSaveDialog: async () => ({ canceled: false, filePath: new0755Dest }),
+                    }
+                    await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o755, 6)
+                } finally {
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                atomicDownloadPermResult = {
+                    existingContentUpdated: fsMod.readFileSync(existing0600Dest, 'utf8') === 'sub-a\\n',
+                    existingModePreserved0600: (fsMod.statSync(existing0600Dest).mode & 0o7777) === 0o600,
+                    new0644ModeMatchesUmask: (fsMod.statSync(new0644Dest).mode & 0o7777) === (0o644 & ~currentUmask),
+                    new0755ModeMatchesUmask: (fsMod.statSync(new0755Dest).mode & 0o7777) === (0o755 & ~currentUmask),
+                }
+
+                // 5b-download-cancel-rename (Round-6 P2 #2): Cancel before fs.rename preserves target + isCancelled=true; cancel during fs.rename leaves isCancelled=false & isComplete=true when rename succeeds, and cleans up + reflects failure when rename rejects.
+                const origFsPromisesChmod = fsPromisesMod.chmod
+                const origFsPromisesRename = fsPromisesMod.rename
+                const preRenameDest = ${JSON.stringify(join(run, 'ssh-cancel-pre-rename.txt'))}
+                const duringRenameOkDest = ${JSON.stringify(join(run, 'ssh-cancel-during-rename-ok.txt'))}
+                const duringRenameFailDest = ${JSON.stringify(join(run, 'ssh-cancel-during-rename-fail.txt'))}
+                fsMod.writeFileSync(preRenameDest, 'KEEP-BEFORE-RENAME')
+                fsMod.writeFileSync(duringRenameOkDest, 'OLD-BEFORE-RENAME-OK')
+                fsMod.writeFileSync(duringRenameFailDest, 'KEEP-ON-RENAME-FAIL')
+
+                // Case A: Cancel during fs.chmod (before fs.rename starts)
+                let releaseChmodPause = null
+                let preRenameTransfer = null
+                fsPromisesMod.chmod = function (targetPath, ...rest) {
+                    if (!releaseChmodPause && typeof targetPath === 'string' && targetPath.includes('.coport-download-')) {
+                        const chmodPromise = origFsPromisesChmod.call(fsPromisesMod, targetPath, ...rest)
+                        return new Promise((resolve, reject) => {
+                            releaseChmodPause = () => chmodPromise.then(resolve, reject)
+                        })
+                    }
+                    return origFsPromisesChmod.call(fsPromisesMod, targetPath, ...rest)
+                }
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: preRenameDest }),
+                }
+                try {
+                    const beforeCount = appRootComp.activeTransfers.length
+                    const dlPromise = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    const dlDeadline = Date.now() + 5000
+                    while (!releaseChmodPause && Date.now() < dlDeadline) await new Promise(r => setTimeout(r, 20))
+                    preRenameTransfer = appRootComp.activeTransfers[beforeCount]
+                    preRenameTransfer.cancel()
+                    releaseChmodPause()
+                    await dlPromise
+                } finally {
+                    fsPromisesMod.chmod = origFsPromisesChmod
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempLeftAfterPreRename = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-')).length
+
+                // Case B: Cancel DURING async fs.rename that succeeds -> transfer finishes complete & NOT cancelled
+                let releaseRenameOk = null
+                let duringRenameOkTransfer = null
+                fsPromisesMod.rename = function (src, dst) {
+                    if (!releaseRenameOk && dst === duringRenameOkDest) {
+                        return new Promise((resolve, reject) => {
+                            releaseRenameOk = () => origFsPromisesRename.call(fsPromisesMod, src, dst).then(resolve, reject)
+                        })
+                    }
+                    return origFsPromisesRename.call(fsPromisesMod, src, dst)
+                }
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: duringRenameOkDest }),
+                }
+                try {
+                    const beforeCount = appRootComp.activeTransfers.length
+                    const dlPromise = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    const dlDeadline = Date.now() + 5000
+                    while (!releaseRenameOk && Date.now() < dlDeadline) await new Promise(r => setTimeout(r, 20))
+                    duringRenameOkTransfer = appRootComp.activeTransfers[beforeCount]
+                    duringRenameOkTransfer.cancel()
+                    releaseRenameOk()
+                    await dlPromise
+                } finally {
+                    fsPromisesMod.rename = origFsPromisesRename
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempLeftAfterRenameOk = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-')).length
+
+                // Case C: Cancel DURING async fs.rename that fails -> temp cleaned up, target intact, isCancelled=true, isComplete=false
+                let releaseRenameFail = null
+                let duringRenameFailTransfer = null
+                fsPromisesMod.rename = function (src, dst) {
+                    if (!releaseRenameFail && dst === duringRenameFailDest) {
+                        return new Promise((_resolve, reject) => {
+                            releaseRenameFail = () => reject(Object.assign(new Error('EACCES: simulated rename failure'), { code: 'EACCES' }))
+                        })
+                    }
+                    return origFsPromisesRename.call(fsPromisesMod, src, dst)
+                }
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: duringRenameFailDest }),
+                }
+                try {
+                    const beforeCount = appRootComp.activeTransfers.length
+                    const dlPromise = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    const dlDeadline = Date.now() + 5000
+                    while (!releaseRenameFail && Date.now() < dlDeadline) await new Promise(r => setTimeout(r, 20))
+                    duringRenameFailTransfer = appRootComp.activeTransfers[beforeCount]
+                    duringRenameFailTransfer.cancel()
+                    releaseRenameFail()
+                    await dlPromise
+                } finally {
+                    fsPromisesMod.rename = origFsPromisesRename
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempLeftAfterRenameFail = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-')).length
+
+                atomicDownloadCancelRenameResult = {
+                    preRenameTargetIntact: fsMod.readFileSync(preRenameDest, 'utf8') === 'KEEP-BEFORE-RENAME',
+                    preRenameCancelled: Boolean(preRenameTransfer?.isCancelled()),
+                    preRenameComplete: Boolean(preRenameTransfer?.isComplete()),
+                    preRenameTempFilesLeft: tempLeftAfterPreRename,
+                    duringRenameOkTargetUpdated: fsMod.readFileSync(duringRenameOkDest, 'utf8') === 'sub-a\\n',
+                    duringRenameOkCancelled: Boolean(duringRenameOkTransfer?.isCancelled()),
+                    duringRenameOkComplete: Boolean(duringRenameOkTransfer?.isComplete()),
+                    duringRenameOkTempFilesLeft: tempLeftAfterRenameOk,
+                    duringRenameFailTargetIntact: fsMod.readFileSync(duringRenameFailDest, 'utf8') === 'KEEP-ON-RENAME-FAIL',
+                    duringRenameFailCancelled: Boolean(duringRenameFailTransfer?.isCancelled()),
+                    duringRenameFailComplete: Boolean(duringRenameFailTransfer?.isComplete()),
+                    duringRenameFailTempFilesLeft: tempLeftAfterRenameFail,
+                }
+
                 // 5b-mid-dir-upload (P2): Multi-file + nested DirectoryUpload paused during first file while switching Alice -> Bob cancels every remaining unsubmitted FileUpload exactly once & 0 writes to Bob
                 await switchLiveToAlice()
                 const activeAliceBackend = samePanelBefore.sftp
@@ -1906,6 +2199,76 @@ try {
                     }
                 } finally {
                     batchAliceBackend.upload = origBatchUpload
+                }
+
+                // 5b-zero-byte-queued-upload (Round-6 P2 #5): Real ElectronFileUpload & HTMLFileUpload 0-byte queued files show isComplete() === false until close(); removing via TransfersMenuComponent actually triggers cancel() and skips backend upload, while uncancelled 0-byte file completes with isComplete() === true.
+                const { HTMLFileUpload } = require('tabby-core')
+                const htmlEmptyKeep = new HTMLFileUpload(new File([], 'html-empty-keep.txt'))
+                const htmlEmptyCancel = new HTMLFileUpload(new File([], 'html-empty-cancel.txt'))
+                const htmlEmptyBeforeCloseComplete = htmlEmptyKeep.isComplete()
+                htmlEmptyKeep.close()
+                const htmlEmptyAfterCloseComplete = htmlEmptyKeep.isComplete()
+                htmlEmptyCancel.cancel()
+                const htmlEmptyCancelState = {
+                    cancelled: htmlEmptyCancel.isCancelled(),
+                    complete: htmlEmptyCancel.isComplete(),
+                }
+
+                const zeroByteDir = ${JSON.stringify(join(run, 'zero-byte-queue-dir'))}
+                fsMod.mkdirSync(zeroByteDir, { recursive: true })
+                fsMod.writeFileSync(zeroByteDir + '/01-first.txt', 'first-payload')
+                fsMod.writeFileSync(zeroByteDir + '/02-cancel-empty.txt', '')
+                fsMod.writeFileSync(zeroByteDir + '/03-keep-empty.txt', '')
+                const realZeroTree = await samePanelBefore.platform.startUploadDirectory([zeroByteDir])
+                const realZeroRootDir = realZeroTree.getChildrens()[0]
+                const realZeroFiles = realZeroRootDir.getChildrens()
+                const realCancelEmpty = realZeroFiles.find(f => f.getName() === '02-cancel-empty.txt')
+                const realKeepEmpty = realZeroFiles.find(f => f.getName() === '03-keep-empty.txt')
+                const zeroCancelCompleteBeforeUpload = realCancelEmpty.isComplete()
+                const zeroKeepCompleteBeforeUpload = realKeepEmpty.isComplete()
+
+                const realZeroUploadedNames = []
+                let releaseRealZeroFirst = null
+                const origRealZeroUpload = batchAliceBackend.upload.bind(batchAliceBackend)
+                batchAliceBackend.upload = async (targetPath, transfer) => {
+                    realZeroUploadedNames.push(targetPath.split('/').pop())
+                    if (transfer.getName() === '01-first.txt') {
+                        await new Promise(resolve => { releaseRealZeroFirst = resolve })
+                    }
+                    return origRealZeroUpload(targetPath, transfer)
+                }
+                try {
+                    const realZeroPromise = samePanelBefore.uploadOneFolder(realZeroTree)
+                    const zDeadline = Date.now() + 5000
+                    while (!releaseRealZeroFirst && Date.now() < zDeadline) await new Promise(r => setTimeout(r, 20))
+                    // Remove the queued 0-byte file via the real TransfersMenuComponent -> MUST trigger cancel() because isComplete() is false
+                    tab1.injector.get(require('@angular/core').ApplicationRef).tick()
+                    const transfersMenuComp = cpComponent('transfers-menu')
+                    transfersMenuComp.removeTransfer(realCancelEmpty)
+                    const cancelledViaMenu = realCancelEmpty.isCancelled()
+                    releaseRealZeroFirst()
+                    await realZeroPromise
+                    const remoteZeroDir = ${JSON.stringify(join(sshRoot, 'sub-a', 'zero-byte-queue-dir'))}
+                    const remoteCancelEmptyExists = fsMod.existsSync(remoteZeroDir + '/02-cancel-empty.txt')
+                    const remoteKeepEmptyExists = fsMod.existsSync(remoteZeroDir + '/03-keep-empty.txt')
+                    try { fsMod.rmSync(remoteZeroDir, { recursive: true, force: true }) } catch {}
+                    zeroByteQueuedUploadResult = {
+                        htmlEmptyBeforeCloseComplete,
+                        htmlEmptyAfterCloseComplete,
+                        htmlEmptyCancelState,
+                        zeroCancelCompleteBeforeUpload,
+                        zeroKeepCompleteBeforeUpload,
+                        cancelledViaMenu,
+                        uploadedNames: realZeroUploadedNames,
+                        cancelEmptyCancelled: realCancelEmpty.isCancelled(),
+                        cancelEmptyComplete: realCancelEmpty.isComplete(),
+                        keepEmptyCancelled: realKeepEmpty.isCancelled(),
+                        keepEmptyComplete: realKeepEmpty.isComplete(),
+                        remoteCancelEmptyExists,
+                        remoteKeepEmptyExists,
+                    }
+                } finally {
+                    batchAliceBackend.upload = origRealZeroUpload
                 }
 
                 // 5b-scan-failure-cleanup (Round-5 P2 #4): Directory scan where 1st file opens and 2nd file fails automatically cancels/closes 1st file handle & stops all powerSaveBlockers with 0 residual transfers
@@ -2046,8 +2409,11 @@ try {
                     midDirCancelCounts,
                     delayedOpenDownloadResult,
                     cancelledSshAtomicDownloadResult,
+                    atomicDownloadPermResult,
+                    atomicDownloadCancelRenameResult,
                     scanFailureCleanupResult,
                     cancelQueuedUploadResult,
+                    zeroByteQueuedUploadResult,
                     closedPanelDropResult,
                 }
                 // Re-open panel for Bob so 5c LRU eviction live refresh test runs on the open Bob panel as before
@@ -2145,6 +2511,10 @@ try {
             readlinkTimeoutManual,
             symlinkRemovedManual,
             symlinkRemovedFallback,
+            persistentFailureSymlink,
+            oneShotFailureSymlink,
+            deepFallbackRecovered,
+            deepFallbackAllDenied,
             authUserIsolation,
             liveReconnectAccountSwitch,
             lruEvictionLiveRefresh,
@@ -2246,6 +2616,33 @@ try {
         hasLiveSubA: true,
         bannerVisible: true,
     })
+    assert.deepEqual(sshIsolationPhase1.persistentFailureSymlink, {
+        path: join(sshRoot, 'sub-a'),
+        foldedToSshRoot: false,
+        keptATxt: true,
+        errorBannerVisible: true,
+        recentUnchanged: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.oneShotFailureSymlink, {
+        readlinkCalls: 2,
+        path: join(sshRoot, 'retarget-parent-a'),
+        foldedToSshRoot: false,
+        hasOnlyInA: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.deepFallbackRecovered, {
+        resolveCallsOver16: true,
+        path: sshRoot,
+        hasSubA: true,
+        loadErrorIsNull: true,
+        bannerVisible: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.deepFallbackAllDenied, {
+        resolveCallsOver16: true,
+        fileListIsNull: true,
+        hasLoadError: true,
+        loadErrorPath: '/',
+        retryVisible: true,
+    })
     assert.equal(await readFile(keepDownloadFile, 'utf8'), 'MUST-NOT-BE-TRUNCATED\n')
     assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
         aliceScope: `ssh:alice@127.0.0.1:${port}`,
@@ -2281,6 +2678,26 @@ try {
             committedContent: 'sub-a\n',
             tempFilesAfterCommit: 0,
         },
+        atomicDownloadPermResult: {
+            existingContentUpdated: true,
+            existingModePreserved0600: true,
+            new0644ModeMatchesUmask: true,
+            new0755ModeMatchesUmask: true,
+        },
+        atomicDownloadCancelRenameResult: {
+            preRenameTargetIntact: true,
+            preRenameCancelled: true,
+            preRenameComplete: false,
+            preRenameTempFilesLeft: 0,
+            duringRenameOkTargetUpdated: true,
+            duringRenameOkCancelled: false,
+            duringRenameOkComplete: true,
+            duringRenameOkTempFilesLeft: 0,
+            duringRenameFailTargetIntact: true,
+            duringRenameFailCancelled: true,
+            duringRenameFailComplete: false,
+            duringRenameFailTempFilesLeft: 0,
+        },
         scanFailureCleanupResult: {
             threwExpected: true,
             firstHandleCloseCalls: 1,
@@ -2292,6 +2709,24 @@ try {
             b2CancelCalls: 1,
             b3Cancelled: false,
             b4Cancelled: false,
+        },
+        zeroByteQueuedUploadResult: {
+            htmlEmptyBeforeCloseComplete: false,
+            htmlEmptyAfterCloseComplete: true,
+            htmlEmptyCancelState: {
+                cancelled: true,
+                complete: false,
+            },
+            zeroCancelCompleteBeforeUpload: false,
+            zeroKeepCompleteBeforeUpload: false,
+            cancelledViaMenu: true,
+            uploadedNames: ['01-first.txt', '03-keep-empty.txt'],
+            cancelEmptyCancelled: true,
+            cancelEmptyComplete: false,
+            keepEmptyCancelled: false,
+            keepEmptyComplete: true,
+            remoteCancelEmptyExists: false,
+            remoteKeepEmptyExists: true,
         },
         closedPanelDropResult: {
             scannedCount: 2,

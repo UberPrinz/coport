@@ -34,10 +34,12 @@ import {
     SFTPChannelPool,
     cancelPendingDirectoryUpload,
     finalizeCanonicalDirectoryListing,
+    inspectPosixEntryViaParentReaddir,
     isAdbDirectoryUnavailableError,
     isSFTPChannelClosedError,
     isSFTPDirectoryUnavailableError,
     isTransientConnectionError,
+    resolveCanonicalReadableDirectory,
     resolvePosixPathWithReadlink,
     resolveReadableDirectory,
     shouldSkipQueuedFileUpload,
@@ -809,7 +811,7 @@ describe('filePanelFallback', () => {
             /timed out/i,
         )
 
-        // Generic Failure without stat confirmation OR when stat rejects/returns non-dir throws
+        // Generic Failure without inspectEntry confirmation OR when entry is non-dir/missing throws
         await assert.rejects(
             () => resolvePosixPathWithReadlink('/real/..', async () => {
                 throw new Error('Status(Failure)')
@@ -825,11 +827,70 @@ describe('filePanelFallback', () => {
         await assert.rejects(
             () => resolvePosixPathWithReadlink('/vanished/..', async () => {
                 throw new Error('Status(Failure)')
-            }, async () => {
-                throw new Error('No such file')
-            }),
+            }, async () => null),
             /No such file/,
         )
+
+        // Round-6 P2 #3: readlink('/dir') returns Failure after /dir was replaced by a symlink to another dir.
+        // Parent readdir reports isSymlink: true (unlike symlink-following stat which would say isDirectory: true).
+        // Case A: persistent Failure on retry -> rejects and NEVER folds '..' to '/'.
+        let rootReaddirCalls = 0
+        const parentReaddirWithSymlink = async (dirPath: string) => {
+            if (dirPath === '/') {
+                rootReaddirCalls++
+                return [
+                    { name: 'dir', isDirectory: false, isSymlink: true },
+                    { name: 'plain', isDirectory: true, isSymlink: false },
+                ]
+            }
+            return []
+        }
+        assert.deepEqual(
+            await inspectPosixEntryViaParentReaddir('/', parentReaddirWithSymlink),
+            { isDirectory: true, isSymlink: false },
+        )
+        assert.equal(rootReaddirCalls, 0)
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink(
+                '/dir/..',
+                async () => {
+                    throw new Error('Status(Failure)')
+                },
+                target => inspectPosixEntryViaParentReaddir(target, parentReaddirWithSymlink),
+            ),
+            /Failure/,
+        )
+        assert.equal(rootReaddirCalls, 1)
+
+        // Case B: one-shot Failure followed by /dir becoming symlink -> '/other/child' retries readlink and resolves to '/other' (never '/').
+        let dirReadlinkAttempts = 0
+        const retriedCanonical = await resolvePosixPathWithReadlink(
+            '/dir/..',
+            async target => {
+                if (target === '/dir') {
+                    dirReadlinkAttempts++
+                    if (dirReadlinkAttempts === 1) {
+                        throw new Error('Status(Failure)')
+                    }
+                    return '/other/child'
+                }
+                throw new Error('Status(Failure)')
+            },
+            target => inspectPosixEntryViaParentReaddir(target, async dirPath => {
+                if (dirPath === '/') {
+                    return [
+                        { name: 'dir', isDirectory: false, isSymlink: true },
+                        { name: 'other', isDirectory: true, isSymlink: false },
+                    ]
+                }
+                if (dirPath === '/other') {
+                    return [{ name: 'child', isDirectory: true, isSymlink: false }]
+                }
+                return []
+            }),
+        )
+        assert.equal(dirReadlinkAttempts, 2)
+        assert.equal(retriedCanonical, '/other')
 
         // Post-readdir fallback flow: /link/../missing -> server rejects missing, reads /link/.. -> post-resolve converges to '/'
         const readdirAttempted: string[] = []
@@ -1040,35 +1101,95 @@ describe('filePanelFallback', () => {
         )
     })
 
+    it('falls back past 16 levels of canonicalization permission errors without stalling', async () => {
+        const deepSegments: string[] = []
+        for (let i = 1; i <= 20; i++) {
+            deepSegments.push(`d${i}`, '..')
+        }
+        const deepPath = `/${deepSegments.join('/')}`
+
+        // Case A: 20 levels deep with '..' at every level, canonicalization hits EACCES at every level, /d1 is readable
+        let resolveAttempts = 0
+        const recovered = await resolveCanonicalReadableDirectory(
+            deepPath,
+            async dirPath => [{ name: `entry-of-${dirPath}` }],
+            isSFTPDirectoryUnavailableError,
+            async () => {
+                resolveAttempts++
+                throw Object.assign(new Error('Permission denied'), { code: 'EACCES' })
+            },
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+        )
+        assert.equal(recovered.ok, true)
+        assert.equal(resolveAttempts, 39)
+        if (recovered.ok) {
+            assert.equal(recovered.path, '/d1')
+            assert.equal(recovered.fellBackFrom, deepPath)
+        }
+
+        // Case B: even /d1 and / fail with EACCES -> exits with explicit failure (never hangs/silent exit)
+        const failed = await resolveCanonicalReadableDirectory(
+            deepPath,
+            async dirPath => {
+                if (!dirPath.includes('..')) {
+                    throw Object.assign(new Error('Permission denied at ancestor'), { code: 'EACCES' })
+                }
+                return [{ name: 'stale' }]
+            },
+            isSFTPDirectoryUnavailableError,
+            async () => {
+                throw Object.assign(new Error('Permission denied during resolve'), { code: 'EACCES' })
+            },
+            raw => normalizeFilePanelPath(raw, true),
+            () => false,
+            true,
+        )
+        assert.equal(failed.ok, false)
+        assert.equal(failed.cancelled, false)
+        if (!failed.ok && !failed.cancelled) {
+            assert.equal(failed.path, '/')
+            assert.match(failed.errorMessage, /Permission denied/)
+        }
+    })
+
     it('recursively cancels every remaining pending FileUpload in nested directories at most once', () => {
         interface MockUpload {
             name: string
             size: number
             cancelled: boolean
             completed: boolean
+            closed: boolean
             cancelCalls: number
             isCancelled: () => boolean
             isComplete: () => boolean
             getSize: () => number
+            close: () => void
             cancel: () => void
         }
         interface MockDir {
             children: (MockUpload | MockDir)[]
             getChildrens: () => (MockUpload | MockDir)[]
         }
-        const makeFile = (name: string, size: number, opts?: { cancelled?: boolean, completed?: boolean }): MockUpload => {
+        const makeFile = (name: string, size: number, opts?: { cancelled?: boolean, completed?: boolean, closed?: boolean }): MockUpload => {
             const file: MockUpload = {
                 name,
                 size,
                 cancelled: opts?.cancelled ?? false,
                 completed: opts?.completed ?? false,
+                closed: opts?.closed ?? Boolean(opts?.completed),
                 cancelCalls: 0,
                 isCancelled: () => file.cancelled,
-                isComplete: () => !file.cancelled && (file.completed || file.size === 0),
+                isComplete: () => file.closed && !file.cancelled && (file.completed || file.size === 0),
                 getSize: () => file.size,
+                close: () => {
+                    file.closed = true
+                },
                 cancel: () => {
                     file.cancelCalls++
                     file.cancelled = true
+                    file.closed = true
                 },
             }
             return file
@@ -1081,15 +1202,20 @@ describe('filePanelFallback', () => {
         const firstHandled = makeFile('first.txt', 100)
         const secondPending = makeFile('second.txt', 50)
         const zeroBytePending = makeFile('empty.txt', 0)
+        const zeroByteCompleted = makeFile('done-empty.txt', 0, { closed: true })
         const alreadyCancelled = makeFile('cancelled.txt', 25, { cancelled: true })
         const alreadyCompleted = makeFile('done.txt', 40, { completed: true })
         const nestedPending = makeFile('nested.txt', 75)
         const deepPending = makeFile('deep.txt', 120)
 
+        assert.equal(zeroBytePending.isComplete(), false)
+        assert.equal(zeroByteCompleted.isComplete(), true)
+
         const tree = makeDir([
             firstHandled,
             secondPending,
             zeroBytePending,
+            zeroByteCompleted,
             alreadyCancelled,
             alreadyCompleted,
             makeDir([
@@ -1105,6 +1231,7 @@ describe('filePanelFallback', () => {
         assert.equal(firstPassCancelled, 4)
         assert.equal(secondPassCancelled, 0)
         assert.equal(firstHandled.cancelCalls, 0)
+        assert.equal(zeroByteCompleted.cancelCalls, 0)
         assert.equal(alreadyCancelled.cancelCalls, 0)
         assert.equal(alreadyCompleted.cancelCalls, 0)
         assert.equal(secondPending.cancelCalls, 1)
@@ -1113,10 +1240,10 @@ describe('filePanelFallback', () => {
         assert.equal(deepPending.cancelCalls, 1)
     })
 
-    it('skips pre-cancelled or already-completed queued files without skipping unuploaded zero-byte files', () => {
-        const makeUpload = (opts: { size: number, cancelled?: boolean, completed?: boolean }) => ({
+    it('skips pre-cancelled or already-completed queued files including zero-byte files only once cancelled or closed', () => {
+        const makeUpload = (opts: { size: number, cancelled?: boolean, completed?: boolean, closed?: boolean }) => ({
             isCancelled: () => Boolean(opts.cancelled),
-            isComplete: () => !opts.cancelled && (Boolean(opts.completed) || opts.size === 0),
+            isComplete: () => Boolean(opts.closed ?? opts.completed) && !opts.cancelled && (Boolean(opts.completed) || opts.size === 0),
             getSize: () => opts.size,
             cancel: () => undefined,
         })
@@ -1126,12 +1253,16 @@ describe('filePanelFallback', () => {
         const completedNonEmpty = makeUpload({ size: 100, completed: true })
         const pendingZeroByte = makeUpload({ size: 0 })
         const cancelledZeroByte = makeUpload({ size: 0, cancelled: true })
+        const completedZeroByte = makeUpload({ size: 0, closed: true })
 
+        assert.equal(pendingZeroByte.isComplete(), false)
+        assert.equal(completedZeroByte.isComplete(), true)
         assert.equal(shouldSkipQueuedFileUpload(pendingNonEmpty), false)
         assert.equal(shouldSkipQueuedFileUpload(cancelledQueued), true)
         assert.equal(shouldSkipQueuedFileUpload(completedNonEmpty), true)
         assert.equal(shouldSkipQueuedFileUpload(pendingZeroByte), false)
         assert.equal(shouldSkipQueuedFileUpload(cancelledZeroByte), true)
+        assert.equal(shouldSkipQueuedFileUpload(completedZeroByte), true)
     })
 })
 
