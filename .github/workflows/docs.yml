@@ -1,5 +1,6 @@
 name: Docs
-on: push
+# coport: Disable automatic upstream Firebase docs deployment in this fork.
+on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
