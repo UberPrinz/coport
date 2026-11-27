@@ -23,12 +23,12 @@
 | `tabby-terminal/src/frontends/frontend.ts`、`tabby-terminal/src/frontends/xtermFrontend.ts` | 仅对共享串口丢弃自动上报，渲染器在 xterm 完成写入后确认输出，按主进程输出顺序应用尺寸 |
 | `tabby-terminal/src/api/connectableTerminalTab.component.ts`、`tabby-ssh/src/components/sshTab.component.ts`、`tabby-ssh/src/components/sshTab.component.pug` | 允许可连接的标签选择不保存恢复令牌，保留 SSH 恢复行为；向文件面板透传按 `authUsername@host:port` 隔离的状态作用域并在无历史时透传检测到的 CWD |
 | `scripts/vars.mjs` | 注册内置 `tabby-adb` 包，沿用上游插件构建、依赖安装和打包入口 |
-| `tabby-core/src/api/profileProvider.ts`、`tabby-core/src/api/platform.ts` | 设备选择取消时返回空标签参数。ADB 分阶段上传在远端提交前保持处理中，并为下载接口增加打开前会话有效性守卫 |
-| `tabby-ssh/src/components/sftpPanel.component.ts`、`tabby-ssh/src/components/sftpPanel.component.pug`、`tabby-ssh/src/components/sftpPanel.component.scss`、`tabby-ssh/src/components/sftpDeleteModal.component.ts`、`tabby-ssh/src/session/ssh.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-ssh/src/sftpContextMenu.ts`、`tabby-ssh/src/api/fileBackend.ts` | 文件面板、目录处理与删除复用 `FileBackend`，保留原 SSH/SFTP 会话和标签入口；监听 SFTP 通道关闭失效缓存并支持重试重建；增强状态保值、逐级回退与重试、收藏/历史、直接敲字模糊过滤与键盘钻取 |
+| `tabby-core/src/api/profileProvider.ts`、`tabby-core/src/api/platform.ts` | 设备选择取消时返回空标签参数。ADB/SSH 分阶段下载在远端提交前保持处理中，为下载接口增加打开前/提交前会话有效性守卫，拖拽扫描推迟注册传输并在中途失败或拒绝接收时取消已创建传输 |
+| `tabby-ssh/src/components/sftpPanel.component.ts`、`tabby-ssh/src/components/sftpPanel.component.pug`、`tabby-ssh/src/components/sftpPanel.component.scss`、`tabby-ssh/src/components/sftpDeleteModal.component.ts`、`tabby-ssh/src/session/ssh.ts`、`tabby-ssh/src/session/sftp.ts`、`tabby-ssh/src/index.ts`、`tabby-ssh/src/sftpContextMenu.ts`、`tabby-ssh/src/api/fileBackend.ts` | 文件面板、目录处理与删除复用 `FileBackend`，保留原 SSH/SFTP 会话和标签入口；监听 SFTP 通道关闭失效缓存并支持重试重建；SSH 下载启用原子落盘与取消守卫，目录上传跳过已提前取消的单个排队文件；增强状态保值、逐级回退与重试、收藏/历史、直接敲字模糊过滤与键盘钻取 |
 | `tabby-ssh/src/utils/filePanelState.ts`、`tabby-ssh/src/utils/filePanelFilter.ts`、`tabby-ssh/src/utils/filePanelFallback.ts`、`tabby-ssh/test/filePanelNavigation.test.ts` | 文件面板状态保值、模糊过滤与逐级回退的零 DOM 纯逻辑模块与 L0 单测 |
 | `tabby-electron/src/sftpContextMenu.ts` | 将依赖 SSH chmod 和断开事件的本地编辑限制在 SFTP 后端 |
-| `tabby-electron/src/services/platform.service.ts` | ADB 下载经同目录暂存后原子替换本地文件；下载打开本地文件或目录前校验可选会话守卫，防止过期下载截断已有文件 |
-| `tabby-core/src/directives/dropZone.directive.ts` | 在 Finder 文件扫描前捕获目标上下文（兼容路径字符串与会话快照），保留既有 transfer 事件 |
+| `tabby-electron/src/services/platform.service.ts` | ADB/SSH 原子下载先写同目录临时文件并在校验会话守卫后原子 `rename` 替换目标（取消/失败仅删临时文件，保留 ADB 关窗清理路径）；目录/多文件上传扫描中途失败时自动取消并关闭已打开文件句柄与 powerSaveBlocker 且不残留全局传输 |
+| `tabby-core/src/directives/dropZone.directive.ts` | 在 Finder 文件扫描前捕获目标上下文（兼容路径字符串与会话快照），实现 `OnDestroy` 并在销毁或无监听者时递归取消扫描完成的拖拽上传且不发射事件，保留既有 transfer 事件 |
 | `scripts/build-macos.mjs` | 创建 DMG 和 ZIP 前强制执行 ad-hoc 签名和校验。停止 Team ID 与 notarization 配置，支持通过 COPORT_BUILD_OUTPUT 和 COPORT_ELECTRON_DIST 指定隔离构建路径与缓存 Electron |
 | `app/lib/coport/*`、`extras/coport-mcp/*`、`scripts/coport/*`、`tabby-adb/*` | fork 新增的串口、MCP、ADB、文件面板状态协调器代码与自动验收 |
 | `docs/coport/*`、`docs/delivery/coport-fork-*`、`docs/delivery/file-panel-navigation.md`、`docs/plans/coport-fork.md`、`docs/specs/coport-fork.md`、`docs/specs/file-panel-navigation.md` | fork 新增的规格、交付证据和进度记录 |

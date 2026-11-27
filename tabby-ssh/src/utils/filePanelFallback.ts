@@ -30,9 +30,11 @@ export interface ManagedSFTPChannel {
     close: () => Promise<unknown>
 }
 
-const TRANSIENT_ERROR_PATTERN = /\b(timeout|timed out|channel closed|disconnected|connection reset|connection refused|econnreset|epipe|broken pipe|not connected|session closed|offline|transport closed)\b/i
+const TRANSIENT_ERROR_PATTERN = /\b(timeout|timed out|etimedout|channel closed|disconnected|connection reset|connection refused|econnreset|epipe|broken pipe|not connected|session closed|offline|transport closed)\b/i
 const UNAVAILABLE_ERROR_PATTERN = /no\s*such\s*file|permission\s*denied|not\s*a\s*directory|enoent|eacces|enotdir|ssh_fx_no_such_file|ssh_fx_permission_denied|status(?:\s+code)?\s*[:=]?\s*[23]\b/i
 const CHANNEL_CLOSED_ERROR_PATTERN = /\b(channel\s+(?:is\s+)?closed|session\s+(?:is\s+)?closed|transport\s+(?:is\s+)?closed|stream\s+(?:is\s+)?closed|sftp\s+(?:channel|session)\s+(?:is\s+)?closed|broken\s+pipe|epipe|econnreset|connection\s+reset|disconnected|not\s+connected|unexpected\s*eof|end\s+of\s+file|eof)\b/i
+const EXPLICIT_NOT_SYMLINK_ERROR_PATTERN = /\b(einval|invalid\s+argument|not\s+a\s+sym(?:bolic\s+)?link)\b/i
+const GENERIC_SFTP_FAILURE_ERROR_PATTERN = /\bstatus_code\s*:\s*(?:failure|badmessage)\b|\bstatus\s*\(\s*(?:failure|bad\s*message)\s*\)|\bssh_fx_(?:failure|bad_message)\b|(?:^|[:(\s])(?:failure|bad\s*message)(?:\)|$)/i
 
 export function hasDotDotSegment (rawPath: string): boolean {
     if (typeof rawPath !== 'string' || !rawPath) {
@@ -143,15 +145,41 @@ export function isSFTPChannelClosedError (error: unknown): boolean {
 }
 
 export function isTransientConnectionError (error: unknown): boolean {
+    if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ETIMEDOUT') {
+        return true
+    }
     if (isSFTPChannelClosedError(error)) {
         return true
     }
     return TRANSIENT_ERROR_PATTERN.test(extractErrorMessage(error))
 }
 
+function isExplicitNotSymlinkError (error: unknown): boolean {
+    if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EINVAL') {
+        return true
+    }
+    return EXPLICIT_NOT_SYMLINK_ERROR_PATTERN.test(extractErrorMessage(error))
+}
+
+function isGenericSFTPFailureError (error: unknown): boolean {
+    if (typeof error === 'object' && error !== null) {
+        const candidate = error as { code?: unknown, status?: unknown, statusCode?: unknown }
+        if ([candidate.code, candidate.status, candidate.statusCode].some(value => value === 4 || value === 5)) {
+            return true
+        }
+    }
+    return GENERIC_SFTP_FAILURE_ERROR_PATTERN.test(extractErrorMessage(error).trim())
+}
+
+export interface PosixPathStatLike {
+    isDirectory: boolean
+    isSymlink?: boolean
+}
+
 export async function resolvePosixPathWithReadlink (
     rawPath: string,
     readlink: (targetPath: string) => Promise<string>,
+    stat?: (targetPath: string) => Promise<PosixPathStatLike>,
     maxSymlinks = 40,
 ): Promise<string> {
     if (typeof rawPath !== 'string' || rawPath.trim() === '') {
@@ -183,13 +211,30 @@ export async function resolvePosixPathWithReadlink (
         try {
             linkTarget = await readlink(candidate)
         } catch (error) {
-            if (isSFTPChannelClosedError(error)) {
+            if (
+                isSFTPChannelClosedError(error) ||
+                isTransientConnectionError(error) ||
+                isSFTPDirectoryUnavailableError(error)
+            ) {
                 throw error
             }
-            if (isSFTPDirectoryUnavailableError(error)) {
-                return rawPath
+            if (isExplicitNotSymlinkError(error)) {
+                if (stat) {
+                    const info = await stat(candidate)
+                    if (!info.isDirectory || info.isSymlink) {
+                        throw error
+                    }
+                }
+                linkTarget = null
+            } else if (isGenericSFTPFailureError(error) && stat) {
+                const info = await stat(candidate)
+                if (!info.isDirectory || info.isSymlink) {
+                    throw error
+                }
+                linkTarget = null
+            } else {
+                throw error
             }
-            linkTarget = null
         }
         if (linkTarget !== null) {
             symlinksFollowed++
@@ -382,10 +427,7 @@ export async function finalizeCanonicalDirectoryListing<T> (
         if (isStale()) {
             return { cancelled: true, path: listedPath, entries: [] }
         }
-        if (isSFTPChannelClosedError(error)) {
-            throw error
-        }
-        canonicalPath = listedPath
+        throw error
     }
     if (canonicalPath === listedPath) {
         return { cancelled: false, path: canonicalPath, entries: initialEntries }
@@ -415,6 +457,23 @@ function isDirectoryUploadTree<T extends CancellableFileUploadLike> (
     return typeof (item as DirectoryUploadTreeLike<T>).getChildrens === 'function'
 }
 
+export function isFileUploadAlreadyComplete<T extends CancellableFileUploadLike> (transfer: T): boolean {
+    if (typeof transfer.isComplete !== 'function') {
+        return false
+    }
+    if (typeof transfer.getSize === 'function' && transfer.getSize() === 0) {
+        return false
+    }
+    return transfer.isComplete()
+}
+
+export function shouldSkipQueuedFileUpload<T extends CancellableFileUploadLike> (transfer: T): boolean {
+    if (typeof transfer.isCancelled === 'function' && transfer.isCancelled()) {
+        return true
+    }
+    return isFileUploadAlreadyComplete(transfer)
+}
+
 export function cancelPendingFileUpload<T extends CancellableFileUploadLike> (
     transfer: T,
     handled?: Set<T>,
@@ -426,11 +485,7 @@ export function cancelPendingFileUpload<T extends CancellableFileUploadLike> (
     if (typeof transfer.isCancelled === 'function' && transfer.isCancelled()) {
         return false
     }
-    if (
-        typeof transfer.isComplete === 'function' &&
-        (typeof transfer.getSize !== 'function' || transfer.getSize() > 0) &&
-        transfer.isComplete()
-    ) {
+    if (isFileUploadAlreadyComplete(transfer)) {
         return false
     }
     transfer.cancel()

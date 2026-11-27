@@ -40,6 +40,7 @@ import {
     isTransientConnectionError,
     resolvePosixPathWithReadlink,
     resolveReadableDirectory,
+    shouldSkipQueuedFileUpload,
 } from '../src/utils/filePanelFallback.ts'
 
 // Enable Node --experimental-strip-types to resolve extensionless relative TS imports inside app/lib/coport/filePanelStateCoordinator.ts.
@@ -726,6 +727,16 @@ describe('filePanelFallback', () => {
             ['/loop-a', '/loop-b'],
             ['/loop-b', '/loop-a'],
         ])
+        const liveDirs = new Set<string>([
+            '/real',
+            '/a',
+            '/a/link-parent',
+            '/a/real-parent',
+            '/a/real-parent/real-child',
+            '/a/b',
+            '/a/c',
+            '/a/c/d',
+        ])
         const readlink = async (target: string): Promise<string> => {
             readlinkCalls++
             if (target === '/missing') {
@@ -737,29 +748,88 @@ describe('filePanelFallback', () => {
             }
             throw new Error('Failure')
         }
+        const statDir = async (target: string) => {
+            if (liveDirs.has(target)) {
+                return { isDirectory: true, isSymlink: false }
+            }
+            throw new Error('No such file')
+        }
 
         // Normal path without '..' triggers zero readlink calls and preserves trailing spaces
-        assert.equal(await resolvePosixPathWithReadlink('/tmp/trail ', readlink), '/tmp/trail ')
+        assert.equal(await resolvePosixPathWithReadlink('/tmp/trail ', readlink, statDir), '/tmp/trail ')
         assert.equal(readlinkCalls, 0)
 
         // Symlink directly under / followed by .. converges cleanly to /
-        assert.equal(await resolvePosixPathWithReadlink('/link/..', readlink), '/')
-        assert.equal(await resolvePosixPathWithReadlink('/link/../..', readlink), '/')
+        assert.equal(await resolvePosixPathWithReadlink('/link/..', readlink, statDir), '/')
+        assert.equal(await resolvePosixPathWithReadlink('/link/../..', readlink, statDir), '/')
 
         // Cross-parent absolute symlink + .. resolves to server's real parent
         assert.equal(
-            await resolvePosixPathWithReadlink('/a/link-parent/to-real-child/..', readlink),
+            await resolvePosixPathWithReadlink('/a/link-parent/to-real-child/..', readlink, statDir),
             '/a/real-parent',
         )
 
         // Relative symlink + .. resolves against symlink's parent directory
-        assert.equal(await resolvePosixPathWithReadlink('/a/b/rel/..', readlink), '/a/c')
+        assert.equal(await resolvePosixPathWithReadlink('/a/b/rel/..', readlink, statDir), '/a/c')
+
+        // Explicit EINVAL / "not a symlink" allows folding without requiring stat
+        assert.equal(
+            await resolvePosixPathWithReadlink('/normal/..', async () => {
+                throw Object.assign(new Error('not a symlink'), { code: 'EINVAL' })
+            }),
+            '/',
+        )
+
+        // OpenSSH macOS sftp-server returns BadMessage for readlink on a regular directory -> verified via stat
+        assert.equal(
+            await resolvePosixPathWithReadlink(
+                '/real/..',
+                async () => {
+                    throw new Error('Status(Status { id: 35, status_code: BadMessage, error_message: "Bad message", language_tag: "" })')
+                },
+                statDir,
+            ),
+            '/',
+        )
 
         // Symlink loop respects depth limit and falls back to original path cleanly
-        assert.equal(await resolvePosixPathWithReadlink('/loop-a/..', readlink), '/loop-a/..')
+        assert.equal(await resolvePosixPathWithReadlink('/loop-a/..', readlink, statDir), '/loop-a/..')
 
-        // Missing intermediate falls back to original path so readdir reports the exact server error
-        assert.equal(await resolvePosixPathWithReadlink('/missing/..', readlink), '/missing/..')
+        // Missing intermediate throws instead of silently returning stale rawPath
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink('/missing/..', readlink, statDir),
+            /No such file/,
+        )
+
+        // Timeout (ETIMEDOUT / timed out) during readlink throws instead of folding to '/'
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink('/link/..', async () => {
+                throw Object.assign(new Error('Request timed out'), { code: 'ETIMEDOUT' })
+            }, statDir),
+            /timed out/i,
+        )
+
+        // Generic Failure without stat confirmation OR when stat rejects/returns non-dir throws
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink('/real/..', async () => {
+                throw new Error('Status(Failure)')
+            }),
+            /Failure/,
+        )
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink('/regular-file/..', async () => {
+                throw new Error('Status(Failure)')
+            }, async () => ({ isDirectory: false, isSymlink: false })),
+            /Failure/,
+        )
+        await assert.rejects(
+            () => resolvePosixPathWithReadlink('/vanished/..', async () => {
+                throw new Error('Status(Failure)')
+            }, async () => {
+                throw new Error('No such file')
+            }),
+            /No such file/,
+        )
 
         // Post-readdir fallback flow: /link/../missing -> server rejects missing, reads /link/.. -> post-resolve converges to '/'
         const readdirAttempted: string[] = []
@@ -779,7 +849,7 @@ describe('filePanelFallback', () => {
         assert.equal(fallbackResult.ok, true)
         assert.deepEqual(readdirAttempted, ['/link/../missing', '/link/..'])
         if (fallbackResult.ok) {
-            const canonical = await resolvePosixPathWithReadlink(fallbackResult.path, readlink)
+            const canonical = await resolvePosixPathWithReadlink(fallbackResult.path, readlink, statDir)
             assert.equal(canonical, '/')
         }
 
@@ -821,13 +891,14 @@ describe('filePanelFallback', () => {
             }
             throw new Error('Failure')
         }
+        const statDir = async () => ({ isDirectory: true, isSymlink: false })
 
         const initialEntries = await readdir('/link/..')
         let recordedCanonical: string | null = null
         const finalized = await finalizeCanonicalDirectoryListing(
             '/link/..',
             initialEntries,
-            dirPath => resolvePosixPathWithReadlink(dirPath, readlink),
+            dirPath => resolvePosixPathWithReadlink(dirPath, readlink, statDir),
             readdir,
             raw => normalizeFilePanelPath(raw, true),
             () => false,
@@ -862,6 +933,38 @@ describe('filePanelFallback', () => {
         assert.equal(normalFinalized.path, '/parent-b')
         assert.equal(resolveCalledOnNormal, false)
         assert.equal(readdirCalls.length, callsBeforeNormal)
+
+        // Symlink removed between initial readdir and readlink propagates error instead of returning stale entries.
+        await assert.rejects(
+            () => finalizeCanonicalDirectoryListing(
+                '/link/..',
+                [{ name: 'stale-a.txt', fullPath: '/link/../stale-a.txt' }],
+                dirPath => resolvePosixPathWithReadlink(dirPath, async () => {
+                    throw new Error('No such file')
+                }, statDir),
+                readdir,
+                raw => normalizeFilePanelPath(raw, true),
+                () => false,
+                true,
+            ),
+            /No such file/,
+        )
+
+        // Timeout during readlink propagates error instead of collapsing to '/' or returning stale entries.
+        await assert.rejects(
+            () => finalizeCanonicalDirectoryListing(
+                '/link/..',
+                [{ name: 'stale-a.txt', fullPath: '/link/../stale-a.txt' }],
+                dirPath => resolvePosixPathWithReadlink(dirPath, async () => {
+                    throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' })
+                }, statDir),
+                readdir,
+                raw => normalizeFilePanelPath(raw, true),
+                () => false,
+                true,
+            ),
+            /ETIMEDOUT/,
+        )
     })
 
     it('discards stale canonicalization and re-read results when backend closes mid-resolution', async () => {
@@ -1008,6 +1111,27 @@ describe('filePanelFallback', () => {
         assert.equal(zeroBytePending.cancelCalls, 1)
         assert.equal(nestedPending.cancelCalls, 1)
         assert.equal(deepPending.cancelCalls, 1)
+    })
+
+    it('skips pre-cancelled or already-completed queued files without skipping unuploaded zero-byte files', () => {
+        const makeUpload = (opts: { size: number, cancelled?: boolean, completed?: boolean }) => ({
+            isCancelled: () => Boolean(opts.cancelled),
+            isComplete: () => !opts.cancelled && (Boolean(opts.completed) || opts.size === 0),
+            getSize: () => opts.size,
+            cancel: () => undefined,
+        })
+
+        const pendingNonEmpty = makeUpload({ size: 100 })
+        const cancelledQueued = makeUpload({ size: 100, cancelled: true })
+        const completedNonEmpty = makeUpload({ size: 100, completed: true })
+        const pendingZeroByte = makeUpload({ size: 0 })
+        const cancelledZeroByte = makeUpload({ size: 0, cancelled: true })
+
+        assert.equal(shouldSkipQueuedFileUpload(pendingNonEmpty), false)
+        assert.equal(shouldSkipQueuedFileUpload(cancelledQueued), true)
+        assert.equal(shouldSkipQueuedFileUpload(completedNonEmpty), true)
+        assert.equal(shouldSkipQueuedFileUpload(pendingZeroByte), false)
+        assert.equal(shouldSkipQueuedFileUpload(cancelledZeroByte), true)
     })
 })
 

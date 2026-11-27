@@ -1416,6 +1416,96 @@ try {
             tab1.sshSession.openSFTP = origOpenForCloseFallback
         }
 
+        // 4e. Round-5 P2 #2: readlink timeout must NOT fold to '/' or write history; symlink removed between readdir and readlink must NOT adopt stale entries (manual & fallback)
+        const readlinkErrorPanel = cpPanelForEl(cpSshTabEl('127.0.0.1'))
+        await readlinkErrorPanel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+        setRetargetLink(retargetParentAChild)
+        const recentBeforeTimeout = [...readlinkErrorPanel.recentPaths]
+        const timeoutBackend = readlinkErrorPanel.sftp
+        const origTimeoutReadlink = timeoutBackend.rawSftp.readlink.bind(timeoutBackend.rawSftp)
+        timeoutBackend.rawSftp.readlink = async target => {
+            if (target === retargetLinkPath) {
+                throw Object.assign(new Error('Request timed out'), { code: 'ETIMEDOUT' })
+            }
+            return origTimeoutReadlink(target)
+        }
+        try {
+            await readlinkErrorPanel.navigate(retargetLinkPath + '/..')
+        } finally {
+            timeoutBackend.rawSftp.readlink = origTimeoutReadlink
+        }
+        readlinkErrorPanel.cdr.detectChanges()
+        const readlinkTimeoutManual = {
+            foldedToRoot: readlinkErrorPanel.path === '/',
+            hasLoadError: Boolean(readlinkErrorPanel.loadError),
+            retryVisible: Boolean(cpSshTabEl('127.0.0.1').querySelector('[data-testid="retry-button"]')),
+            recentUnchanged: JSON.stringify(readlinkErrorPanel.recentPaths) === JSON.stringify(recentBeforeTimeout),
+        }
+        // Recover from timeout error cleanly back to sub-a
+        await readlinkErrorPanel.navigate(${JSON.stringify(join(sshRoot, 'sub-a'))})
+
+        // 4e-removed-manual: symlink removed after initial readdir('/retarget-link/..') and before readlink('/retarget-link') -> keep sub-a with errorNotice, never adopt stale only-in-parent-a.txt
+        setRetargetLink(retargetParentAChild)
+        const recentBeforeRemovedManual = [...readlinkErrorPanel.recentPaths]
+        const removedManualBackend = readlinkErrorPanel.sftp
+        const origRemovedManualResolve = removedManualBackend.resolvePath.bind(removedManualBackend)
+        removedManualBackend.resolvePath = async p => {
+            if (p === retargetLinkPath + '/..') {
+                try { fsMod.unlinkSync(retargetLinkPath) } catch {}
+            }
+            return origRemovedManualResolve(p)
+        }
+        try {
+            await readlinkErrorPanel.navigate(retargetLinkPath + '/..')
+        } finally {
+            removedManualBackend.resolvePath = origRemovedManualResolve
+        }
+        readlinkErrorPanel.cdr.detectChanges()
+        const symlinkRemovedManual = {
+            path: readlinkErrorPanel.path,
+            keptATxt: Boolean(readlinkErrorPanel.fileList?.some(e => e.name === 'a.txt')),
+            adoptedStaleA: Boolean(readlinkErrorPanel.fileList?.some(e => e.name === 'only-in-parent-a.txt')),
+            errorBannerVisible: Boolean(cpSshTabEl('127.0.0.1').querySelector('[data-testid="error-banner"]')),
+            recentUnchanged: JSON.stringify(readlinkErrorPanel.recentPaths) === JSON.stringify(recentBeforeRemovedManual),
+        }
+
+        // 4e-removed-fallback: startup fallback from retargetLink/../missing-after-unlink where symlink is removed after fallback readdir succeeds and before readlink -> falls back to live ancestor sshRoot, never adopts stale only-in-parent-a.txt
+        setRetargetLink(retargetParentAChild)
+        await closeSftpFor('127.0.0.1')
+        ipcRenderer.sendSync('coport-file-panel-state:op', {
+            op: 'recordVisit',
+            scope: tab1.sftpStateScope,
+            path: retargetLinkPath + '/../missing-after-unlink',
+        })
+        const origOpenForRemovedFallback = tab1.sshSession.openSFTP.bind(tab1.sshSession)
+        let unlinkedInFallback = false
+        tab1.sshSession.openSFTP = async (...args) => {
+            const backend = await origOpenForRemovedFallback(...args)
+            const origRes = backend.resolvePath.bind(backend)
+            backend.resolvePath = async p => {
+                if (!unlinkedInFallback && p === retargetLinkPath + '/..') {
+                    unlinkedInFallback = true
+                    try { fsMod.unlinkSync(retargetLinkPath) } catch {}
+                }
+                return origRes(p)
+            }
+            return backend
+        }
+        let s1RemovedFallback
+        try {
+            s1RemovedFallback = await openSftpFor('127.0.0.1')
+        } finally {
+            tab1.sshSession.openSFTP = origOpenForRemovedFallback
+        }
+        s1RemovedFallback.panel.cdr.detectChanges()
+        const symlinkRemovedFallback = {
+            path: s1RemovedFallback.panel.path,
+            adoptedStaleA: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'only-in-parent-a.txt')),
+            hasLiveSubA: Boolean(s1RemovedFallback.panel.fileList?.some(e => e.name === 'sub-a')),
+            bannerVisible: Boolean(s1RemovedFallback.tabEl.querySelector('[data-testid="fallback-banner"]')),
+        }
+        setRetargetLink(retargetParentAChild)
+
         // 5. Same host+port with empty profile.options.user: interactive authUsername isolation + LIVE account switch with independent Bob backend (delete/upload isolation) + LRU eviction live refresh
         await closeSftpFor('127.0.0.1')
         const origProfileUser = tab1.profile.options.user
@@ -1505,6 +1595,12 @@ try {
             let uploadTransferCancelled = false
             let dragCancelCounts = null
             let midDirCancelCounts = null
+            let delayedOpenDownloadResult = null
+            let cancelledSshAtomicDownloadResult = null
+            let scanFailureCleanupResult = null
+            let cancelQueuedUploadResult = null
+            let closedPanelDropResult = null
+            let samePanelForLru = samePanelBefore
             try {
                 const switchLiveToAlice = async () => {
                     tab1.sshSession = origSshSession
@@ -1636,6 +1732,101 @@ try {
                 await new Promise(r => setTimeout(r, 80))
                 samePanelBefore.platform.electron.dialog = origElectronDialog
 
+                // 5b-download-delayed-open (Round-5 P2 #1): Delayed fs.open AFTER canOpen() passes -> switch Alice -> Bob before fs.open resolves -> existing local file untouched & 0 temp files left
+                await switchLiveToAlice()
+                const fsPromisesMod = require('fs/promises')
+                const origFsPromisesOpen = fsPromisesMod.open
+                let releaseDelayedOpen = null
+                let delayedOpenIntercepted = false
+                fsPromisesMod.open = function (targetPath, ...rest) {
+                    if (!delayedOpenIntercepted && typeof targetPath === 'string' && targetPath.includes('.coport-download-')) {
+                        delayedOpenIntercepted = true
+                        const openPromise = origFsPromisesOpen.call(fsPromisesMod, targetPath, ...rest)
+                        return new Promise((resolve, reject) => {
+                            releaseDelayedOpen = () => openPromise.then(resolve, reject)
+                        })
+                    }
+                    return origFsPromisesOpen.call(fsPromisesMod, targetPath, ...rest)
+                }
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: ${JSON.stringify(keepDownloadFile)} }),
+                }
+                const appRootComp = cpComponent('app-root')
+                const transfersBeforeDelayedOpen = appRootComp.activeTransfers.length
+                try {
+                    const pendingDelayedOpenDownload = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    const openDeadline = Date.now() + 5000
+                    while (!releaseDelayedOpen && Date.now() < openDeadline) await new Promise(r => setTimeout(r, 20))
+                    await switchLiveToBob()
+                    releaseDelayedOpen()
+                    await pendingDelayedOpenDownload
+                    await new Promise(r => setTimeout(r, 120))
+                } finally {
+                    fsPromisesMod.open = origFsPromisesOpen
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempFilesAfterDelayedOpen = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-'))
+                delayedOpenDownloadResult = {
+                    intercepted: delayedOpenIntercepted,
+                    contentIntact: fsMod.readFileSync(${JSON.stringify(keepDownloadFile)}, 'utf8') === 'MUST-NOT-BE-TRUNCATED\\n',
+                    tempFilesLeft: tempFilesAfterDelayedOpen.length,
+                    transfersAdded: appRootComp.activeTransfers.length - transfersBeforeDelayedOpen,
+                }
+
+                // 5b-download-mid-cancel (Round-5 P2 #1): Real SSH atomic download cancelled mid-transfer preserves existing local file & leaves 0 temp files; normal SSH atomic download commits cleanly
+                await switchLiveToAlice()
+                const activeAliceForDl = samePanelBefore.sftp
+                const origAliceDlOpen = activeAliceForDl.open.bind(activeAliceForDl)
+                let releaseSshDlRead = null
+                activeAliceForDl.open = async (...args) => {
+                    const handle = await origAliceDlOpen(...args)
+                    const origRead = handle.read.bind(handle)
+                    let pausedOnce = false
+                    handle.read = async () => {
+                        if (!pausedOnce) {
+                            pausedOnce = true
+                            await new Promise(resolve => { releaseSshDlRead = resolve })
+                        }
+                        return origRead()
+                    }
+                    return handle
+                }
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: ${JSON.stringify(keepDownloadFile)} }),
+                }
+                try {
+                    const pendingMidCancelDl = samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 6)
+                    const dlPauseDeadline = Date.now() + 5000
+                    while (!releaseSshDlRead && Date.now() < dlPauseDeadline) await new Promise(r => setTimeout(r, 20))
+                    await switchLiveToBob()
+                    releaseSshDlRead()
+                    await pendingMidCancelDl
+                    await new Promise(r => setTimeout(r, 120))
+                } finally {
+                    activeAliceForDl.open = origAliceDlOpen
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempFilesAfterMidCancel = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-'))
+                const sshCommitDest = ${JSON.stringify(join(run, 'ssh-atomic-commit.txt'))}
+                fsMod.writeFileSync(sshCommitDest, 'OLD-SSH-CONTENT')
+                await switchLiveToAlice()
+                samePanelBefore.platform.electron.dialog = {
+                    showSaveDialog: async () => ({ canceled: false, filePath: sshCommitDest }),
+                }
+                try {
+                    await samePanelBefore.download(${JSON.stringify(join(sshRoot, 'sub-a', 'a.txt'))}, 0o644, 2)
+                } finally {
+                    samePanelBefore.platform.electron.dialog = origElectronDialog
+                }
+                const tempFilesAfterCommit = fsMod.readdirSync(${JSON.stringify(run)}).filter(n => n.startsWith('.coport-download-'))
+                cancelledSshAtomicDownloadResult = {
+                    atomicEnabled: samePanelBefore.sftp.atomicDownloads === true,
+                    existingIntactAfterMidCancel: fsMod.readFileSync(${JSON.stringify(keepDownloadFile)}, 'utf8') === 'MUST-NOT-BE-TRUNCATED\\n',
+                    tempFilesAfterMidCancel: tempFilesAfterMidCancel.length,
+                    committedContent: fsMod.readFileSync(sshCommitDest, 'utf8'),
+                    tempFilesAfterCommit: tempFilesAfterCommit.length,
+                }
+
                 // 5b-mid-dir-upload (P2): Multi-file + nested DirectoryUpload paused during first file while switching Alice -> Bob cancels every remaining unsubmitted FileUpload exactly once & 0 writes to Bob
                 await switchLiveToAlice()
                 const activeAliceBackend = samePanelBefore.sftp
@@ -1676,6 +1867,192 @@ try {
                 } finally {
                     activeAliceBackend.upload = origAliceUpload
                 }
+
+                // 5b-cancel-queued-file (Round-5 P2 #5): Cancelling queued 2nd file during 1st file upload skips 2nd cleanly and still uploads 1st, 3rd, and 0-byte 4th without aborting batch
+                await switchLiveToAlice()
+                const batchAliceBackend = samePanelBefore.sftp
+                const origBatchUpload = batchAliceBackend.upload.bind(batchAliceBackend)
+                const batchUploadedNames = []
+                let releaseBatchFirst = null
+                batchAliceBackend.upload = async (targetPath, transfer) => {
+                    batchUploadedNames.push(targetPath.split('/').pop())
+                    if (transfer.getName() === 'batch-1.txt') {
+                        await new Promise(resolve => { releaseBatchFirst = resolve })
+                    }
+                    transfer.close()
+                }
+                try {
+                    const batchTree = new DirectoryUpload()
+                    const b1 = makeTrackedUpload('batch-1.txt', 10)
+                    const b2 = makeTrackedUpload('batch-2.txt', 10)
+                    const b3 = makeTrackedUpload('batch-3.txt', 10)
+                    const b4 = makeTrackedUpload('batch-4-empty.txt', 0)
+                    batchTree.pushChildren(b1)
+                    batchTree.pushChildren(b2)
+                    batchTree.pushChildren(b3)
+                    batchTree.pushChildren(b4)
+                    const batchPromise = samePanelBefore.uploadOneFolder(batchTree)
+                    const bDeadline = Date.now() + 5000
+                    while (!releaseBatchFirst && Date.now() < bDeadline) await new Promise(r => setTimeout(r, 20))
+                    // User cancels queued 2nd file from transfer menu while 1st file is uploading
+                    b2.cancel()
+                    releaseBatchFirst()
+                    await batchPromise
+                    cancelQueuedUploadResult = {
+                        uploadedNames: batchUploadedNames,
+                        b2CancelCalls: b2.getCancelCalls(),
+                        b3Cancelled: b3.isCancelled(),
+                        b4Cancelled: b4.isCancelled(),
+                    }
+                } finally {
+                    batchAliceBackend.upload = origBatchUpload
+                }
+
+                // 5b-scan-failure-cleanup (Round-5 P2 #4): Directory scan where 1st file opens and 2nd file fails automatically cancels/closes 1st file handle & stops all powerSaveBlockers with 0 residual transfers
+                const scanFailDir = ${JSON.stringify(join(run, 'scan-fail-dir'))}
+                fsMod.mkdirSync(scanFailDir, { recursive: true })
+                const scanFile1 = scanFailDir + '/01-ok.txt'
+                const scanFile2 = scanFailDir + '/02-fail.txt'
+                fsMod.writeFileSync(scanFile1, 'first-file-content')
+                fsMod.writeFileSync(scanFile2, 'second-file-content')
+                const activeBlockerIds = new Set()
+                const origBlockerStart = samePanelBefore.platform.electron.powerSaveBlocker.start.bind(samePanelBefore.platform.electron.powerSaveBlocker)
+                const origBlockerStop = samePanelBefore.platform.electron.powerSaveBlocker.stop.bind(samePanelBefore.platform.electron.powerSaveBlocker)
+                let firstHandleCloseCalls = 0
+                let scanErrorMessage = null
+                const transfersBeforeScanFail = appRootComp.activeTransfers.length
+                samePanelBefore.platform.electron.powerSaveBlocker.start = type => {
+                    const id = origBlockerStart(type)
+                    activeBlockerIds.add(id)
+                    return id
+                }
+                samePanelBefore.platform.electron.powerSaveBlocker.stop = id => {
+                    activeBlockerIds.delete(id)
+                    return origBlockerStop(id)
+                }
+                fsPromisesMod.open = async function (targetPath, ...rest) {
+                    if (targetPath === scanFile2) {
+                        throw Object.assign(new Error('EACCES: simulated read failure'), { code: 'EACCES' })
+                    }
+                    const handle = await origFsPromisesOpen.call(fsPromisesMod, targetPath, ...rest)
+                    if (targetPath === scanFile1) {
+                        const origClose = handle.close.bind(handle)
+                        handle.close = async () => {
+                            firstHandleCloseCalls++
+                            return origClose()
+                        }
+                    }
+                    return handle
+                }
+                try {
+                    await samePanelBefore.platform.startUploadDirectory([scanFailDir])
+                } catch (error) {
+                    scanErrorMessage = error.message
+                } finally {
+                    fsPromisesMod.open = origFsPromisesOpen
+                    samePanelBefore.platform.electron.powerSaveBlocker.start = origBlockerStart
+                    samePanelBefore.platform.electron.powerSaveBlocker.stop = origBlockerStop
+                }
+                await new Promise(r => setTimeout(r, 80))
+                scanFailureCleanupResult = {
+                    threwExpected: Boolean(scanErrorMessage && scanErrorMessage.includes('simulated read failure')),
+                    firstHandleCloseCalls,
+                    leakedBlockers: activeBlockerIds.size,
+                    transfersAdded: appRootComp.activeTransfers.length - transfersBeforeScanFail,
+                }
+
+                // 5b-drop-close-panel (Round-5 P2 #3): Closing panel while drag directory scan is in-flight cancels all scanned FileUploads & leaves 0 residual items in global activeTransfers
+                await switchLiveToBob()
+                const samePanelReusedBeforeClose = cpPanelForEl(aliceReopen.tabEl) === samePanelBefore
+                const distinctBobBackendBeforeClose = samePanelBefore.sftp === bobBackend && bobBackend !== aliceBackend
+                samePanelBefore.platform.startUploadFromDragEvent = origStartUploadFromDrag
+                let capturedDropUpload = null
+                const origRealDrag = samePanelBefore.platform.startUploadFromDragEvent.bind(samePanelBefore.platform)
+                samePanelBefore.platform.startUploadFromDragEvent = async (...args) => {
+                    const res = await origRealDrag(...args)
+                    capturedDropUpload = res
+                    return res
+                }
+                let releaseDropReadEntries = null
+                const makeFakeFileEntry = (name, text) => ({
+                    isFile: true,
+                    isDirectory: false,
+                    name,
+                    file: cb => cb(new File([text], name)),
+                })
+                const fakeDirEntry = {
+                    isFile: false,
+                    isDirectory: true,
+                    name: 'dropped-folder',
+                    createReader: () => ({
+                        readEntries: cb => {
+                            releaseDropReadEntries = () => cb([
+                                makeFakeFileEntry('drop-a.txt', 'aaa'),
+                                {
+                                    isFile: false,
+                                    isDirectory: true,
+                                    name: 'nested',
+                                    createReader: () => ({
+                                        readEntries: subCb => subCb([makeFakeFileEntry('drop-b.txt', 'bbb')]),
+                                    }),
+                                },
+                            ])
+                        },
+                    }),
+                }
+                const transfersBeforeClosedDrop = appRootComp.activeTransfers.length
+                const dropEvent = new Event('drop')
+                Object.defineProperty(dropEvent, 'dataTransfer', {
+                    value: { items: [{ webkitGetAsEntry: () => fakeDirEntry }] },
+                })
+                aliceReopen.tabEl.querySelector('sftp-panel .body').dispatchEvent(dropEvent)
+                const dropWaitDeadline = Date.now() + 5000
+                while (!releaseDropReadEntries && Date.now() < dropWaitDeadline) await new Promise(r => setTimeout(r, 20))
+                // Close/destroy the panel BEFORE the drag scan resolves!
+                await closeSftpFor('127.0.0.1')
+                releaseDropReadEntries()
+                const dropDoneDeadline = Date.now() + 5000
+                while (!capturedDropUpload && Date.now() < dropDoneDeadline) await new Promise(r => setTimeout(r, 20))
+                await new Promise(r => setTimeout(r, 100))
+                const collectUploads = tree => {
+                    const out = []
+                    for (const child of tree.getChildrens()) {
+                        if (typeof child.getChildrens === 'function') {
+                            out.push(...collectUploads(child))
+                        } else {
+                            out.push(child)
+                        }
+                    }
+                    return out
+                }
+                const scannedFiles = capturedDropUpload ? collectUploads(capturedDropUpload) : []
+                closedPanelDropResult = {
+                    scannedCount: scannedFiles.length,
+                    allCancelled: scannedFiles.length === 2 && scannedFiles.every(f => f.isCancelled()),
+                    transfersAdded: appRootComp.activeTransfers.length - transfersBeforeClosedDrop,
+                }
+                liveReconnectAccountSwitch = {
+                    samePanelReused: samePanelReusedBeforeClose,
+                    distinctBobBackend: distinctBobBackendBeforeClose,
+                    bobSessionOpenCalls,
+                    bobRetryTargetPath,
+                    bobFavoritesDuringError,
+                    bobRecoveredPath,
+                    bobRecoveredFavorites,
+                    bobLeakedAlicePath,
+                    bobOps,
+                    uploadTransferCancelled,
+                    dragCancelCounts,
+                    midDirCancelCounts,
+                    delayedOpenDownloadResult,
+                    cancelledSshAtomicDownloadResult,
+                    scanFailureCleanupResult,
+                    cancelQueuedUploadResult,
+                    closedPanelDropResult,
+                }
+                // Re-open panel for Bob so 5c LRU eviction live refresh test runs on the open Bob panel as before
+                const bobReopenForLru = await openSftpFor('127.0.0.1')
+                samePanelForLru = bobReopenForLru.panel
             } finally {
                 samePanelBefore.platform.showMessageBox = origShowMessageBox
                 samePanelBefore.platform.popupContextMenu = origPopupMenu
@@ -1684,25 +2061,10 @@ try {
                 samePanelBefore.platform.electron.dialog = origElectronDialog
             }
 
-            liveReconnectAccountSwitch = {
-                samePanelReused: cpPanelForEl(aliceReopen.tabEl) === samePanelBefore,
-                distinctBobBackend: samePanelBefore.sftp === bobBackend && bobBackend !== aliceBackend,
-                bobSessionOpenCalls,
-                bobRetryTargetPath,
-                bobFavoritesDuringError,
-                bobRecoveredPath,
-                bobRecoveredFavorites,
-                bobLeakedAlicePath,
-                bobOps,
-                uploadTransferCancelled,
-                dragCancelCounts,
-                midDirCancelCounts,
-            }
-
             // 5c. LRU eviction live refresh: Bob's panel is currently OPEN with favorite [sub-b]; write 50 new SSH scopes -> Bob's open panel immediately clears favorites, recent & star
-            samePanelBefore.cdr.detectChanges()
-            const favoritesBeforeEvict = [...samePanelBefore.favorites]
-            const starredBeforeEvict = samePanelBefore.isCurrentPathFavorite
+            samePanelForLru.cdr.detectChanges()
+            const favoritesBeforeEvict = [...samePanelForLru.favorites]
+            const starredBeforeEvict = samePanelForLru.isCurrentPathFavorite
             const favoritesBarBeforeEvict = Boolean(aliceReopen.tabEl.querySelector('[data-testid="favorites-bar"]'))
             for (let i = 1; i <= 50; i++) {
                 ipcRenderer.sendSync('coport-file-panel-state:op', {
@@ -1712,17 +2074,17 @@ try {
                 })
             }
             const evictDeadline = Date.now() + 5000
-            while ((samePanelBefore.favorites.length > 0 || samePanelBefore.isCurrentPathFavorite) && Date.now() < evictDeadline) {
+            while ((samePanelForLru.favorites.length > 0 || samePanelForLru.isCurrentPathFavorite) && Date.now() < evictDeadline) {
                 await new Promise(r => setTimeout(r, 25))
             }
-            samePanelBefore.cdr.detectChanges()
+            samePanelForLru.cdr.detectChanges()
             lruEvictionLiveRefresh = {
                 favoritesBeforeEvict,
                 starredBeforeEvict,
                 favoritesBarBeforeEvict,
-                favoritesAfterEvict: [...samePanelBefore.favorites],
-                recentAfterEvict: [...samePanelBefore.recentPaths],
-                starredAfterEvict: samePanelBefore.isCurrentPathFavorite,
+                favoritesAfterEvict: [...samePanelForLru.favorites],
+                recentAfterEvict: [...samePanelForLru.recentPaths],
+                starredAfterEvict: samePanelForLru.isCurrentPathFavorite,
                 favoritesBarAfterEvict: Boolean(aliceReopen.tabEl.querySelector('[data-testid="favorites-bar"]')),
             }
             await closeSftpFor('127.0.0.1')
@@ -1780,6 +2142,9 @@ try {
             symlinkRetargetFallback,
             disconnectDuringResolveManual,
             disconnectDuringResolveFallback,
+            readlinkTimeoutManual,
+            symlinkRemovedManual,
+            symlinkRemovedFallback,
             authUserIsolation,
             liveReconnectAccountSwitch,
             lruEvictionLiveRefresh,
@@ -1862,6 +2227,25 @@ try {
         recoveredAfterRetry: true,
         recoveredPath: '/',
     })
+    assert.deepEqual(sshIsolationPhase1.readlinkTimeoutManual, {
+        foldedToRoot: false,
+        hasLoadError: true,
+        retryVisible: true,
+        recentUnchanged: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.symlinkRemovedManual, {
+        path: join(sshRoot, 'sub-a'),
+        keptATxt: true,
+        adoptedStaleA: false,
+        errorBannerVisible: true,
+        recentUnchanged: true,
+    })
+    assert.deepEqual(sshIsolationPhase1.symlinkRemovedFallback, {
+        path: sshRoot,
+        adoptedStaleA: false,
+        hasLiveSubA: true,
+        bannerVisible: true,
+    })
     assert.equal(await readFile(keepDownloadFile, 'utf8'), 'MUST-NOT-BE-TRUNCATED\n')
     assert.deepEqual(sshIsolationPhase1.authUserIsolation, {
         aliceScope: `ssh:alice@127.0.0.1:${port}`,
@@ -1874,7 +2258,7 @@ try {
     assert.deepEqual(sshIsolationPhase1.liveReconnectAccountSwitch, {
         samePanelReused: true,
         distinctBobBackend: true,
-        bobSessionOpenCalls: 6,
+        bobSessionOpenCalls: 9,
         bobRetryTargetPath: join(sshRoot, 'sub-b'),
         bobFavoritesDuringError: [join(sshRoot, 'sub-b')],
         bobRecoveredPath: join(sshRoot, 'sub-b'),
@@ -1884,6 +2268,36 @@ try {
         uploadTransferCancelled: true,
         dragCancelCounts: { root: 1, nested: 1 },
         midDirCancelCounts: { first: 0, second: 1, third: 1, fourth: 1 },
+        delayedOpenDownloadResult: {
+            intercepted: true,
+            contentIntact: true,
+            tempFilesLeft: 0,
+            transfersAdded: 0,
+        },
+        cancelledSshAtomicDownloadResult: {
+            atomicEnabled: true,
+            existingIntactAfterMidCancel: true,
+            tempFilesAfterMidCancel: 0,
+            committedContent: 'sub-a\n',
+            tempFilesAfterCommit: 0,
+        },
+        scanFailureCleanupResult: {
+            threwExpected: true,
+            firstHandleCloseCalls: 1,
+            leakedBlockers: 0,
+            transfersAdded: 0,
+        },
+        cancelQueuedUploadResult: {
+            uploadedNames: ['batch-1.txt', 'batch-3.txt', 'batch-4-empty.txt'],
+            b2CancelCalls: 1,
+            b3Cancelled: false,
+            b4Cancelled: false,
+        },
+        closedPanelDropResult: {
+            scannedCount: 2,
+            allCancelled: true,
+            transfersAdded: 0,
+        },
     })
     assert.deepEqual(sshIsolationPhase1.lruEvictionLiveRefresh, {
         favoritesBeforeEvict: [join(sshRoot, 'sub-b')],

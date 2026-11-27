@@ -49,6 +49,7 @@ export class SFTPFileHandle {
 }
 
 export class SFTPSession implements FileBackend {
+    readonly atomicDownloads = true
     get closed$ (): Observable<void> { return this.closed }
     get rawSftp (): russh.SFTP { return this.sftp }
     private closed = new Subject<void>()
@@ -72,7 +73,11 @@ export class SFTPSession implements FileBackend {
     }
 
     resolvePath (rawPath: string): Promise<string> {
-        return resolvePosixPathWithReadlink(rawPath, target => this.sftp.readlink(target))
+        return resolvePosixPathWithReadlink(
+            rawPath,
+            target => this.sftp.readlink(target),
+            target => this.stat(target),
+        )
     }
 
     async readdir (p: string): Promise<SFTPFile[]> {
@@ -143,44 +148,68 @@ export class SFTPSession implements FileBackend {
     async upload (path: string, transfer: FileUpload): Promise<void> {
         this.logger.info('Uploading into', path)
         const tempPath = path + '.tabby-upload'
+        let handle: SFTPFileHandle | null = null
+        let tempCreated = false
         try {
-            const handle = await this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE)
-            while (true) {
+            if (transfer.isCancelled()) {
+                throw new Error('Upload cancelled')
+            }
+            handle = await this.open(tempPath, russh.OPEN_WRITE | russh.OPEN_CREATE)
+            tempCreated = true
+            while (!transfer.isCancelled()) {
                 const chunk = await transfer.read()
-                if (!chunk.length) {
+                if (transfer.isCancelled()) {
                     break
+                }
+                if (!chunk.length) {
+                    await handle.close()
+                    handle = null
+                    await this.unlink(path).catch(() => null)
+                    await this.rename(tempPath, path)
+                    tempCreated = false
+                    transfer.close()
+                    return
                 }
                 await handle.write(chunk)
             }
-            await handle.close()
-            await this.unlink(path).catch(() => null)
-            await this.rename(tempPath, path)
-            transfer.close()
+            throw new Error('Upload cancelled')
         } catch (e) {
             transfer.setStatus(e instanceof Error ? e.message : String(e))
             transfer.cancel()
-            this.unlink(tempPath).catch(() => null)
+            await handle?.close().catch(() => null)
+            if (tempCreated) {
+                this.unlink(tempPath).catch(() => null)
+            }
             throw e
         }
     }
 
     async download (path: string, transfer: FileDownload): Promise<void> {
         this.logger.info('Downloading', path)
+        let handle: SFTPFileHandle | null = null
         try {
-            const handle = await this.open(path, russh.OPEN_READ)
-            while (true) {
+            if (transfer.isCancelled()) {
+                throw new Error('Download cancelled')
+            }
+            handle = await this.open(path, russh.OPEN_READ)
+            while (!transfer.isCancelled()) {
                 const chunk = await handle.read()
-                if (!chunk.length) {
+                if (transfer.isCancelled()) {
                     break
+                }
+                if (!chunk.length) {
+                    await transfer.completeDownload()
+                    return
                 }
                 await transfer.write(chunk)
             }
-            transfer.close()
-            handle.close()
+            throw new Error('Download cancelled')
         } catch (e) {
             transfer.setStatus(e instanceof Error ? e.message : String(e))
             transfer.cancel()
             throw e
+        } finally {
+            await handle?.close().catch(() => null)
         }
     }
 

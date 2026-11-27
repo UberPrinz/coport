@@ -172,32 +172,52 @@ export abstract class PlatformService {
     abstract startUpload (options?: FileUploadOptions): Promise<FileUpload[]>
     abstract startUploadDirectory (paths?: string[]): Promise<DirectoryUpload>
 
-    async startUploadFromDragEvent (event: DragEvent, multiple = false): Promise<DirectoryUpload> {
+    async startUploadFromDragEvent (event: DragEvent, multiple = false, canAccept?: () => boolean): Promise<DirectoryUpload> {
         const result = new DirectoryUpload()
 
         if (!event.dataTransfer) {
             return Promise.resolve(result)
         }
 
+        const created: FileUpload[] = []
+        let aborted = false
+        const cancelCreated = () => {
+            aborted = true
+            for (const transfer of created) {
+                if (!transfer.isCancelled()) {
+                    transfer.cancel()
+                }
+            }
+        }
+
         const traverseFileTree = (item: any, root: DirectoryUpload = result): Promise<void> => {
-            return new Promise((resolve) => {
+            return new Promise((resolve, reject) => {
                 if (item.isFile) {
                     item.file((file: File) => {
                         const transfer = new HTMLFileUpload(file)
-                        this.fileTransferStarted.next(transfer)
+                        if (aborted) {
+                            transfer.cancel()
+                            resolve()
+                            return
+                        }
+                        created.push(transfer)
                         root.pushChildren(transfer)
                         resolve()
-                    })
+                    }, reject)
                 } else if (item.isDirectory) {
                     const dirReader = item.createReader()
                     const childrenFolder = new DirectoryUpload(item.name)
-                    dirReader.readEntries(async (entries: any[]) => {
-                        for (const entry of entries) {
-                            await traverseFileTree(entry, childrenFolder)
-                        }
-                        resolve()
-                    })
                     root.pushChildren(childrenFolder)
+                    dirReader.readEntries(async (entries: any[]) => {
+                        try {
+                            for (const entry of entries) {
+                                await traverseFileTree(entry, childrenFolder)
+                            }
+                            resolve()
+                        } catch (error) {
+                            reject(error)
+                        }
+                    }, reject)
                 } else {
                     resolve()
                 }
@@ -217,7 +237,22 @@ export abstract class PlatformService {
                 }
             }
         }
-        return Promise.all(promises).then(() => result)
+        try {
+            await Promise.all(promises)
+        } catch (error) {
+            aborted = true
+            await Promise.allSettled(promises)
+            cancelCreated()
+            throw error
+        }
+        if (canAccept && !canAccept()) {
+            cancelCreated()
+            return result
+        }
+        for (const transfer of created) {
+            this.fileTransferStarted.next(transfer)
+        }
+        return result
     }
 
     getConfigPath (): string|null {
@@ -315,9 +350,16 @@ export class HTMLFileUpload extends FileUpload {
         return chunk
     }
 
+    private closed = false
+
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     bringToFront (): void { }
 
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
-    close (): void { }
+    close (): void {
+        if (this.closed) {
+            return
+        }
+        this.closed = true
+        void this.reader.cancel().catch(() => null)
+    }
 }
