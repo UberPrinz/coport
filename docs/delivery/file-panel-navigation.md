@@ -12,10 +12,10 @@
   - Codex 第 5 轮审查修复提交：`d023376d`（`d023376d9e620579e0e98d5588c59bd5107da263`）
   - Codex 第 6 轮审查修复提交：`97142f65`（`97142f6542c7ad1df2e6b21969a97134c7ef8db4`）
   - Codex 第 7 轮审查修复提交 `e5ffcb54eebe5059fd3ccc8d862c96d48cf6495e`
-- **当前状态**为 `L4 就绪`。第 7 轮的 5 项 P2 已修复，全量自动验收通过，签名包位于隔离目录。
-- **累计审查轮次**为 7，下一轮增量复核由编排方统一执行。
+- **当前状态**：`等待 G3 真机人工验收`。全部 L0（47+11）/L2（`coport_shells` + `prepare_adb`）与定向增量复核完成（0 P0 / 0 P1），已将验证通过的 `e5ffcb54` 构建安装至 `/Applications/Coport.app`。
+- **累计审查轮次**：8（含第 7 轮修复后的定向增量复核；按 `dev-flow` 收敛刹车放行 3 项极细 SSH/上游 `russh` 边界记录于下文）。
 - **累计 CI 修复轮次**：0（未推送 / 无远端 CI 触发）
-- **下一动作**是由编排方定向复核 `b6a2a9df..e5ffcb54`，复核通过后按 G3/L4 清单进行人工验收。
+- **下一动作**：请用户按 G3 真机验收清单在 `/Applications/Coport.app` 上体验验收并回复通过或问题；通过后推送分支并创建 PR 进入 G4。
 
 ## 实现摘要与偏差记录
 
@@ -174,7 +174,15 @@ SFTP 沿用先移除目标再重命名的提交顺序。如果移除成功而重
 
 包内 `tabby-ssh/dist/index.js` 的 SHA-256 为 `a751d8a2adc711e0356ca3f5517f7a570bf88ed1dd730f6c249fa8688f3d0c55`，`tabby-electron/dist/index.js` 为 `efddba93a78ff63cdabe8f0fb331d017a5bd504995d812623063f01fd278f09a`。本机实测日志及各命令的退出码保存在 `/tmp/coport-round7.ADX271`。
 
-## L4 真机人工验收清单（待独立复审通过后执行）
+### 第 8 轮（Codex 定向增量复核 `b6a2a9df..a473f03c` · 收敛放行记录）
+
+第 7 轮的 5 项 P2 已全部闭环，**0 项 P0 / 0 项 P1**。本次定向复核记录以下 3 项极细 SSH / 上游依赖边界（均不影响 ADB 及 SSH 常规使用，按 `dev-flow` 收敛刹车原则记入报告放行，后续按需跟进）：
+
+1. **上游 `russh` `stat()` 权限属性遗漏（仅影响通过符号链接下载显式 `0000` 权限的新文件）**：上游 `russh/lib/sftp.js:54` 浅拷贝原生 `SftpFileMetadata` 未拷贝原型上的 `permissions` getter，导致经符号链接指向 `0000` 文件新建下载时按默认 `0666 & ~umask` 创建。
+2. **非标准 SFTP 服务端在 `0111` 仅搜索父目录下对真实符号链接持续返回通用 `Failure`**：`russh` 原生 `SftpChannel` 未暴露 `LSTAT` 与 `REALPATH`，极端非标准服务端场景下无法无父目录列举地再区分。
+3. **SSH 上传 `rename` 毫秒级提交瞬间点击传输菜单取消**：传输菜单（上游 `transfersMenu.component.ts`）立即从列表移除该行，实际已进入提交态的远端替换仍会完成。
+
+## L4 真机人工验收清单（G3 就绪 · 已安装至 `/Applications/Coport.app`）
 
 1. 独立复审通过后，构建并安装至 `/Applications/Coport.app`，连接真实无 `/sdcard` ADB 设备（及可选 SSH 主机）。
 2. 打开 Files 面板确认首次直接打开 `/`、无 `/sdcard` 报错且不卡 `Loading`。
