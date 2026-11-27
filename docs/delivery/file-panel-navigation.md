@@ -11,10 +11,11 @@
   - Codex 第 4 轮审查修复提交：`6501dc77`（`6501dc77370ffaf45b19ee4bffd1c323e360c7ae`）
   - Codex 第 5 轮审查修复提交：`d023376d`（`d023376d9e620579e0e98d5588c59bd5107da263`）
   - Codex 第 6 轮审查修复提交：`97142f65`（`97142f6542c7ad1df2e6b21969a97134c7ef8db4`）
-- **当前状态**：`L4 就绪`（Codex 第 6 轮独立复审全部 5 项 P2 发现已根因修复并完成全量 L0/L2 自动验收；未覆盖 `/Applications/Coport.app`、未推送、未创建 PR）
-- **累计审查轮次**：6（已完成 Codex 第 1/2/3/4/5/6 轮独立审查与全部修复，等待编排方确认或派发后续复核）
+  - Codex 第 7 轮审查修复提交 `e5ffcb54eebe5059fd3ccc8d862c96d48cf6495e`
+- **当前状态**为 `L4 就绪`。第 7 轮的 5 项 P2 已修复，全量自动验收通过，签名包位于隔离目录。
+- **累计审查轮次**为 7，下一轮增量复核由编排方统一执行。
 - **累计 CI 修复轮次**：0（未推送 / 无远端 CI 触发）
-- **下一动作**：返回编排方，由编排方复核第 6 轮修复（`145dc983..HEAD` / `e6083033..HEAD`）并决定是否进入本机安装 `/Applications/Coport.app` 与 G3/L4 真机人工验收。
+- **下一动作**是由编排方定向复核 `b6a2a9df..e5ffcb54`，复核通过后按 G3/L4 清单进行人工验收。
 
 ## 实现摘要与偏差记录
 
@@ -122,7 +123,21 @@
 | 4 | P2 | SSH 启动路径回退存在 16 次硬编码循环上限，超限后静默退出停在 `Loading` | `filePanelFallback.ts` 抽出纯逻辑循环 `resolveCanonicalReadableDirectory`（移除 16 次上限，每轮按 `result.path` 严格缩短父路径直至 `'/'` 并配合 `visitedStarts` 防环，任何非过期退出必定返回 `ok: true` 或 `ok: false`）；`SFTPPanelComponent.navigateWithFallback` 直接委托该函数，保证所有非过期退出路径要么成功渲染列表，要么设置 `this.loadError` 展示错误与「Retry」按钮，结构上杜绝 `fileList === null && loadError === null` 卡死；L0（20 层 `..` 路径 39 次规范化权限拒绝）与 L2（`deepFallbackRecovered` 与 `deepFallbackAllDenied`）全通过 | 通过（L0 + L2） |
 | 5 | P2 | 排队中的 0 字节空文件在上传前因 `0 >= 0` 被 `isComplete()` 判为已完成，传输菜单移除不触发 `cancel()` | `FileUpload` 覆写 `isComplete()`，禁止 0 字节文件在未显式 `completed` 前通过 `0 >= 0` 判为完成；`ElectronFileUpload`/`HTMLFileUpload` 在非取消 `close()`、`FileUpload.readAll()` 以及 `SFTPSession.upload`/`AdbFileBackend.uploadFile` 真正提交完成时置 `setCompleted(true)`（`SFTPSession.upload` 同步维护 `pendingCommit`）；`filePanelFallback.ts` 移除 `isFileUploadAlreadyComplete` 的 `size === 0` 特判；L0 与 L2（`zeroByteQueuedUploadResult`：真实 `ElectronFileUpload` + `HTMLFileUpload` + 真实 `TransfersMenuComponent.removeTransfer`）验证未上传前 `isComplete() === false`、菜单移除触发 `cancel()` 并跳过后端上传（`uploadedNames=['01-first.txt','03-keep-empty.txt']`）、未取消 0 字节文件上传完成后 `isComplete() === true` | 通过（L0 + L2） |
 
-## L0–L2 自动验收矩阵证据
+### 第 7 轮（Codex 独立复审，修复提交 `e5ffcb54`）
+
+| # | 严重级 | 根因与修复 | L0/L2 实测 |
+|---|---|---|---|
+| 1 | P2 | 关闭远端上传句柄期间仍可取消。关闭后立即复核取消，并在第一次目标写入前锁定取消。提交成功后标记完成，提交失败后解除锁定、处理取消意图并清理临时文件。并发上传各用独立的同目录临时文件。 | 关闭期间取消不调用目标 `unlink` 或 `rename`，原内容保留。提交期取消的成功与失败分支均如实记录传输状态，三个场景均无临时文件残留。 |
+| 2 | P2 | SSH 原子下载覆盖时直接采用目标的 `mode & 0o7777`。ADB 继续使用目标权限与请求权限的交集，并保留原特殊权限位。 | SSH 用远端 `0644` 覆盖本地 `0755` 和 `0600`，内容更新且原权限保留。ADB 两组覆盖结果为 `0444` 和 `0600`。 |
+| 3 | P2 | SFTP 列表与 `stat` 记录权限是否存在，`SFTPFile.mode` 继续为数字。下载新文件时，缺失权限按 `0666 & ~umask`，显式 `0000` 保持为零。 | L0 覆盖不同 umask。L2 注入两种 SFTP 元数据，使用真实 SFTP 读取内容并用本地 `stat` 验证权限和内容。 |
+| 4 | P2 | 父目录 `readdir` 非跟随校验优先。仅权限拒绝时使用 `stat` 确认目录，再次 `readlink` 检查是否需要展开符号链接。超时、断线或路径不存在直接抛错。 | 真实 `sshd` 下，`0111` 父目录内的 `team/child/..` 在手动导航和启动恢复均列出 `team`。可读父目录用例在首次列表后将普通目录换为符号链接，两次 `readlink` 后列出链接目标的父目录。 |
+| 5 | P2 | 规范路径复读前通过原有回调交回路径。复读报告目录不可用时，从该规范路径的父目录继续回退，并用 `visitedStarts` 防环。 | L0 验证读取顺序和根目录失败。L2 在原路径读取和规范化完成后将 `srv/shared` 改为 `0111`，真实 `sshd` 复读失败后直接列出 `srv`，横幅显示原请求和最终路径。 |
+
+SFTP 沿用先移除目标再重命名的提交顺序。如果移除成功而重命名失败，旧目标已移除，上传显示失败或已取消，并清理当前临时文件。
+
+首轮 L2 的既有上传用例传入仅实现原接口的轻量传输对象。兼容性修复使提交状态方法可选，真实 `FileUpload` 继续执行完整状态转换。完整回归随后在重新构建的包上执行。
+
+## 第 6 轮自动验收历史证据
 
 被测实现与测试提交：`97142f65`（构建产物隔离于 `dist/coport-file-panel-nav/mac-arm64/Coport.app`，未触碰 `/Applications/Coport.app`）。
 
@@ -139,6 +154,25 @@
 | SSH 隔离、原子下载权限保留与 `rename` 提交取消一致性、父目录 `readdir` 符号链接确认、超 16 层回退与 0 字节排队取消 | L2 | 同上 `coport_shells.py` | 0 | `atomicDownloadPermResult={existingContentUpdated:true,existingModePreserved0600:true,new0644ModeMatchesUmask:true,new0755ModeMatchesUmask:true}`；`atomicDownloadCancelRenameResult` 验证 `rename` 前取消（`preRenameTargetIntact:true,preRenameCancelled:true,preRenameComplete:false,preRenameTempFilesLeft:0`）、`rename` 期间取消成功（`duringRenameOkTargetUpdated:true,duringRenameOkCancelled:false,duringRenameOkComplete:true,duringRenameOkTempFilesLeft:0`）及失败（`duringRenameFailTargetIntact:true,duringRenameFailCancelled:true,duringRenameFailComplete:false,duringRenameFailTempFilesLeft:0`）；`persistentFailureSymlink={foldedToSshRoot:false,keptATxt:true,errorBannerVisible:true,recentUnchanged:true}`、`oneShotFailureSymlink={readlinkCalls:2,foldedToSshRoot:false,hasOnlyInA:true}`；`deepFallbackRecovered={resolveCallsOver16:true,path:".../remote",hasSubA:true,loadErrorIsNull:true,bannerVisible:true}`、`deepFallbackAllDenied={resolveCallsOver16:true,fileListIsNull:true,hasLoadError:true,loadErrorPath:"/",retryVisible:true}`；`zeroByteQueuedUploadResult` 验证真实 `ElectronFileUpload`/`HTMLFileUpload` 与 `TransfersMenuComponent.removeTransfer`（`zeroCancelCompleteBeforeUpload:false,zeroKeepCompleteBeforeUpload:false,cancelledViaMenu:true,uploadedNames:["01-first.txt","03-keep-empty.txt"],cancelEmptyCancelled:true,cancelEmptyComplete:false,keepEmptyComplete:true,remoteCancelEmptyExists:false,remoteKeepEmptyExists:true`）；同时既有第 1–5 轮全量项与 `bobOps={unlink:0,rmdir:0,upload:0,mkdir:0,download:0}` 全通过 |
 | 直接敲字过滤、Enter 下载清过滤、过期异步、1,000 条目首键基准与虚拟列表 ResizeObserver | L2 | 同上 `coport_shells.py` | 0 | `filteredActions`（`rawIndex=5`, `row0Name="z-target.txt"`）点击/右键 Download/Enter/Delete 目标均准确，按 `Enter` 下载后 `filterTextAfterEnterDownload=""`, `showFilterAfterEnterDownload=false`, `focusedAfterEnterDownload=true`；`staleOps` 慢速 `openSFTP`/双符号链接双序/慢速 `stat`/`mkdir`/`uploadOne` 全通过；1,000 条目未展开过滤栏首键 `firstKeyMs=4.3ms`、后续全查询 `maxMs=4.3ms`（`≤ 16 ms`, `readdirCalls=0`）；视口增高后挂载行数由 `36` 增至 `70` |
 | 路径栏单击编辑、IME 防护、手动错误复焦与既有回归 | L2 | 同上 `coport_shells.py` 及 `python3 -B scripts/coport/sim/prepare_adb.py "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"` | 0 | 单击编辑、IME 组字 `Enter`/`Esc` 透传、`Esc` 取消复焦、手动错误保留列表复焦；ADB/SSH 既有上传/下载（含 `0o444` 覆盖与 17 并发队列）/目录上传/新建目录/删除/符号链接/拖拽/关窗原子下载清理（`atomicDownloadOnWindowClose=true`）与 `prepare_adb.py`（10/10 项全 `true`）全部退出 0 |
+
+## 第 7 轮自动验收证据
+
+被测实现和测试提交为 `e5ffcb54eebe5059fd3ccc8d862c96d48cf6495e`。环境为 macOS 27.0.1 arm64、Node v26.4.0、Yarn 1.22.22、Electron 43.7.0。打包产物位于 `dist/coport-file-panel-nav/mac-arm64/Coport.app`。两套 L2 验证使用隔离用户数据目录，文件面板验证连接本机真实 `sshd`、模拟 ADB 和私有 PTY。
+
+| 命令 | 退出码 | 实测结果 |
+|---|---:|---|
+| `npm run lint` | 0 | ESLint 无错误或警告 |
+| `npm run build` | 0 | 14 个 typings 和 18 个 webpack 构建任务完成。webpack 有 Sass 废弃、未使用源文件和包体积警告 |
+| `npm run test:ssh-term` | 0 | 47/47 通过，千条目过滤 p95 0.77 ms、最大 0.89 ms |
+| `npm run test:unit` | 0 | 11/11 通过 |
+| `node scripts/coport/check-upstream-diff.mjs` | 0 | 对照 `54869e10` 检查 128 个路径，均已登记 |
+| `node scripts/prepackage-plugins.mjs` | 0 | 内置插件依赖准备成功 |
+| `COPORT_BUILD_OUTPUT="$PWD/dist/coport-file-panel-nav" COPORT_ELECTRON_DIST="$PWD/dist/coport-m0/electron" node scripts/build-macos.mjs` | 0 | 隔离 arm64 应用、DMG 和 ZIP 构建成功 |
+| `codesign --verify --deep --strict "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"` | 0 | 隔离应用 ad-hoc 签名有效 |
+| `python3 -B scripts/coport/sim/coport_shells.py "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"` | 0 | 第 7 轮 5 项及既有验证通过。千条目首键和后续查询最大均为 3.8 ms，目录复读次数为 0，虚拟列表随视口由 36 行扩至 70 行 |
+| `python3 -B scripts/coport/sim/prepare_adb.py "$PWD/dist/coport-file-panel-nav/mac-arm64/Coport.app"` | 0 | ADB 优先、串口回退、离线与未授权等 10/10 项通过 |
+
+包内 `tabby-ssh/dist/index.js` 的 SHA-256 为 `a751d8a2adc711e0356ca3f5517f7a570bf88ed1dd730f6c249fa8688f3d0c55`，`tabby-electron/dist/index.js` 为 `efddba93a78ff63cdabe8f0fb331d017a5bd504995d812623063f01fd278f09a`。本机实测日志及各命令的退出码保存在 `/tmp/coport-round7.ADX271`。
 
 ## L4 真机人工验收清单（待独立复审通过后执行）
 
